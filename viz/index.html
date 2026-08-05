@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KOPENG · memory graph</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%237BB390'/%3E%3C/svg%3E">
+  <!-- Local-first: no external font egress. Geist Mono is used if locally
+       installed; styles.css falls back to a system monospace stack. -->
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    /* Review tab (T8) — pending-dreams diff review. Scoped here so the change
+       stays within the viz HTML/JS owned files; reuses ops-table / live-* for
+       the rest. */
+    .review-toolbar { display: flex; align-items: center; gap: .5rem; padding: .5rem .75rem; flex-wrap: wrap; font-size: .82rem; }
+    .review-split { display: grid; grid-template-columns: minmax(280px, 38%) 1fr; gap: .75rem; padding: 0 .75rem .75rem; align-items: start; }
+    .review-list-pane { overflow: auto; max-height: calc(100vh - 180px); }
+    #review-list-table tbody tr { cursor: pointer; }
+    #review-list-table tbody tr.review-row-active { outline: 1px solid hsl(var(--accent)); background: hsl(var(--accent) / 0.1); }
+    .review-diff-pane { overflow: auto; max-height: calc(100vh - 180px); }
+    .review-entry { border: 1px solid hsl(var(--border-subtle)); background: hsl(var(--surface-01)); padding: .6rem .7rem; margin-bottom: .6rem; }
+    .review-entry-head { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-bottom: .4rem; }
+    .review-badge { font-size: .72rem; padding: .1rem .4rem; border: 1px solid var(--border); }
+    .review-badge-tier { opacity: .8; }
+    .review-res-pending { color: hsl(var(--color-warning)); }
+    .review-res-accepted, .review-res-auto_applied { color: hsl(var(--color-success)); }
+    .review-res-rejected { color: hsl(var(--color-error)); }
+    .review-rationale { font-size: .82rem; margin: .25rem 0 .4rem; opacity: .9; }
+    .review-impact { font-size: .78rem; margin: 0 0 .4rem; padding: .35rem .5rem; border-left: 2px solid hsl(var(--accent)); background: hsl(var(--accent) / 0.06); }
+    .review-impact div { margin: .1rem 0; }
+    .review-impact b { opacity: .8; }
+    .review-impact .review-reversible { opacity: .65; font-style: italic; }
+    .review-member { font-size: .78rem; border-left: 2px solid hsl(var(--border-strong)); padding: .15rem .5rem; margin: .2rem 0; }
+    .review-member-excerpt { opacity: .85; }
+    .review-actions { display: flex; gap: .4rem; margin-top: .4rem; flex-wrap: wrap; align-items: center; }
+    .review-actions label { font-size: .78rem; display: flex; align-items: center; gap: .3rem; }
+    .review-msg { font-size: .8rem; margin-top: .5rem; min-height: 1.1em; }
+    .review-msg-ok { color: hsl(var(--color-success)); }
+    .review-msg-err { color: hsl(var(--color-error)); }
+    /* Round-2: section heads, history table, dreaming-controls panel. */
+    .review-section-head { font-size: .72rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; margin: .9rem 0 .35rem; padding-bottom: .25rem; border-bottom: 1px solid var(--border); }
+    .review-list-pane .review-section-head:first-child { margin-top: 0; }
+    #review-history-table tbody tr { cursor: pointer; }
+    #review-history-table tbody tr.review-row-active { outline: 1px solid hsl(var(--accent)); background: hsl(var(--accent) / 0.1); }
+    .review-controls { border: 1px solid hsl(var(--border-subtle)); background: hsl(var(--surface-01)); padding: .5rem .7rem .6rem; }
+    .review-controls .review-section-head { margin-top: 0; border-bottom: none; padding-bottom: 0; }
+    .review-controls-body { display: flex; flex-direction: column; gap: .3rem; }
+    .review-toggle { display: flex; align-items: center; justify-content: space-between; gap: .6rem; font-size: .8rem; }
+    .review-toggle-label { display: flex; flex-direction: column; }
+    .review-toggle-hint { font-size: .68rem; opacity: .65; }
+    .review-toggle button { min-width: 4.5rem; }
+    .review-toggle button.review-toggle-on { color: hsl(var(--color-success)); border-color: hsl(var(--color-success) / .5); }
+    .review-controls-note { font-size: .68rem; opacity: .6; margin-top: .45rem; }
+    .review-controls-msg { font-size: .74rem; min-height: 1em; margin-top: .25rem; }
+  </style>
+</head>
+<body>
+  <!-- Lucide icon definitions, referenced by <use href="#icon-..."> in the graph.
+       Stroke-only at currentColor; strokes scale with zoom for a terminal feel. -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <defs>
+      <symbol id="icon-user" viewBox="0 0 24 24"
+              fill="none" stroke="currentColor"
+              stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="8" r="5"/>
+        <path d="M20 21a8 8 0 0 0-16 0"/>
+      </symbol>
+      <symbol id="icon-feedback" viewBox="0 0 24 24"
+              fill="none" stroke="currentColor"
+              stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        <path d="M12 7v2"/>
+        <path d="M12 13h.01"/>
+      </symbol>
+      <symbol id="icon-project" viewBox="0 0 24 24"
+              fill="none" stroke="currentColor"
+              stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>
+      </symbol>
+      <symbol id="icon-reference" viewBox="0 0 24 24"
+              fill="none" stroke="currentColor"
+              stroke-linecap="round" stroke-linejoin="round">
+        <path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/>
+      </symbol>
+      <symbol id="icon-discovery" viewBox="0 0 24 24"
+              fill="none" stroke="currentColor"
+              stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/>
+        <path d="M20 3v4"/>
+        <path d="M22 5h-4"/>
+        <path d="M4 17v2"/>
+        <path d="M5 18H3"/>
+      </symbol>
+    </defs>
+  </svg>
+
+  <header>
+    <button id="drawer-left-btn" class="drawer-btn" title="open stores · legend · pipeline" aria-label="Open left panel">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="0"/><path d="M9 3v18"/></svg>
+    </button>
+    <div class="brand">
+      <span class="brand-prompt">&gt;</span>
+      <span class="brand-name">KOPENG</span>
+      <span class="brand-sub">memory.graph</span>
+      <span class="brand-status-dot" title="connected"></span>
+    </div>
+    <div id="health" class="health">connecting…</div>
+    <button id="theme-toggle" title="Toggle light/dark theme" aria-label="Toggle theme">
+      <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>
+      </svg>
+      <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="4"/>
+        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+      </svg>
+    </button>
+    <button id="drawer-right-btn" class="drawer-btn" title="open filters · selection" aria-label="Open right panel">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="0"/><path d="M15 3v18"/></svg>
+    </button>
+  </header>
+
+  <main>
+    <aside id="left">
+      <div class="drawer-head">
+        <span class="drawer-head-label">stores · legend · pipeline</span>
+        <button class="drawer-close" data-drawer-close aria-label="Close panel">✕</button>
+      </div>
+      <h2>stores</h2>
+      <p class="hint">The seven data stores that back KOPENG. Three are core; four are optional, gated by env flags.</p>
+      <div id="stores"></div>
+
+      <h2 style="margin-top:1.4rem">legend</h2>
+      <div id="legend"></div>
+
+      <h2 style="margin-top:1.4rem">pipeline</h2>
+      <p class="hint">How a query flows.</p>
+      <ol class="pipeline">
+        <li><b>embed</b> — query → 384-dim vector</li>
+        <li><b>filter</b> — type / scope / tags in SQL</li>
+        <li><b>hybrid</b> — RRF: cosine + FTS5</li>
+        <li><b>rerank</b> — MS-MARCO cross-encoder</li>
+        <li><b>blend</b> — score × confidence floor</li>
+      </ol>
+    </aside>
+
+    <section id="graph">
+      <div class="tabs" role="tablist">
+        <button class="tab active" role="tab" data-tab="graph" aria-selected="true">graph</button>
+        <button class="tab" role="tab" data-tab="live" aria-selected="false">live<span class="tab-dot" id="live-dot" title="disconnected"></span></button>
+        <button class="tab" role="tab" data-tab="ops" aria-selected="false">ops</button>
+        <button class="tab" role="tab" data-tab="replay" aria-selected="false">replay</button>
+        <button class="tab" role="tab" data-tab="review" aria-selected="false">review<span class="tab-dot" id="review-dot" title="pending dreams"></span></button>
+        <button class="tab tab-btn" role="tab" data-tab="slots" aria-selected="false">slots</button>
+      </div>
+
+      <div class="tab-panel" data-panel="graph">
+        <svg id="canvas"></svg>
+        <div id="tooltip" class="tooltip" style="display:none"></div>
+        <div class="graph-chips">
+          <div id="zoom-hud" class="zoom-hud"><span class="zoom-label">zoom</span><span id="zoom-value">100%</span></div>
+          <div class="overlay-hint">drag · scroll to zoom · click a node</div>
+        </div>
+      </div>
+
+      <div class="tab-panel" data-panel="live" hidden>
+        <div class="live-toolbar">
+          <span class="live-status" id="live-status">connecting…</span>
+          <span class="live-sep">·</span>
+          <span class="live-count"><b id="live-count">0</b> events</span>
+          <span class="live-sep">·</span>
+          <span class="live-rate" id="live-rate">0/s</span>
+          <span class="live-sep">·</span>
+          <label class="live-pause"><input type="checkbox" id="live-pause"> pause</label>
+          <button class="live-clear" id="live-clear" title="Clear list">clear</button>
+        </div>
+        <div class="live-list" id="live-list">
+          <div class="live-empty">waiting for tool events… run anything in another Claude Code window.</div>
+        </div>
+      </div>
+
+      <div class="tab-panel" data-panel="ops" hidden>
+        <div class="ops-toolbar">
+          <span class="ops-label">ops · operational visibility</span>
+          <span class="live-sep">·</span>
+          <span id="ops-poll-status">idle</span>
+          <span class="live-sep">·</span>
+          <span class="ops-hint">polls every 10s while this tab is active</span>
+        </div>
+        <div class="ops-grid">
+          <section class="ops-card ops-card-wide" data-card="dream-history">
+            <header class="ops-card-head">
+              <h3>dream consolidation · recent passes</h3>
+              <span class="ops-card-sub" id="ops-dream-sub">—</span>
+            </header>
+            <div class="ops-metric-label" id="ops-dream-summary">—</div>
+            <table class="ops-table" id="ops-dream-table">
+              <thead>
+                <tr><th>when</th><th>scope</th><th>mode</th><th>examined</th><th>proposed</th><th>applied</th><th>pending</th><th>status</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </section>
+
+          <section class="ops-card" data-card="corpus-health">
+            <header class="ops-card-head">
+              <h3>corpus health</h3>
+              <span class="ops-card-sub" id="ops-corpus-sub">slow query — polls every 30s</span>
+            </header>
+            <div class="ops-metric-big" id="ops-corpus-dups">—</div>
+            <div class="ops-metric-label" id="ops-corpus-dups-label">dream-actionable duplicate pairs</div>
+            <dl class="ops-kv" id="ops-corpus-kv"></dl>
+          </section>
+
+          <section class="ops-card" data-card="discovery-status">
+            <header class="ops-card-head">
+              <h3>discovery cursor lag</h3>
+              <span class="ops-card-sub" id="ops-discovery-sub">—</span>
+            </header>
+            <div class="ops-senses" id="ops-senses" data-state="unknown" title="age of the most recent observation — green <1h · amber <24h · red beyond / off">
+              <span class="ops-senses-dot"></span>
+              <span class="ops-senses-label" id="ops-senses-label">senses —</span>
+            </div>
+            <div class="ops-metric-big" id="ops-discovery-lag">—</div>
+            <div class="ops-metric-label">observations behind watermark</div>
+            <div class="ops-spark" id="ops-discovery-spark"></div>
+            <div class="ops-card-foot" id="ops-discovery-foot">—</div>
+          </section>
+
+          <section class="ops-card" data-card="reasoner-status">
+            <header class="ops-card-head">
+              <h3>reasoner</h3>
+              <span class="ops-card-sub" id="ops-reasoner-sub">—</span>
+            </header>
+            <div class="ops-senses" id="ops-reasoner-light" data-state="unknown" title="dream reasoner liveness — armed + provider reachable">
+              <span class="ops-senses-dot"></span>
+              <span class="ops-senses-label" id="ops-reasoner-state">—</span>
+            </div>
+            <div class="ops-metric-label" id="ops-reasoner-model">model —</div>
+            <dl class="ops-kv" id="ops-reasoner-kv"></dl>
+            <div class="ops-card-foot" id="ops-reasoner-foot">—</div>
+          </section>
+
+          <section class="ops-card" data-card="last-promotion">
+            <header class="ops-card-head">
+              <h3>last promotion run</h3>
+              <span class="ops-card-sub" id="ops-promotion-sub">—</span>
+            </header>
+            <div class="ops-metric-big" id="ops-promotion-when">never</div>
+            <div class="ops-metric-label" id="ops-promotion-when-label">no promotion runs since logging shipped</div>
+            <dl class="ops-kv" id="ops-promotion-kv"></dl>
+          </section>
+
+          <section class="ops-card" data-card="cache-stats">
+            <header class="ops-card-head">
+              <h3>cache · dedup ratio</h3>
+              <span class="ops-card-sub" id="ops-cache-sub">—</span>
+            </header>
+            <div class="ops-metric-big" id="ops-cache-ratio">—</div>
+            <div class="ops-metric-label">reinforced / (created + reinforced)</div>
+            <dl class="ops-kv" id="ops-cache-kv"></dl>
+          </section>
+
+          <section class="ops-card ops-card-wide" data-card="confidence-distribution">
+            <header class="ops-card-head">
+              <h3>confidence tiers</h3>
+              <span class="ops-card-sub" id="ops-conf-sub">—</span>
+            </header>
+            <div class="ops-tier-bar" id="ops-conf-bar"></div>
+            <div class="ops-tier-legend" id="ops-conf-legend"></div>
+            <div class="ops-table-scroll">
+              <table class="ops-table ops-table-compact" id="ops-conf-table"></table>
+            </div>
+          </section>
+
+          <section class="ops-card ops-card-wide" data-card="top-decaying">
+            <header class="ops-card-head">
+              <h3>top decaying memories</h3>
+              <span class="ops-card-sub" id="ops-decay-sub">slow query — polls every 30s</span>
+            </header>
+            <table class="ops-table" id="ops-decay-table">
+              <thead>
+                <tr><th>id</th><th>type</th><th>scope</th><th>summary</th><th>score</th><th>days idle</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </section>
+        </div>
+      </div>
+
+      <div class="tab-panel" data-panel="replay" hidden>
+        <div class="replay-toolbar">
+          <label class="replay-picker-label" for="replay-session">session</label>
+          <select id="replay-session" class="replay-picker">
+            <option value="">— pick a session —</option>
+          </select>
+          <button class="replay-btn" id="replay-refresh" title="Refresh session list">↻</button>
+          <span class="live-sep">·</span>
+          <button class="replay-btn replay-play" id="replay-play" disabled>play</button>
+          <button class="replay-btn" id="replay-reset" disabled title="Jump to start">reset</button>
+          <span class="live-sep">·</span>
+          <label class="replay-speed-label">speed</label>
+          <div class="replay-speed-group" role="group" aria-label="Playback speed">
+            <button class="replay-speed-btn" data-speed="1">1×</button>
+            <button class="replay-speed-btn active" data-speed="4">4×</button>
+            <button class="replay-speed-btn" data-speed="16">16×</button>
+          </div>
+          <span class="replay-status" id="replay-status">pick a session above</span>
+        </div>
+        <div class="replay-scrub-row">
+          <span class="replay-scrub-pos" id="replay-pos">—</span>
+          <input type="range" id="replay-scrub" class="replay-scrub" min="0" max="0" value="0" step="1" disabled>
+          <span class="replay-scrub-total" id="replay-total">—</span>
+        </div>
+        <div class="live-list" id="replay-list">
+          <div class="live-empty">pick a session above to load its event timeline.</div>
+        </div>
+      </div>
+
+      <div class="tab-panel" data-panel="review" hidden>
+        <div class="review-toolbar">
+          <span class="ops-label">review · dreams</span>
+          <span class="live-sep">·</span>
+          <span id="review-poll-status">idle</span>
+          <span class="live-sep">·</span>
+          <button class="replay-btn" id="review-refresh" title="Refresh dream lists">↻</button>
+          <span class="ops-hint">accept runs under the consolidation lock (423 when busy)</span>
+        </div>
+        <div class="review-split">
+          <div class="review-list-pane">
+            <div class="review-controls" id="review-controls">
+              <div class="review-section-head">dreaming controls</div>
+              <div class="review-controls-body" id="review-controls-body">
+                <div class="ops-empty">loading operator config…</div>
+              </div>
+              <div class="review-controls-note">the dreaming service itself is env-gated (DREAMING_ENABLED, restart-bound); these knobs are live.</div>
+            </div>
+
+            <div class="review-section-head">awaiting review</div>
+            <table class="ops-table" id="review-list-table">
+              <thead>
+                <tr><th>id</th><th>scope</th><th>window</th><th>pending</th><th>examined</th><th>when</th></tr>
+              </thead>
+              <tbody id="review-list-tbody">
+                <tr><td colspan="6" class="ops-empty">no dreams loaded yet</td></tr>
+              </tbody>
+            </table>
+
+            <div class="review-section-head">history — every completed pass</div>
+            <table class="ops-table" id="review-history-table">
+              <thead>
+                <tr><th>when</th><th>window</th><th>examined</th><th>proposed</th><th>applied</th><th>status</th></tr>
+              </thead>
+              <tbody id="review-history-tbody">
+                <tr><td colspan="6" class="ops-empty">no history loaded yet</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="review-diff-pane" id="review-diff-pane">
+            <div class="live-empty">pick a dream on the left — pending or history — to see what it proposed and what happened to each change.</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="slots-panel" class="tab-panel" data-panel="slots" hidden>
+        <div class="panel-header">
+          <h3>Slots</h3>
+          <span id="slots-count" class="badge"></span>
+        </div>
+        <table id="slots-table">
+          <thead>
+            <tr>
+              <th>slot_key</th><th>type</th><th>scope</th><th>content</th><th>updated</th>
+            </tr>
+          </thead>
+          <tbody id="slots-tbody"></tbody>
+        </table>
+      </div>
+
+      <button class="aside-toggle" data-target="left" aria-label="Toggle left sidebar" title="Toggle stores panel">
+        <span class="aside-toggle-icon" aria-hidden="true">‹</span>
+      </button>
+      <button class="aside-toggle" data-target="right" aria-label="Toggle right sidebar" title="Toggle filters panel">
+        <span class="aside-toggle-icon" aria-hidden="true">›</span>
+      </button>
+    </section>
+
+    <aside id="right">
+      <div class="drawer-head">
+        <span class="drawer-head-label">filters · selection</span>
+        <button class="drawer-close" data-drawer-close aria-label="Close panel">✕</button>
+      </div>
+      <h2>filters</h2>
+      <div id="filters"></div>
+      <h2 style="margin-top:1.2rem">selection</h2>
+      <div id="detail" class="empty">click a memory or entity to view it</div>
+    </aside>
+  </main>
+  <div id="drawer-backdrop" class="drawer-backdrop" aria-hidden="true"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"
+          integrity="sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i"
+          crossorigin="anonymous"></script>
+  <script src="app.js"></script>
+</body>
+</html>

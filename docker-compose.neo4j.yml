@@ -1,0 +1,21 @@
+services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: kopeng-neo4j
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7687:7687"
+      - "127.0.0.1:7474:7474"
+    volumes:
+      - kopeng-neo4j-data:/data
+      - kopeng-neo4j-logs:/logs
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_memory_pagecache_size: 512M
+      NEO4J_dbms_memory_heap_initial__size: 512M
+      NEO4J_dbms_memory_heap_max__size: 1G
+
+volumes:
+  kopeng-neo4j-data:
+  kopeng-neo4j-logs:

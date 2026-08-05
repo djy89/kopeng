@@ -1,0 +1,17 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: kopeng-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:9000:9000"   # S3 API
+      - "127.0.0.1:9001:9001"   # Web console
+    volumes:
+      - kopeng-minio-data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+
+volumes:
+  kopeng-minio-data:

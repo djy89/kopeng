@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: kopeng-postgres
+    restart: unless-stopped
+    ports:
+      # Host port defaults to 5432; override POSTGRES_HOST_PORT in .env if 5432
+      # is already taken (e.g. a native Postgres install). Container stays 5432.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - kopeng-postgres-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: kopeng
+      POSTGRES_USER: kopeng
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env — the container will not initialize without it}
+
+volumes:
+  kopeng-postgres-data:
