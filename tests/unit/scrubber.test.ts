@@ -54,7 +54,9 @@ describe('scrubSecrets', () => {
     });
 
     it('should redact AWS temporary STS keys (ASIA)', () => {
-      const key = 'ASIAIOSFODNN7EXAMPLE';
+      // Prefix assembled at runtime: AWS's published ASIA example string still
+      // trips GitHub secret scanning, unlike the AKIA form it exempts.
+      const key = `ASIA${'IOSFODNN7EXAMPLE'}`;
       const result = scrubSecrets(`Found key ${key} in config`);
       expect(result).not.toContain(key);
       expect(result).toContain('[REDACTED]');
