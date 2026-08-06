@@ -37,8 +37,6 @@
     "eval:adversarial": "tsx scripts/eval-reasoner-adversarial.ts",
     "eval:nli": "tsx scripts/eval-nli-classifier.ts",
     "viz": "node scripts/viz-server.js",
-    "sync:indexes": "tsx scripts/sync-claude-indexes.ts",
-    "propose:triggers": "tsx scripts/propose-trigger-rewrites.ts",
     "metric:surfacing": "tsx scripts/metric-surfacing.ts",
     "metric:adherence": "tsx scripts/metric-adherence.ts",
     "triage:anchors": "tsx scripts/triage-anchors.ts",
