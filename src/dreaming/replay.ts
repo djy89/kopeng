@@ -34,6 +34,8 @@ import type {
   PairVerdict, ConditionExtraction, ClusterSynthesis,
 } from './reasoner/reasoner.js';
 import { ConsolidationLockManager } from './lock.js';
+import { applyEntry, rollbackMemory, type ApplyDeps } from './apply.js';
+import { autoArchiveDecayed } from '../promotion/auto-archive.js';
 
 // ── Gold set ──
 
@@ -92,8 +94,8 @@ export class CountingReasoner implements ConsolidationReasoner {
 class RecordingSelector implements CandidateSelector {
   groups: CandidateGroup[] = [];
   constructor(private readonly inner: CandidateSelector) {}
-  select(memories: CandidateMemory[]): CandidateGroup[] {
-    this.groups = this.inner.select(memories);
+  async select(memories: CandidateMemory[]): Promise<CandidateGroup[]> {
+    this.groups = await this.inner.select(memories);
     return this.groups;
   }
 }
@@ -506,15 +508,18 @@ export async function runRotationScenario(deps: {
 
 const WC_BASE = Date.parse('2026-06-15T08:00:00Z'); // ISO week 2026-W25
 
-/** Unit vector with cosine exactly `w` against basis(i) (8-dim, zero-model). */
+/** Unit vector with cosine exactly `w` against basis(i) (zero-model). Sized 12
+ *  (was 8 pre-round-22): existing callers only ever index 0-7 (or `p % 8`), so
+ *  widening is a zero-padded no-op for them — new dims stay orthogonal. */
+const WC_DIM = 12;
 function wcBlend(i: number, j: number, w: number): Float32Array {
-  const v = new Float32Array(8);
+  const v = new Float32Array(WC_DIM);
   v[i] = w;
   v[j] = Math.sqrt(1 - w * w);
   return v;
 }
 function wcBasis(i: number): Float32Array {
-  const v = new Float32Array(8);
+  const v = new Float32Array(WC_DIM);
   v[i] = 1;
   return v;
 }
@@ -649,7 +654,7 @@ export async function runWholeCorpusScenario(deps: {
  * gates it); with the default operator config nothing deterministic-safe ever
  * auto-applies, so the index is never meaningfully used.
  */
-class NullVectorSearch implements IVectorSearch {
+export class NullVectorSearch implements IVectorSearch {
   async loadFromDatabase(): Promise<void> { /* no-op */ }
   async add(): Promise<void> { /* no-op */ }
   async remove(): Promise<void> { /* no-op */ }
@@ -690,6 +695,8 @@ export async function runReferentGuardScenario(deps: {
     `Workflow sequence detected: ${bigram}. Observed in ${sessions}/${total} sessions (${pct}% coverage). This consistent ordering suggests a deliberate workflow step.`;
   const repeated = (tool: string, payload: string): string =>
     `When working in this project, the operator frequently uses ${tool} with: ${payload}`;
+  const repeatedCommand = (command: string): string =>
+    `The operator frequently runs this command in the project: ${command}`;
   const keyFiles = (files: string[]): string =>
     `Key reference files frequently accessed in rg-app:\n${files.map(f => `  - ${f}`).join('\n')}\n\nThese files are consistently accessed across sessions, suggesting they are architectural touchpoints or orientation files.`;
 
@@ -745,6 +752,12 @@ export async function runReferentGuardScenario(deps: {
   const numA = await seed(seq('Read(config.ts) → Edit(config.ts)', 2, 5, 40), { embedding: wcBasis(4) });
   const numB = await seed(seq('Read(config.ts) → Edit(config.ts)', 4, 7, 57), { embedding: wcBlend(4, 5, 0.93) });
 
+  // P5 — band repeated_command pair, different commands (round-22 defect: this
+  // template previously never parsed, so referentGuard bailed for both members
+  // and the reasoner read the near-identical prose wrapper as `duplicate`).
+  const rcA = await seed(repeatedCommand('git diff --stat'), { embedding: wcBasis(8) });
+  const rcB = await seed(repeatedCommand('cargo fmt && cargo clippy && cargo test'), { embedding: wcBlend(8, 9, 0.91) });
+
   // C1 — CONTROL: same bigram + substantive difference → must reach the reasoner.
   const ctlA = await seed(seq('Bash(vitest) → Bash(git)', 3, 5, 60), { embedding: wcBasis(6) });
   const ctlB = await seed(
@@ -758,7 +771,15 @@ export async function runReferentGuardScenario(deps: {
   const opB = await seed('Deploy checklist:\n  - update DNS\n  - rotate keys', { type: 'project' });
   await plantFlag(opB, opA);
 
-  const noiseIds = new Set([seqA, seqB, rtA, rtB, kfA, kfB, numA, numB]);
+  // C3 — CONTROL: cross-family SAME command (repeated_tool "Bash" wrapper vs
+  // repeated_command wrapper) — round-22's other required behavior: folding
+  // both producers into one referent family means this is a same-referent
+  // pair, so it must still reach the reasoner (a genuine duplicate claim,
+  // confirmed by hand 2026-08-20) rather than being misrouted `unrelated`.
+  const xfA = await seed(repeated('Bash', 'cargo test --workspace'), { embedding: wcBasis(10) });
+  const xfB = await seed(repeatedCommand('cargo test --workspace'), { embedding: wcBlend(10, 11, 0.90) });
+
+  const noiseIds = new Set([seqA, seqB, rtA, rtB, kfA, kfB, numA, numB, rcA, rcB]);
 
   const counter = new CountingReasoner(new NoOpReasoner());
   const result = await runDreamPass({
@@ -774,10 +795,11 @@ export async function runReferentGuardScenario(deps: {
 
   check('pass completed', result.status === 'completed', `got ${result.status}`);
 
-  // The guard, not the reasoner, decided every noise pair: exactly the two
-  // control pairs were classified.
-  check('exactly 2 classify calls (controls only — noise pairs cost 0)',
-    counter.classifyCalls === 2, `got ${counter.classifyCalls}`);
+  // The guard, not the reasoner, decided every noise pair: exactly the three
+  // control pairs were classified (C1 same-referent-substantive-diff, C3
+  // cross-family-same-command — both genuine same-referent claims).
+  check('exactly 3 classify calls (controls only — noise pairs cost 0)',
+    counter.classifyCalls === 3, `got ${counter.classifyCalls}`);
   check('zero LLM calls (NoOp)', counter.llmCalls === 0, `got ${counter.llmCalls}`);
 
   const dream = result.dream_id !== null ? await deps.dreamStore.getDream(result.dream_id) : null;
@@ -795,7 +817,11 @@ export async function runReferentGuardScenario(deps: {
   check('operator-authored list pair untouched by the guard (contested fallback as before)',
     opEntry?.change_class === 'contested' && opEntry?.tier === 'reasoner-driven', JSON.stringify(opEntry ?? null));
 
-  check('exactly the two control entries were proposed', entries.length === 2, `got ${entries.length}`);
+  const xfEntry = entries.find(e => e.memory_ids.length === 2 && e.memory_ids.includes(xfA) && e.memory_ids.includes(xfB));
+  check('cross-family same-command control still reaches the reasoner (not misrouted unrelated)',
+    xfEntry?.tier === 'reasoner-driven', JSON.stringify(xfEntry ?? null));
+
+  check('exactly the three control entries were proposed', entries.length === 3, `got ${entries.length}`);
 
   // Flag lifecycle: BOTH routed flagged pairs retire their flags via the
   // existing consume path — unrelated (guard) and contested (fallback) alike.
@@ -808,10 +834,145 @@ export async function runReferentGuardScenario(deps: {
   }
 
   // Nothing was archived — the guard only suppresses proposals, never mutates.
-  for (const id of [...noiseIds, ctlA, ctlB, opA, opB]) {
+  for (const id of [...noiseIds, ctlA, ctlB, opA, opB, xfA, xfB]) {
     const row = await deps.memoryStore.get(id);
     check(`memory #${id} still active`, row !== null && !row.is_archived);
   }
 
   return { name: 't31-referent-guard', ok: failures.length === 0, failures };
+}
+
+// ── Phase 2 reversibility scenario ──
+
+/**
+ * The synthetic alias-variant scope pair shared by the reversibility scenario
+ * and the Phase-5 alias fixtures (`tests/fixtures/dreaming/corpus.ts`). One
+ * definition so the two harness fixtures for "a casing variant of one client
+ * scope" cannot drift apart. Names are synthetic (fixture-hygiene rule) and
+ * mirror the T46 doc example.
+ */
+export const SYNTHETIC_ALIAS_SCOPE_RAW = 'client:Acme-Foods';
+export const SYNTHETIC_ALIAS_SCOPE_CANONICAL = 'client:acme-foods';
+
+/**
+ * Phase 2 zero-LLM gate: the reversibility invariants exercised end-to-end
+ * against the same harness deps shape every other replay scenario uses (no
+ * raw db handle, no LLM — deterministic via injected clocks, mirroring the
+ * unit coverage in `tests/unit/reversibility.test.ts` / `dream-apply.test.ts`).
+ *
+ *   1. G1/G2 rescue loop: a 0.6-confidence project memory has its `last_seen`
+ *      genuinely backdated ~400 days via `IDreamStore.reinforceMemory(id, at)`
+ *      (the store's own clock-control hook — no raw db handle needed, same
+ *      effect as the unit test's raw-SQL `datetime('now','-400 days')`).
+ *      `autoArchiveDecayed` (real wall-clock `now`, no override) archives it;
+ *      `rollbackMemory` restores the pre-archive snapshot — which is STILL
+ *      400-days-ancient — and its built-in rescue reinforce
+ *      (`reinforceMemory`, unconditionally real-wall-clock) is what refreshes
+ *      `last_seen` back to genuinely now. A second archive pass at real wall
+ *      time finds nothing to archive only because that rescue ran: comment it
+ *      out in `rollbackMemory` and this sub-check re-archives, proving the
+ *      gate is load-bearing (see Task 7 report for the RED run). G2 asserts
+ *      exactly one audited `rollback` row lands on the carrier dream the
+ *      first pass created.
+ *   2. G3: a `merge` entry whose keep target was archived out-of-band after
+ *      the diff was generated must be refused (`not_actionable`) rather than
+ *      archive its sibling toward a dead target — stale-diff defense, not
+ *      data loss.
+ *   3. Canonical survivor: an `exact_dup` pair split across an alias/canonical
+ *      scope pair (same normalized content, different scope) swaps keep and
+ *      archive so the CANONICAL-scoped row survives when `canonicalizeScope`
+ *      is supplied.
+ */
+export async function runReversibilityScenario(deps: {
+  memoryStore: IMemoryStore;
+  dreamStore: IDreamStore;
+}): Promise<ScenarioResult> {
+  const failures: string[] = [];
+  const check = (label: string, ok: boolean, detail = ''): void => {
+    if (!ok) failures.push(`${label}${detail ? ` (${detail})` : ''}`);
+  };
+
+  const applyDeps: ApplyDeps = {
+    memoryStore: deps.memoryStore,
+    dreamStore: deps.dreamStore,
+    vectorIndex: new NullVectorSearch(),
+  };
+
+  const seed = async (content: string, scope = 'global', confidence = 0.7): Promise<number> => {
+    const { id } = await deps.memoryStore.store({
+      content, type: 'project', scope, source: 'replay-reversibility',
+      source_path: null, metadata: '{}', embedding: null, embedding_model: '',
+      created_by: null, tags: [], confidence,
+    });
+    return id;
+  };
+
+  // ── G1/G2: rescue loop ──
+  {
+    const id = await seed('replay reversibility: ancient but deliberately rescued', 'global', 0.6);
+    // Genuinely backdate last_seen — the effect a rollback-restored snapshot
+    // must actually be seen to have, distinct from just inflating the clock
+    // `autoArchiveDecayed` scores against.
+    await deps.dreamStore.reinforceMemory(id, new Date(Date.now() - 400 * DAY_MS).toISOString());
+
+    const first = await autoArchiveDecayed(applyDeps, 0.1, false);
+    check('G1: decay pass archives the genuinely-aged memory', first.archived.includes(id), `archived=${JSON.stringify(first.archived)}`);
+    check('G1: memory is archived after the first pass', (await deps.memoryStore.get(id))?.is_archived === 1);
+
+    const rb = await rollbackMemory(applyDeps, id);
+    check('G1: rollback succeeds', rb !== null);
+    check('G1: memory is active again after rollback', (await deps.memoryStore.get(id))?.is_archived === 0);
+
+    check('G2: exactly one audited rollback row on the carrier dream',
+      first.dream_id !== undefined
+        && (await deps.dreamStore.listAuditForDream(first.dream_id)).filter(a => a.change_class === 'rollback').length === 1,
+      `dream_id=${first.dream_id}`);
+
+    // Real wall-clock now (no override): the rescue reinforce set last_seen to
+    // genuinely now, so this must find nothing — the rescue holds.
+    const second = await autoArchiveDecayed(applyDeps, 0.1, false);
+    check('G1: the rescue holds — a real-time re-run archives nothing', !second.archived.includes(id), `archived=${JSON.stringify(second.archived)}`);
+    check('G1: memory stays active after the rescue re-run', (await deps.memoryStore.get(id))?.is_archived === 0);
+  }
+
+  // ── G3: stale keep-target refusal ──
+  {
+    const a = await seed('replay reversibility: keep-target A');
+    const b = await seed('replay reversibility: sibling B');
+    const dream = await deps.dreamStore.createDream({ window_key: 'replay-reversibility-g3' });
+    const entry: DreamDiffEntry = {
+      change_class: 'merge', tier: 'reasoner-driven', memory_ids: [a, b],
+      rationale: 'replay reversibility: stale keep-target scenario',
+      after: { keep_id: a, archive_ids: [b] },
+    };
+    await deps.memoryStore.archive(a); // out-of-band archive of the keep target, after the diff was crafted
+
+    const result = await applyEntry(applyDeps, dream.id, 0, entry, false);
+    check('G3: applyEntry refuses a stale (archived) keep target', result.outcome === 'not_actionable', `outcome=${result.outcome}`);
+    const bRow = await deps.memoryStore.get(b);
+    check('G3: sibling B stays active (no data loss)', bRow !== null && !bRow.is_archived);
+  }
+
+  // ── Canonical survivor: exact_dup swap across an alias/canonical scope pair ──
+  {
+    const a = await seed('npm test runs the suite', SYNTHETIC_ALIAS_SCOPE_RAW, 0.8);
+    const b = await seed('NPM  test runs the suite', SYNTHETIC_ALIAS_SCOPE_CANONICAL, 0.6);
+    const dream = await deps.dreamStore.createDream({ window_key: 'replay-reversibility-canon' });
+    const entry: DreamDiffEntry = {
+      change_class: 'exact_dup', tier: 'deterministic-safe', memory_ids: [a, b],
+      rationale: 'replay reversibility: exact dup across an alias/canonical scope pair',
+      after: { keep_id: a, archive_ids: [b] },
+    };
+    const canonicalDeps: ApplyDeps = {
+      ...applyDeps,
+      canonicalizeScope: async (s: string) => (s === SYNTHETIC_ALIAS_SCOPE_RAW ? SYNTHETIC_ALIAS_SCOPE_CANONICAL : s),
+    };
+
+    const result = await applyEntry(canonicalDeps, dream.id, 0, entry, false);
+    check('canonical survivor: entry applies', result.outcome === 'applied', `outcome=${result.outcome}`);
+    check('canonical survivor: alias-scoped A archived', (await deps.memoryStore.get(a))?.is_archived === 1);
+    check('canonical survivor: canonical-scoped B survives', (await deps.memoryStore.get(b))?.is_archived === 0);
+  }
+
+  return { name: 'phase2-reversibility', ok: failures.length === 0, failures };
 }

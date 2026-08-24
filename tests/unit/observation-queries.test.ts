@@ -294,6 +294,36 @@ describe('ObservationQueries', () => {
       const stats = await obsQueries.getObservationStats('project:a');
       expect(stats.total).toBe(1);
     });
+
+    // Phase 4: §2's alias-group dormancy reads per-scope recency — a global
+    // MAX(created_at) under a scoped call would make every scope share one
+    // activity clock (and a scope with no rows read the corpus-wide newest).
+    it('scopes oldest/newest to the requested project_scope; a scope with no rows reads null', async () => {
+      await obsQueries.storeObservation(createTestObservation({ project_scope: 'project:a' }));
+
+      const scoped = await obsQueries.getObservationStats('project:a');
+      expect(scoped.oldest).not.toBeNull();
+      expect(scoped.newest).not.toBeNull();
+
+      const empty = await obsQueries.getObservationStats('project:no-rows');
+      expect(empty.total).toBe(0);
+      expect(empty.oldest).toBeNull();
+      expect(empty.newest).toBeNull();
+    });
+
+    // R-1 (team round): mirror the PG executed-SQL twin's discrimination — a
+    // scoped call must return the scope's OWN aged stamp, not leak another
+    // scope's fresher one through a global MAX(created_at).
+    it('a scoped newest is the scope\'s own aged stamp, not another scope\'s fresher one', async () => {
+      await obsQueries.storeObservation(createTestObservation({ project_scope: 'project:aged-a' }));
+      await obsQueries.storeObservation(createTestObservation({ project_scope: 'project:fresh-b' }));
+      const aged = new Date(Date.now() - 100 * 86_400_000).toISOString();
+      db.prepare("UPDATE observations SET created_at = ? WHERE project_scope = 'project:aged-a'").run(aged);
+
+      const a = await obsQueries.getObservationStats('project:aged-a');
+      expect(a.newest).not.toBeNull();
+      expect(Date.now() - new Date(a.newest!).getTime()).toBeGreaterThan(90 * 86_400_000);
+    });
   });
 
   describe('getObservationsBySession', () => {

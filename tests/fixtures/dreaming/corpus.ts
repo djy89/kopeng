@@ -9,12 +9,14 @@
  *               and durability-aware decay
  *   phase 2   — reasoner classification (what a banded pair MEANS)
  *
- * Embeddings are hand-crafted unit vectors (18-dim), NOT model output — the
+ * Embeddings are hand-crafted unit vectors (26-dim), NOT model output — the
  * harness stays zero-model. `blend(i, j, w)` builds a vector whose cosine with
  * `basis(i)` is exactly `w`, so every pairwise similarity below is by design:
  * paraphrase pair at 0.98 (collapse tier), contradiction at 0.90 and preference
  * change at 0.88 (reasoner band), Redis distractors at 0.70 (sub-band — shared
- * vocabulary must NOT be flagged).
+ * vocabulary must NOT be flagged), and the Phase-5 threshold-straddling pairs
+ * at 0.96/0.94 (either side of the 0.95 collapse threshold) and 0.86/0.84
+ * (either side of the 0.85 band floor).
  *
  * Hard-Anchor decoys (ids 12–15): anchored memories (`confidence = 1.0` or
  * `is_locked`) each have a journal-tier twin with IDENTICAL normalized content.
@@ -26,8 +28,9 @@
  */
 import type { CandidateMemory } from '../../../src/dreaming/reasoner/reasoner.js';
 import type { GoldCase } from '../../../src/dreaming/replay.js';
+import { SYNTHETIC_ALIAS_SCOPE_RAW, SYNTHETIC_ALIAS_SCOPE_CANONICAL } from '../../../src/dreaming/replay.js';
 
-const DIM = 18;
+const DIM = 26;
 
 function basis(i: number): Float32Array {
   const v = new Float32Array(DIM);
@@ -114,6 +117,25 @@ export const SYNTHETIC_CORPUS: CandidateMemory[] = [
   //    low confidence → effective strength ≈ 0.07 < 0.2 archive threshold ──
   mem(30, 'Workaround for the legacy importer crash: rerun with --skip-validation.', basis(16),
     { confidence: 0.45, last_seen: '2026-01-05T12:00:00Z', updated_at: '2026-01-05T12:00:00Z' }),
+
+  // ── threshold-straddling pairs (Phase 5): one pair just ABOVE and one just
+  //    BELOW each selector boundary, so a drifted predicate flips a gate rather
+  //    than passing silently. Margins (0.01) dwarf float32 rounding (~1e-7).
+  //    NOTE: the band pairs here (42-43, 44-45) feed EXPECTED_CLASSIFY_CALLS_B
+  //    in scripts/replay-dream.ts — adding or removing a band pair anywhere in
+  //    this corpus must update that pin alongside its derivation comment. ──
+  // 0.96 ≥ COSINE_DUPLICATE_THRESHOLD (0.95): collapse tier, deterministic-safe.
+  mem(40, 'The recall hook runs under a hard 3-second budget per prompt.', basis(18)),
+  mem(41, 'Each prompt gives the recall hook at most 3 seconds to respond.', blend(18, 19, 0.96)),
+  // 0.94 < 0.95 but ≥ NEAR_DUP_BAND_MIN (0.85): band tier, reasoner-driven, never collapsed.
+  mem(42, 'The observation buffer flushes in chunks capped at 100 items.', basis(20)),
+  mem(43, 'Observation flush chunks are limited to 100 entries per batch.', blend(20, 21, 0.94)),
+  // 0.86 ≥ 0.85: still band tier — the floor holds from above.
+  mem(44, 'The viz server proxies SSE by URL prefix detection.', basis(22)),
+  mem(45, 'SSE requests are recognized by the viz proxy via their URL prefix.', blend(22, 23, 0.86)),
+  // 0.84 < 0.85: below the band — related vocabulary, must NOT be flagged at all.
+  mem(46, 'Winston writes structured logs for every subsystem.', basis(24)),
+  mem(47, 'Log levels are configured per transport in the Winston setup.', blend(24, 25, 0.84)),
 ];
 
 export const GOLD_CASES: GoldCase[] = [
@@ -166,7 +188,86 @@ export const GOLD_CASES: GoldCase[] = [
     detectable_phase: 1.2,
     note: 'Confidence 0.45, unseen for ~5 months → effective strength below the 0.2 archive threshold (D1.1 durability-aware decay). Archive proposal, deterministic-safe.',
   },
+  {
+    id: 'straddle-collapse-above',
+    gold_class: 'duplicate',
+    member_ids: [40, 41],
+    detectable_phase: 1.2,
+    note: 'Cosine 0.96, just above COSINE_DUPLICATE_THRESHOLD (0.95) — must land in the collapse tier (merge, deterministic-safe). A raised threshold flips this gate.',
+  },
+  {
+    id: 'straddle-band-below-collapse',
+    gold_class: 'duplicate',
+    member_ids: [42, 43],
+    detectable_phase: 1.2,
+    note: 'Cosine 0.94, just below 0.95 but in the 0.85–0.95 band — must be reasoner-driven, never collapsed. A lowered collapse threshold flips this gate.',
+  },
+  {
+    id: 'straddle-band-above-floor',
+    gold_class: 'duplicate',
+    member_ids: [44, 45],
+    detectable_phase: 1.2,
+    note: 'Cosine 0.86, just above NEAR_DUP_BAND_MIN (0.85) — band tier, reasoner-driven. A raised band floor makes this pair vanish and flips the gate.',
+  },
+  // NOTE deliberately absent: ids 46/47 (cosine 0.84, below the band) are NOT a
+  // gold case — they must produce no group and no diff entry. The zero-FP gate
+  // plus "every diff entry matches a gold case" is what fails if the band floor
+  // ever drops below 0.84.
 ];
+
+/**
+ * Alias-scope fixture set (Phase 5): normalize-equal content (a case variant —
+ * byte-identical content cannot coexist on live rows, the `content_hash` unique
+ * index forbids it) stored under two casing variants of one client scope.
+ * Grouping is closure-sensitive BY DESIGN:
+ *   - no `canonicalize` wired  → the pair reads cross-scope → `promote_global`
+ *     signal (R6: promote, never collapse);
+ *   - alias closure wired      → both sides canonicalize to the canonical scope
+ *     → same-scope `exact_dup`, deterministic-safe, and Phase-2 provenance
+ *     stamps raw vs effective scope per member.
+ * The replay CLI runs BOTH configurations and asserts each outcome, so a broken
+ * or silently-dropped closure fails the harness instead of degrading grouping.
+ * The scope pair is the shared SYNTHETIC_ALIAS_SCOPE_* definition (one source,
+ * also used by the reversibility scenario); the table below goes through the
+ * real `buildScopeResolution` validator in the CLI, never a hand-rolled parser.
+ */
+export const ALIAS_CORPUS: CandidateMemory[] = [
+  mem(50, 'Invoices for the acme account are filed under the shared drive.', basis(0), { scope: SYNTHETIC_ALIAS_SCOPE_CANONICAL }),
+  mem(51, 'INVOICES for the acme account are filed under the shared drive.', basis(0), { scope: SYNTHETIC_ALIAS_SCOPE_RAW }),
+];
+
+/** Gold set when NO canonicalize closure is wired: raw scopes differ → cross-scope signal. */
+export const ALIAS_GOLD_RAW: GoldCase[] = [
+  {
+    id: 'alias-pair-raw',
+    gold_class: 'cross_scope_duplicate',
+    member_ids: [50, 51],
+    detectable_phase: 0,
+    note: 'Normalize-equal content (case variant) on client:acme-foods vs client:Acme-Foods with no alias closure — cross-scope on raw strings, promote_global signal.',
+  },
+];
+
+/** Gold set when the alias closure IS wired: both scopes fold to one canonical → same-scope dup. */
+export const ALIAS_GOLD_CANONICAL: GoldCase[] = [
+  {
+    id: 'alias-pair-canonical',
+    gold_class: 'duplicate',
+    member_ids: [50, 51],
+    detectable_phase: 0,
+    note: 'Same pair under an alias closure mapping client:Acme-Foods → client:acme-foods — same-scope exact_dup, deterministic-safe.',
+  },
+];
+
+/**
+ * The raw alias table for the canonical alias pass. The replay CLI resolves it
+ * through the REAL `buildScopeResolution` (src/scopes/resolver.ts) — closure
+ * and version both come from the resolution, so a fixture entry the production
+ * validator would reject cannot silently certify grouping behavior the write
+ * path ignores (the Phase-1 four-parsers failure mode).
+ */
+export const ALIAS_TABLE: Record<string, string> = {
+  [SYNTHETIC_ALIAS_SCOPE_RAW]: SYNTHETIC_ALIAS_SCOPE_CANONICAL,
+};
 
 /**
  * The anchored half of each decoy pair must never appear in a candidate group or

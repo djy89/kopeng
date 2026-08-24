@@ -1,9 +1,10 @@
 import type pg from 'pg';
-import type { Memory, MemoryType, PromotionRun, ConfidenceTierCount, TopDecayingMemory, CorpusHealthStats, CorpusHealthSampleRow } from '../types/types.js';
+import type { Memory, MemoryType, PromotionRun, ConfidenceTierCount, TopDecayingMemory, CorpusHealthStats, CorpusHealthSampleRow, ScopeAggregateRow } from '../types/types.js';
 import { CONTRADICTION_FLAG_TAG } from '../dreaming/contradiction.js';
 import type { IMemoryStore } from './interfaces.js';
-import { computeContentHash, generateSummary } from './queries.js';
+import { computeContentHash, generateSummary, foldScopeAggregates } from './queries.js';
 import { computeDecayScores } from '../promotion/decay.js';
+import { ARCHIVED_SQL_PREDICATE } from '../utils/archived.js';
 
 function embeddingBufferToVector(buf: Buffer): string {
   const arr = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
@@ -221,7 +222,7 @@ export class PgQueries implements IMemoryStore {
 
   async get(id: number): Promise<(Memory & { tags: string[] }) | null> {
     const result = await this.pool.query(
-      'SELECT id, content, content_hash, summary, type, scope, source, source_path, metadata, embedding::text, embedding_model, created_by, created_at, updated_at, archived_at, is_archived, confidence, discovery_run_id, observation_count, last_seen, is_locked FROM memories WHERE id = $1',
+      'SELECT id, content, content_hash, summary, type, scope, source, source_path, metadata, embedding::text, embedding_model, created_by, created_at, updated_at, archived_at, is_archived, confidence, discovery_run_id, observation_count, last_seen, is_locked, deprecated_at, valid_from, last_contradicted FROM memories WHERE id = $1',
       [id]
     );
     if (result.rows.length === 0) return null;
@@ -242,6 +243,21 @@ export class PgQueries implements IMemoryStore {
     );
 
     return { ...memory, tags };
+  }
+
+  // Non-reinforcing read — see IMemoryStore.peek.
+  async peek(id: number): Promise<(Memory & { tags: string[] }) | null> {
+    const result = await this.pool.query(
+      'SELECT id, content, content_hash, summary, type, scope, source, source_path, metadata, embedding::text, embedding_model, created_by, created_at, updated_at, archived_at, is_archived, confidence, discovery_run_id, observation_count, last_seen, is_locked, deprecated_at, valid_from, last_contradicted FROM memories WHERE id = $1',
+      [id]
+    );
+    if (result.rows.length === 0) return null;
+    const memory = rowToMemory(result.rows[0]);
+    const tagsResult = await this.pool.query(
+      'SELECT tag FROM memory_tags WHERE memory_id = $1',
+      [id]
+    );
+    return { ...memory, tags: tagsResult.rows.map((r: Record<string, unknown>) => r.tag as string) };
   }
 
   async update(
@@ -561,6 +577,16 @@ export class PgQueries implements IMemoryStore {
     );
   }
 
+  async trimAccessLog(days: number): Promise<number> {
+    if (days <= 0) return 0; // 0 = keep forever — never run the DELETE
+    // Backend-native cutoff (CX-7): interval arithmetic in PG, not a JS string.
+    const result = await this.pool.query(
+      'DELETE FROM memory_access_log WHERE accessed_at < now() - make_interval(days => $1)',
+      [days]
+    );
+    return result.rowCount ?? 0;
+  }
+
   async reinforceOnAccess(ids: number[]): Promise<void> {
     if (ids.length === 0) return;
     await this.pool.query(
@@ -725,9 +751,12 @@ export class PgQueries implements IMemoryStore {
       scope: string;
       is_locked: boolean;
       metadata: string | Record<string, unknown> | null;
+      type: string;
+      tags: string[] | null;
     }>(
-      `SELECT id, confidence, observation_count, last_seen, updated_at, embedding::text AS embedding, scope, is_locked, metadata
-       FROM memories WHERE is_archived = false ORDER BY id ASC LIMIT $1`,
+      `SELECT m.id, m.confidence, m.observation_count, m.last_seen, m.updated_at, m.embedding::text AS embedding, m.scope, m.is_locked, m.metadata, m.type,
+              (SELECT array_agg(tag) FROM memory_tags t WHERE t.memory_id = m.id) AS tags
+       FROM memories m WHERE m.is_archived = false ORDER BY m.id ASC LIMIT $1`,
       [limit]
     );
     return result.rows.map(r => ({
@@ -741,7 +770,56 @@ export class PgQueries implements IMemoryStore {
       is_locked: !!r.is_locked,
       // jsonb arrives pre-parsed from the driver; classifyDupPair expects the string form
       metadata: r.metadata == null ? null : typeof r.metadata === 'string' ? r.metadata : JSON.stringify(r.metadata),
+      type: r.type,
+      tags: r.tags ?? [],
     }));
+  }
+
+  async getScopeAggregates(): Promise<ScopeAggregateRow[]> {
+    // Same shape as the SQLite implementation; `CASE WHEN is_archived THEN`
+    // rather than a backend-specific comparison. Timestamps normalized to ISO
+    // here because the pg driver hands back Date objects, and foldScopeAggregates
+    // compares them as strings.
+    const result = await this.pool.query<{
+      scope: string; type: string; n: string | number; active: string | number;
+      first_write: Date | string | null; last_write: Date | string | null;
+    }>(
+      `SELECT scope, type,
+              COUNT(*) AS n,
+              SUM(CASE WHEN is_archived THEN 0 ELSE 1 END) AS active,
+              MIN(created_at) AS first_write,
+              MAX(created_at) AS last_write
+       FROM memories
+       GROUP BY scope, type`
+    );
+    const iso = (v: Date | string | null) => (v instanceof Date ? v.toISOString() : v);
+    return foldScopeAggregates(result.rows.map(r => ({
+      scope: r.scope,
+      type: r.type,
+      n: Number(r.n),
+      active: Number(r.active),
+      first_write: iso(r.first_write),
+      last_write: iso(r.last_write),
+    })));
+  }
+
+  async countActiveByScope(scope: string): Promise<number> {
+    const result = await this.pool.query<{ count: string }>(
+      `SELECT COUNT(*) AS count FROM memories WHERE scope = $1 AND ${ARCHIVED_SQL_PREDICATE} = false`,
+      [scope]
+    );
+    return parseInt(result.rows[0].count, 10);
+  }
+
+  async countActiveWithMetadataKey(key: string): Promise<number> {
+    // metadata is JSONB here, so the native top-level key-existence check is
+    // both correct and cheaper than the SQLite side's LIKE (which the Task 10
+    // brief allows as advisory). jsonb_exists() is the function form of `?`.
+    const result = await this.pool.query<{ count: string }>(
+      `SELECT COUNT(*) AS count FROM memories WHERE ${ARCHIVED_SQL_PREDICATE} = false AND jsonb_exists(metadata, $1)`,
+      [key]
+    );
+    return parseInt(result.rows[0].count, 10);
   }
 }
 

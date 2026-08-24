@@ -12,6 +12,8 @@
  */
 
 import type { IMemoryStore, IVectorSearch } from '../database/interfaces.js';
+import { CLAUDE_INDEX_TAG, SKILL_TAG } from '../types/types.js';
+import { isScopeForm, isGlobalScope } from '../scopes/resolver.js';
 import { embed, isEmbedderReady } from '../embeddings/embedder.js';
 import logger from '../utils/logger.js';
 
@@ -54,12 +56,25 @@ export interface SurfaceCaps {
 export interface SurfaceDeps {
   queries: IMemoryStore;
   embeddingIndex: IVectorSearch;
+  /**
+   * T46 alias-table canonicalization (Phase 4 T8). Absent ⇒ identity — the
+   * project lanes search the raw request scopes, byte-identical to pre-T8.
+   */
+  canonicalizeScope?: (s: string) => Promise<string>;
+  /** Alias-group expansion (canonical + every alias of it). Absent ⇒ raw only. */
+  expandScope?: (s: string) => Promise<string[]>;
 }
 
 export interface SurfaceRequest {
   prompt: string;
   /** Optional `project:<name>` scope to also pull per-project conventions. */
   projectScope?: string;
+  /**
+   * Declared anchor scopes (P4 `.kopeng.json` markers), additive to
+   * projectScope — each feeds the procedural-skill and per-project
+   * convention lanes after canonicalization + alias expansion.
+   */
+  anchorScopes?: string[];
   caps?: SurfaceCaps;
 }
 
@@ -79,6 +94,9 @@ const FETCH_PER_SCOPE = 10;
 
 /** RRF fusion constant (mirrors recall path). */
 const K = 60;
+
+/** Hard cap on the resolved project-lane scope set (mirrors the P4 anchor bound). */
+const PROJECT_LANE_MAX_SCOPES = 16;
 
 // ── Core search helpers ────────────────────────────────────────────────────
 
@@ -137,16 +155,19 @@ async function searchScope(
   ftsQuery: string | null,
   scope: string,
   scoreFloor: number,
+  indexTag: string = CLAUDE_INDEX_TAG,
 ): Promise<Array<{ id: number; score: number }>> {
   const { queries, embeddingIndex } = deps;
 
-  // Pre-filter by scope AND the claude-index tag — surfacing only ever proposes the
-  // curated ~/.claude catalog, never arbitrary memories that happen to share the scope.
-  // Without this, project:<name> conventions pull in the whole project corpus, and
+  // Pre-filter by scope AND an index tag. The catalog lanes use CLAUDE_INDEX_TAG
+  // (the curated ~/.claude catalog). The procedural-skill lane uses SKILL_TAG —
+  // auto-discovered workflow memories, NOT hand-curated; they carry a derived
+  // external_key and surface as ADVISORY (see the materialise call below). Without
+  // this pre-filter, project:<name> pulls in the whole project corpus, and
   // client:claude-tool mixes in legacy ad-hoc tool memories (which lack external_key).
   const candidateIds = await queries.getFilteredIds({
     scope,
-    tags: ['claude-index'],
+    tags: [indexTag],
     include_archived: false,
   });
 
@@ -253,21 +274,83 @@ export async function surface(
 
     const ftsQuery = promptToFtsQuery(req.prompt);
 
-    // Convention scopes: always client:claude-convention; add per-project if given
-    const conventionScopes: string[] = ['client:claude-convention'];
-    if (req.projectScope) {
-      conventionScopes.push(req.projectScope);
+    // Phase 4 (T8): resolve the project-lane scope set — projectScope plus the
+    // declared anchor scopes, each canonicalized through the alias table and
+    // expanded to its alias group so rows on either side of a scope migration
+    // stay reachable. Invalid and global entries are silently skipped (never a
+    // 400), and every step fails open per-scope to the raw string so a broken
+    // alias table can't blank the lanes. Catalog scopes are untouched.
+    const rawScopes = [req.projectScope, ...(req.anchorScopes ?? [])]
+      .filter((s): s is string => typeof s === 'string' && s.length > 0)
+      .filter(s => isScopeForm(s) && !isGlobalScope(s));
+    const resolvedScopes: string[] = [];
+    const seenScopes = new Set<string>();
+    for (const raw of rawScopes) {
+      try {
+        const canonical = deps.canonicalizeScope ? await deps.canonicalizeScope(raw) : raw;
+        const group = deps.expandScope ? await deps.expandScope(canonical) : [raw];
+        for (const s of group) {
+          if (!seenScopes.has(s)) { seenScopes.add(s); resolvedScopes.push(s); }
+        }
+      } catch {
+        if (!seenScopes.has(raw)) { seenScopes.add(raw); resolvedScopes.push(raw); }
+      }
+      if (resolvedScopes.length >= PROJECT_LANE_MAX_SCOPES) break;
     }
+    const projectLaneScopes = resolvedScopes.slice(0, PROJECT_LANE_MAX_SCOPES);
+
+    // Convention scopes: always client:claude-convention; add the resolved
+    // project-lane scopes for per-project conventions.
+    const conventionScopes: string[] = ['client:claude-convention', ...projectLaneScopes];
+
+    // Procedural-skill scopes: auto-discovered workflow ("skill") memories are
+    // ALWAYS project-scoped (discovery writes scope:project:<name>), tagged
+    // SKILL_TAG — distinct from the client:claude-skill catalog lane. No global
+    // producer exists, so we don't search 'global' (avoids surfacing arbitrary
+    // global memories that merely share the tag). Empty resolved set ⇒ the
+    // lane is skipped (the pre-T8 "no projectScope" rule, generalized).
+    const proceduralSkillScopes = projectLaneScopes;
 
     // Fan out all scope searches in parallel
-    const [toolCandidates, skillCandidates, ...conventionCandidateSets] =
-      await Promise.all([
-        searchScope(deps, queryVec, ftsQuery, 'client:claude-tool', SCORE_FLOOR),
-        searchScope(deps, queryVec, ftsQuery, 'client:claude-skill', SCORE_FLOOR),
-        ...conventionScopes.map(scope =>
+    const [
+      toolCandidates,
+      catalogSkillCandidates,
+      proceduralSkillSets,
+      conventionCandidateSets,
+    ] = await Promise.all([
+      searchScope(deps, queryVec, ftsQuery, 'client:claude-tool', SCORE_FLOOR),
+      searchScope(deps, queryVec, ftsQuery, 'client:claude-skill', SCORE_FLOOR),
+      Promise.all(
+        proceduralSkillScopes.map(scope =>
+          searchScope(deps, queryVec, ftsQuery, scope, SCORE_FLOOR, SKILL_TAG),
+        ),
+      ),
+      Promise.all(
+        conventionScopes.map(scope =>
           searchScope(deps, queryVec, ftsQuery, scope, SCORE_FLOOR),
         ),
-      ]);
+      ),
+    ]);
+
+    // Procedural skill ids surface as ADVISORY (auto-derived, unconfirmed) even
+    // though they share the 'skill' class with the curated catalog (which is hard).
+    const proceduralSkillIds = new Set<number>(
+      proceduralSkillSets.flat().map(c => c.id),
+    );
+
+    // Merge catalog + procedural skills into one class (dedup by id, keep max score).
+    const skillById = new Map<number, number>();
+    for (const { id, score } of catalogSkillCandidates) {
+      if (!skillById.has(id) || skillById.get(id)! < score) skillById.set(id, score);
+    }
+    for (const candidates of proceduralSkillSets) {
+      for (const { id, score } of candidates) {
+        if (!skillById.has(id) || skillById.get(id)! < score) skillById.set(id, score);
+      }
+    }
+    const skillCandidates = [...skillById.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([id, score]) => ({ id, score }));
 
     // Merge convention candidates from all convention scopes (dedup by id)
     const conventionById = new Map<number, number>();
@@ -285,12 +368,17 @@ export async function surface(
     // Global dedup: a memory id should only appear in ONE class
     const seenIds = new Set<number>();
 
-    /** Materialise the top-N candidates for a class. */
+    /**
+     * Materialise the top-N candidates for a class. `bindingFor`, when given,
+     * overrides the default binding per id (used to mark procedural skills
+     * advisory while catalog skills in the same class stay hard).
+     */
     async function materialise(
       candidates: Array<{ id: number; score: number }>,
       cls: SurfaceClass,
       binding: Binding,
       cap: number,
+      bindingFor?: (id: number) => Binding | undefined,
     ): Promise<SurfaceItem[]> {
       const items: SurfaceItem[] = [];
       for (const { id, score } of candidates) {
@@ -303,17 +391,21 @@ export async function surface(
         const { key, title } = extractKeyAndTitle(mem.id, mem.content, mem.metadata);
 
         seenIds.add(id);
-        items.push({ class: cls, key, title, content: mem.content, score, binding });
+        items.push({ class: cls, key, title, content: mem.content, score, binding: bindingFor?.(id) ?? binding });
       }
       return items;
     }
 
-    // Materialise per class — tools first (highest priority for dedup)
-    const [tools, skills, conventions] = await Promise.all([
-      materialise(toolCandidates, 'tool', 'hard', caps.tools),
-      materialise(skillCandidates, 'skill', 'hard', caps.skills),
-      materialise(conventionCandidates, 'convention', 'advisory', caps.conventions),
-    ]);
+    // Materialise per class SEQUENTIALLY — tools first (highest priority for
+    // dedup). R-4 (team round): under Promise.all the three loops interleaved,
+    // and the check-then-act on `seenIds` (the add lands only after an awaited
+    // queries.get) let a row reachable by two classes — e.g. a project-lane
+    // row tagged both `claude-index` and `skill` — surface in both. The
+    // per-scope searches above stay parallel; only this phase is serialized.
+    const tools = await materialise(toolCandidates, 'tool', 'hard', caps.tools);
+    const skills = await materialise(skillCandidates, 'skill', 'hard', caps.skills,
+      id => (proceduralSkillIds.has(id) ? 'advisory' : undefined));
+    const conventions = await materialise(conventionCandidates, 'convention', 'advisory', caps.conventions);
 
     return { tools, skills, conventions };
   } catch (err) {

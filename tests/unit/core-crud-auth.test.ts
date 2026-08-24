@@ -13,7 +13,7 @@
  *      /api/memories/recall and /search on every prompt with no key, so gating
  *      them would silently break recall for every client.
  */
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import Database from 'better-sqlite3';
 import { runMigrations } from '../../src/database/migrations.js';
@@ -23,6 +23,29 @@ import { registerRoutes } from '../../src/api/routes.js';
 import config from '../../src/config/config.js';
 import type { IDatabaseLifecycle } from '../../src/database/interfaces.js';
 
+// CX-13: POST /api/memories/traverse is registered only inside the
+// `if (config.neo4j.enabled)` block (routes.ts) and its handler opens a real
+// Neo4j session. To pin its auth posture WITHOUT a Neo4j instance — and
+// without the vacuous pass where an unregistered route 404s and 404 !== 401
+// trivially holds — the graph dependencies are stubbed so the route can be
+// REGISTERED and answer for real.
+vi.mock('../../src/graph/neo4j.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/graph/neo4j.js')>();
+  return {
+    ...actual,
+    getSession: () => ({ close: async () => {} }),
+  };
+});
+vi.mock('../../src/graph/graph-queries.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/graph/graph-queries.js')>();
+  return {
+    ...actual,
+    traverseEntity: async () => ({
+      entity: 'deploys', entityType: 'unknown', connectedMemoryIds: [], relatedEntities: [],
+    }),
+  };
+});
+
 const KEY = 'test-admin-key';
 
 let app: FastifyInstance;
@@ -30,8 +53,14 @@ let db: Database.Database;
 let queries: MemoryQueries;
 let seededId = 0;
 let prevKey = '';
+let prevNeo4jEnabled = false;
 
 beforeAll(async () => {
+  // Route registration happens once, inside registerRoutes — the flag must be
+  // on BEFORE that call for the traverse route to exist at all.
+  prevNeo4jEnabled = config.neo4j.enabled;
+  config.neo4j.enabled = true;
+
   db = new Database(':memory:');
   db.pragma('journal_mode = WAL');
   runMigrations(db);
@@ -68,6 +97,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  config.neo4j.enabled = prevNeo4jEnabled;
   await app.close();
   db.close();
 });
@@ -129,15 +159,54 @@ describe('core CRUD is admin-key gated', () => {
 describe('POST-shaped reads stay open (the recall hooks send no key)', () => {
   // A regression here breaks memory recall for every client, silently — the
   // hooks fail closed to "no memories" rather than surfacing an auth error.
-  for (const url of ['/api/memories/recall', '/api/memories/search']) {
+  // The not-404 assertion guards the vacuous pass: an unregistered route
+  // 404s, and 404 !== 401 would hold trivially.
+  const OPEN_READS: Array<{ url: string; payload: unknown }> = [
+    { url: '/api/memories/recall', payload: { query: 'seed memory' } },
+    { url: '/api/memories/search', payload: { query: 'seed memory' } },
+    { url: '/api/surface', payload: { prompt: 'which tools help with deploys' } },
+  ];
+  for (const { url, payload } of OPEN_READS) {
     it(`${url} does not require a key`, async () => {
-      const res = await app.inject({ method: 'POST', url, payload: { query: 'seed memory' } });
+      const res = await app.inject({ method: 'POST', url, payload: payload as never });
+      expect(res.statusCode).not.toBe(404);
+      expect(res.statusCode).not.toBe(401);
+    });
+
+    it(`${url} does not 401 on a wrong key either`, async () => {
+      const res = await app.inject({
+        method: 'POST', url, headers: { 'x-api-key': 'nope' }, payload: payload as never,
+      });
+      expect(res.statusCode).not.toBe(404);
       expect(res.statusCode).not.toBe(401);
     });
   }
 
   it('GET /api/memories does not require a key', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/memories?limit=5' });
+    expect(res.statusCode).toBe(200);
+  });
+});
+
+describe('POST /api/memories/traverse stays open (CX-13 — registration proven, not assumed)', () => {
+  // Registration is conditional on config.neo4j.enabled (see the vi.mock note
+  // at the top): with the flag forced on and the session/traverseEntity
+  // dependencies stubbed, the route answers for real — so the not-404
+  // assertion kills the vacuous pass where a never-registered route would
+  // satisfy `not 401` by 404ing.
+  const payload = { entity: 'deploys' };
+
+  it('is registered (not 404) and does not require a key', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/memories/traverse', payload });
+    expect(res.statusCode).not.toBe(404);
+    expect(res.statusCode).not.toBe(401);
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('does not 401 on a wrong key either', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/memories/traverse', headers: { 'x-api-key': 'nope' }, payload,
+    });
     expect(res.statusCode).toBe(200);
   });
 });

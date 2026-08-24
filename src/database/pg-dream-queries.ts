@@ -1,7 +1,9 @@
 import type pg from 'pg';
 import type { IDreamStore, IOperatorConfigStore } from './interfaces.js';
-import type {
-  Dream, DreamDiff, MemoryRevision, DreamAuditEntry, OperatorConfig, DreamMode, DreamTrigger, ConsolidationLock,
+import {
+  PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON, REVISION_KEEP_PER_MEMORY,
+  type Dream, type DreamDiff, type MemoryRevision, type DreamAuditEntry, type OperatorConfig,
+  type DreamMode, type DreamTrigger, type ConsolidationLock,
 } from '../types/types.js';
 
 /** Postgres implementation of the dreaming-layer stores (D0.2). */
@@ -72,11 +74,17 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
   }
 
   async getLastCompletedDream(operatorId: string, scope: string | null, mode: DreamMode): Promise<Dream | null> {
+    // Excludes promotion + discovery-maintenance audit-carrier rows (P3, Phase
+    // 2): a carrier is a real completed dreams row that exists only to route
+    // archives through the audited apply path, not an actual dream pass —
+    // counting it satisfies the once-per-period gate and permanently blocks
+    // the whole-corpus sweep from firing.
     const r = await this.pool.query(
       `SELECT * FROM dreams WHERE operator_id = $1 AND mode = $2
         AND scope IS NOT DISTINCT FROM $3 AND status = 'completed'
+        AND COALESCE(reason, '') NOT IN ($4, $5)
        ORDER BY started_at DESC, id DESC LIMIT 1`,
-      [operatorId, mode, scope]
+      [operatorId, mode, scope, PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON]
     );
     return r.rows.length ? rowToDream(r.rows[0]) : null;
   }
@@ -89,6 +97,11 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
   }
 
   async listRecentDreams(limit: number, offset: number = 0): Promise<Dream[]> {
+    // Carriers are INCLUDED here (team-review #22 S3): they perform real,
+    // automatic archives, so dream-history is their one operator-facing record
+    // — the ops endpoint labels them `is_carrier`. The carrier exclusion lives
+    // only where it is load-bearing: getLastCompletedDream (the once-per-period
+    // scheduler gate) and listPendingDreams (the review queue).
     const r = await this.pool.query(
       `SELECT * FROM dreams WHERE status = 'completed'
        ORDER BY started_at DESC, id DESC LIMIT $1 OFFSET $2`,
@@ -98,11 +111,15 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
   }
 
   async listPendingDreams(limit: number): Promise<Dream[]> {
+    // Carrier exclusion in the QUERY, matching listRecentDreams/getLastCompletedDream
+    // (team-review #22): carriers previously stayed out of the review queue only because
+    // their writers hardcode acceptance_status — an incidental value, not a rule.
     const r = await this.pool.query(
       `SELECT * FROM dreams WHERE status = 'completed'
         AND acceptance_status IN ('pending', 'partial')
+        AND COALESCE(reason, '') NOT IN ($2, $3)
        ORDER BY started_at DESC, id DESC LIMIT $1`,
-      [limit]
+      [limit, PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON]
     );
     return r.rows.map(rowToDream);
   }
@@ -114,29 +131,80 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
   // ───────────────────────── revisions ──────────────────────────
 
   async snapshotRevision(memoryId: number, createdByDreamId?: number | null): Promise<{ id: number; revision: number }> {
-    const r = await this.pool.query(
+    const insertSql =
       `INSERT INTO memory_revisions
         (memory_id, revision, content, content_hash, summary, embedding, embedding_model,
-         confidence, observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from, created_by_dream_id)
+         confidence, observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
+         scope, type, updated_at, last_seen, created_by_dream_id)
        SELECT m.id,
          (SELECT COALESCE(MAX(revision), 0) + 1 FROM memory_revisions WHERE memory_id = $1),
          m.content, m.content_hash, m.summary, m.embedding, m.embedding_model,
          m.confidence, m.observation_count, m.metadata,
          (SELECT COALESCE(jsonb_agg(tag ORDER BY tag), '[]'::jsonb) FROM memory_tags WHERE memory_id = $1),
-         m.last_contradicted, m.deprecated_at, m.valid_from, $2
+         m.last_contradicted, m.deprecated_at, m.valid_from,
+         m.scope, m.type, m.updated_at, m.last_seen, $2
        FROM memories m WHERE m.id = $1
-       RETURNING id, revision`,
-      [memoryId, createdByDreamId ?? null]
+       RETURNING id, revision`;
+    const insertParams = [memoryId, createdByDreamId ?? null];
+
+    // Dream-linked snapshot: single statement, no trim — a non-NULL-class insert
+    // cannot change the NULL-class set, so the trim there was a guaranteed no-op
+    // costing one round-trip per audited archive (team-review #22 r2 N2).
+    if (createdByDreamId != null) {
+      const r = await this.pool.query(insertSql, insertParams);
+      if (r.rows.length === 0) throw new Error(`snapshotRevision: memory ${memoryId} not found`);
+      return { id: Number(r.rows[0].id), revision: Number(r.rows[0].revision) };
+    }
+
+    // Operator-edit snapshot: insert + retention trim in ONE transaction — the
+    // SQLite side wraps the pair in db.transaction, and the two backends must
+    // share atomicity semantics (r2 NEW-5).
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const r = await client.query(insertSql, insertParams);
+      if (r.rows.length === 0) throw new Error(`snapshotRevision: memory ${memoryId} not found`);
+      // Retention (team-review #22): bound the operator-edit revision class to the
+      // newest REVISION_KEEP_PER_MEMORY per memory. Dream-linked revisions are
+      // exempt — see the constant's doc in types.ts.
+      await client.query(
+        `DELETE FROM memory_revisions
+          WHERE memory_id = $1 AND created_by_dream_id IS NULL
+            AND revision NOT IN (
+              SELECT revision FROM memory_revisions
+               WHERE memory_id = $1 AND created_by_dream_id IS NULL
+               ORDER BY revision DESC LIMIT $2)`,
+        [memoryId, REVISION_KEEP_PER_MEMORY]
+      );
+      await client.query('COMMIT');
+      return { id: Number(r.rows[0].id), revision: Number(r.rows[0].revision) };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async deleteRevision(memoryId: number, revision: number): Promise<boolean> {
+    const r = await this.pool.query(
+      `DELETE FROM memory_revisions WHERE memory_id = $1 AND revision = $2`, [memoryId, revision]
     );
-    if (r.rows.length === 0) throw new Error(`snapshotRevision: memory ${memoryId} not found`);
-    return { id: Number(r.rows[0].id), revision: Number(r.rows[0].revision) };
+    return (r.rowCount ?? 0) > 0;
+  }
+
+  async deleteRevisions(memoryId: number): Promise<number> {
+    const r = await this.pool.query(
+      `DELETE FROM memory_revisions WHERE memory_id = $1`, [memoryId]
+    );
+    return r.rowCount ?? 0;
   }
 
   async listRevisions(memoryId: number): Promise<MemoryRevision[]> {
     const r = await this.pool.query(
       `SELECT id, memory_id, revision, content, content_hash, summary, confidence,
         observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
-        created_by_dream_id, created_at
+        scope, type, updated_at, last_seen, created_by_dream_id, created_at
        FROM memory_revisions WHERE memory_id = $1 ORDER BY revision DESC`,
       [memoryId]
     );
@@ -147,7 +215,7 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
     const r = await this.pool.query(
       `SELECT id, memory_id, revision, content, content_hash, summary, confidence,
         observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
-        created_by_dream_id, created_at
+        scope, type, updated_at, last_seen, created_by_dream_id, created_at
        FROM memory_revisions WHERE memory_id = $1 AND revision = $2`,
       [memoryId, revision]
     );
@@ -170,23 +238,31 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
       await client.query(
         `INSERT INTO memory_revisions
           (memory_id, revision, content, content_hash, summary, embedding, embedding_model,
-           confidence, observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from, created_by_dream_id)
+           confidence, observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
+           scope, type, updated_at, last_seen, created_by_dream_id)
          SELECT m.id,
            (SELECT COALESCE(MAX(revision), 0) + 1 FROM memory_revisions WHERE memory_id = $1),
            m.content, m.content_hash, m.summary, m.embedding, m.embedding_model,
            m.confidence, m.observation_count, m.metadata,
            (SELECT COALESCE(jsonb_agg(tag ORDER BY tag), '[]'::jsonb) FROM memory_tags WHERE memory_id = $1),
-           m.last_contradicted, m.deprecated_at, m.valid_from, NULL
+           m.last_contradicted, m.deprecated_at, m.valid_from,
+           m.scope, m.type, m.updated_at, m.last_seen, NULL
          FROM memories m WHERE m.id = $1`,
         [memoryId]
       );
 
       // Copy the revision back over the live row (search_vector regenerates automatically).
+      // scope/type/last_seen are NULL-safe COALESCEs: a legacy (pre-v10) revision has
+      // NULL in these columns and must never clobber the live values (ruling 7).
+      // updated_at is NOT restored from the revision — it always gets the restore's own
+      // stamp, since it is the correction clock, not part of what's being reverted.
       await client.query(
         `UPDATE memories m SET content = r.content, content_hash = r.content_hash, summary = r.summary,
           embedding = r.embedding, embedding_model = r.embedding_model, confidence = r.confidence,
           observation_count = r.observation_count, metadata = r.metadata,
           last_contradicted = r.last_contradicted, deprecated_at = r.deprecated_at, valid_from = r.valid_from,
+          scope = COALESCE(r.scope, m.scope), type = COALESCE(r.type, m.type),
+          last_seen = COALESCE(r.last_seen, m.last_seen),
           updated_at = NOW()
          FROM memory_revisions r WHERE r.memory_id = $1 AND r.revision = $2 AND m.id = $1`,
         [memoryId, revision]
@@ -378,6 +454,10 @@ function rowToRevision(row: Record<string, unknown>): MemoryRevision {
     last_contradicted: toIsoOrNull(row.last_contradicted),
     deprecated_at: toIsoOrNull(row.deprecated_at),
     valid_from: toIsoOrNull(row.valid_from),
+    scope: (row.scope as string | null) ?? null,
+    type: (row.type as string | null) ?? null,
+    updated_at: toIsoOrNull(row.updated_at),
+    last_seen: toIsoOrNull(row.last_seen),
     created_by_dream_id: row.created_by_dream_id !== null && row.created_by_dream_id !== undefined ? Number(row.created_by_dream_id) : null,
     created_at: toIso(row.created_at),
   };
@@ -409,6 +489,7 @@ function rowToConfig(row: Record<string, unknown>): OperatorConfig {
     auto_accept_exact_dup: !!row.auto_accept_exact_dup,
     auto_accept_decay: !!row.auto_accept_decay,
     reasoner_provider: (row.reasoner_provider as string | null) ?? null,
+    primary_scope: (row.primary_scope as string | null) ?? null,
     config: jsonToString(row.config, '{}'),
     created_at: toIso(row.created_at),
     updated_at: toIso(row.updated_at),

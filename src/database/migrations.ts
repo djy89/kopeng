@@ -398,6 +398,36 @@ const migrations: Migration[] = [
       `ALTER TABLE memory_revisions ADD COLUMN valid_from TEXT`,
     ],
   },
+  {
+    version: 8,
+    description: 'Phase 2 (reversibility): memory_revisions snapshots the whole row — scope, type, updated_at, last_seen — so scope/type changes and the decay clock are restorable',
+    up: [
+      `ALTER TABLE memory_revisions ADD COLUMN scope TEXT`,
+      `ALTER TABLE memory_revisions ADD COLUMN type TEXT`,
+      `ALTER TABLE memory_revisions ADD COLUMN updated_at TEXT`,
+      `ALTER TABLE memory_revisions ADD COLUMN last_seen TEXT`,
+    ],
+  },
+  {
+    version: 9,
+    description: 'Phase 3: scope_registry table + operator_config.primary_scope',
+    up: [
+      `CREATE TABLE IF NOT EXISTS scope_registry (
+        scope TEXT PRIMARY KEY,
+        slug TEXT,
+        claimant_raw TEXT NOT NULL,
+        origin_cwd TEXT,
+        status TEXT NOT NULL DEFAULT 'provisional'
+          CHECK(status IN ('provisional', 'confirmed', 'quarantined')),
+        reserved INTEGER NOT NULL DEFAULT 0,
+        first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        ruled_at TEXT
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_scope_registry_slug ON scope_registry(slug)`,
+      `ALTER TABLE operator_config ADD COLUMN primary_scope TEXT`,
+    ],
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

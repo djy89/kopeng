@@ -1,5 +1,38 @@
 export type MemoryType = 'user' | 'feedback' | 'project' | 'reference' | 'discovery';
 
+/**
+ * Cross-subsystem tag contracts for surfacing lanes. The producer (discovery /
+ * index sync) and the consumer (`/api/surface`) must agree on these strings —
+ * keep them here so the contract is explicit and grep-safe.
+ */
+export const CLAUDE_INDEX_TAG = 'claude-index';
+export const SKILL_TAG = 'skill';
+
+/**
+ * The `dreams.reason` marking an audit-CARRIER row: promotion's decay archival creates a real
+ * dreams row purely so archives can route through the audited apply path (R14). It is not a dream
+ * pass. Consumers that ask "did a whole-corpus sweep run?" or "what did dreaming change?" MUST
+ * exclude it — otherwise carriers satisfy the once-per-period gate and the sweep can never fire
+ * (P3, tracker Round 12).
+ *
+ * PERSISTED VALUE: this exact string is written into live `dreams.reason` rows (22 on live as of
+ * writing) matched by the queries above. Changing the value here — a rename, a typo fix, dropping
+ * "R14" — is a DATA MIGRATION, not a rename: it silently un-excludes every historical carrier row
+ * and re-deadlocks the whole-corpus sweep, with no test failing.
+ */
+export const PROMOTION_CARRIER_REASON = 'promotion decay archival (R14 audited path)';
+
+/** Marks the internal dream row that carries discovery-maintenance's audited archives. */
+export const MAINTENANCE_CARRIER_REASON = 'discovery-maintenance archival (Phase 2 audited path)';
+
+/**
+ * Retention bound for OPERATOR-EDIT revisions (team-review #22): snapshotRevision trims each
+ * memory's `created_by_dream_id IS NULL` revisions to the newest N. Dream-linked revisions are
+ * NEVER auto-trimmed — they are the audit trail's reversibility record (invariant #11) and only
+ * die via the deliberate admin purge route.
+ */
+export const REVISION_KEEP_PER_MEMORY = 20;
+
 export interface Memory {
   id: number;
   content: string;
@@ -178,7 +211,7 @@ export interface DiscoveryRun {
   memories_reinforced: number;
   started_at: string;
   completed_at: string | null;
-  status: 'running' | 'completing' | 'completed' | 'failed';
+  status: 'running' | 'completing' | 'completed' | 'failed' | 'held';
   error: string | null;
 }
 
@@ -221,6 +254,23 @@ export interface TopDecayingMemory {
 }
 
 /** Cheap SQL-only aggregates over the active corpus, backing /api/ops/corpus-health. */
+/**
+ * Per-scope aggregates backing the T43 scope-drift detector. One row per scope,
+ * over ALL memories (archived included): a migration's residual check counts
+ * active rows only, so archived rows left behind on an alias scope are exactly
+ * the residue that would otherwise go unseen.
+ */
+export interface ScopeAggregateRow {
+  scope: string;
+  total: number;
+  active: number;
+  archived: number;
+  /** memory type -> count, over all rows in this scope. */
+  by_type: Record<string, number>;
+  first_write: string | null;
+  last_write: string | null;
+}
+
 export interface CorpusHealthStats {
   active_count: number;
   /** Mean confidence over active memories. null when the corpus is empty. */
@@ -245,6 +295,15 @@ export interface CorpusHealthSampleRow {
   scope: string;
   is_locked: boolean;
   metadata: string | null;
+  /**
+   * T30 decay inputs (Phase 5 round-2 fix): without these, `memoryStrength`
+   * over the sample ran the DEFAULT 60d curve with no structural floor while
+   * the dream decay tier ran the per-type curve + floor — so the ops
+   * `decayed_at_risk_count` could disagree with what dreaming actually
+   * archives. The metric must share the archiver's predicate.
+   */
+  type: string;
+  tags: string[];
 }
 
 export interface DiscoveryConfig {
@@ -306,6 +365,13 @@ export interface PatternCandidate {
   distinct_sessions?: number;
   /** Additional tags from synthesizer (merged with default auto-discovered tags). */
   synthesized_tags?: string[];
+  /**
+   * Normalized workflow step keys for `sequence` patterns (e.g.
+   * ['Read(routes.ts)', 'Bash(tsc)']). The machine-readable form of the chain —
+   * consumed by the synthesizer's chaining and the skill key/title derivation,
+   * so neither has to re-parse the human `description`.
+   */
+  steps?: string[];
 }
 
 export interface EvidenceEntry {
@@ -375,6 +441,15 @@ export interface DreamDiffEntry {
    */
   resolution?: 'auto_applied' | 'accepted' | 'rejected';
   resolved_at?: string;
+  /**
+   * Phase 2: apply-time revalidation inputs. Absent on pre-Phase-2 diffs —
+   * the hash check and canonical-survivor preference then skip (the
+   * keep-target liveness check applies regardless).
+   */
+  provenance?: {
+    alias_table_version: string | null;
+    members: Array<{ id: number; content_hash: string | null; scope: string; effective_scope: string }>;
+  };
 }
 
 export interface DreamDiff {
@@ -402,6 +477,14 @@ export interface MemoryRevision {
   last_contradicted: string | null;
   deprecated_at: string | null;
   valid_from: string | null;
+  /** Phase 2: full-row snapshot — restorable scope/type and the decay clock.
+   *  NULL on pre-v8 revisions; restore COALESCEs so legacy revisions never
+   *  clobber live values. updated_at is recorded, NOT restored (restore
+   *  stamps its own — it is the correction clock). */
+  scope: string | null;
+  type: string | null;
+  updated_at: string | null;
+  last_seen: string | null;
   created_by_dream_id: number | null;
   created_at: string;
 }
@@ -431,6 +514,7 @@ export interface OperatorConfig {
   auto_accept_exact_dup: boolean;
   auto_accept_decay: boolean;
   reasoner_provider: string | null;
+  primary_scope: string | null;
   config: string;
   created_at: string;
   updated_at: string;

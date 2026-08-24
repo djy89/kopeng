@@ -88,11 +88,23 @@ export function parseArgs(argv: string[], envUrl?: string, homedir?: string): Sn
  * folded in under `meta`; `confidence_distribution` = the endpoint's data.
  * Returns the line WITHOUT a trailing newline (the writer owns framing).
  */
-export function composeSnapshotLine(health: OpsEnvelope, dist: OpsEnvelope, ts: string): string {
+export function composeSnapshotLine(
+  health: OpsEnvelope,
+  dist: OpsEnvelope,
+  ts: string,
+  drift?: OpsEnvelope | null,
+): string {
+  // `scope_drift` carries the SUMMARY only, not the cluster list: this file is a
+  // time series, and the number that matters over time is active_rows_adrift —
+  // 0 on a reconciled corpus, so any rise is new drift rather than a backlog.
+  // OPTIONAL by design: omitted when the drift fetch failed or the server predates
+  // /api/ops/scope-drift, so adding it can never break the weekly snapshot.
+  const driftSummary = (drift?.data as { summary?: unknown } | undefined)?.summary;
   return JSON.stringify({
     ts,
     corpus_health: { ...health.data, ...(health.meta !== undefined ? { meta: health.meta } : {}) },
     confidence_distribution: dist.data,
+    ...(driftSummary !== undefined ? { scope_drift: driftSummary } : {}),
   });
 }
 
@@ -139,8 +151,14 @@ async function main(): Promise<void> {
     fetchOps(args.url, '/api/ops/confidence-distribution'),
   ]);
 
+  // Scope drift is BEST-EFFORT and deliberately not in the Promise.all above:
+  // the two original endpoints are the snapshot's contract, and a 404 from a
+  // server predating /api/ops/scope-drift (or any drift-side error) must not
+  // cost the operator their weekly corpus-health line.
+  const drift = await fetchOps(args.url, '/api/ops/scope-drift').catch(() => null);
+
   const ts = new Date().toISOString();
-  const line = composeSnapshotLine(health, dist, ts);
+  const line = composeSnapshotLine(health, dist, ts, drift);
 
   const outPath = path.resolve(args.outPath);
   fs.mkdirSync(path.dirname(outPath), { recursive: true });

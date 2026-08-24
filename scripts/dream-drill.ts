@@ -55,10 +55,11 @@ import type {
   ConsolidationReasoner, CandidateMemory, ReasonerContext, PairVerdict, ConditionExtraction, ClusterSynthesis,
 } from '../src/dreaming/reasoner/reasoner.js';
 import { ConsolidationLockManager } from '../src/dreaming/lock.js';
-import { resolveDream, rollbackMemory, type ApplyDeps } from '../src/dreaming/apply.js';
+import { applyEntry, resolveDream, rollbackMemory, type ApplyDeps } from '../src/dreaming/apply.js';
 import { CONTRADICTION_FLAG_TAG, CONTRADICTION_FLAG_KEY } from '../src/dreaming/contradiction.js';
 import type { DreamDiffEntry } from '../src/types/types.js';
 import { DRILL_MEMORIES, DRILL_CASES } from './lib/drill-corpus.js';
+import { drillSucceeded, observedChecksPass, requiredChecksPass } from './lib/drill-verdict.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -577,10 +578,10 @@ async function drill(
       supersedeDetails.push(`#${after.supersede.current_id} not newer than #${after.supersede.deprecated_id}`);
     }
   }
-  gate('H7', 'every supersede direction is timestamp-true', supersedeDirOk,
+  gate('H7', 'every supersede direction is timestamp-true', observedChecksPass(supersedeCount, supersedeDirOk),
     !supersedeDirOk ? supersedeDetails.join('; ')
       : supersedeCount === 0
-        ? 'vacuous this run — 0 supersede entries (P2/H11 backstop the class in llm mode)'
+        ? '0 supersede entries — direction was not exercised'
         : `${supersedeCount} supersede entr(ies) checked`);
 
   const autoArchivedIds = audit.filter(a => a.applied_automatically && a.action === 'archive' && a.memory_id !== null).map(a => a.memory_id!);
@@ -657,31 +658,52 @@ async function drill(
       `markers=${marked}, rollback-cleared=${restored}`);
   } else {
     probe('P2', 'supersede accept sets markers (both rows live) and rolls back',
-      mode === 'no-llm', mode === 'no-llm' ? 'skipped — no supersede entries in no-llm mode (expected)' : 'no supersede entry this run — pref cases fell back conservative; re-run or inspect (documented reasoner-drift limitation)');
+      false, 'no supersede entry this run — apply/rollback path was not exercised');
   }
 
   // P3: accept a conditional entry — the branch encoding becomes a new memory with provenance.
   const condIdx = ['cond-1', 'cond-2'].map(c => caseEntryIndex.get(c)).find(i => i !== undefined && entries[i].change_class === 'conditional');
-  if (condIdx !== undefined) {
-    const ids = entries[condIdx].memory_ids;
+  const syntheticConditional: DreamDiffEntry | null = mode === 'no-llm' && condIdx === undefined
+    ? {
+        change_class: 'conditional',
+        tier: 'reasoner-driven',
+        memory_ids: ['cond1-a', 'cond1-b'].map(requireId),
+        rationale: 'deterministic no-LLM apply probe',
+        after: {
+          encode: {
+            content: 'When the API environment is development, use the development key; when it is production, use the deployment secret.',
+            source_ids: ['cond1-a', 'cond1-b'].map(requireId),
+            condition_a: 'environment is development',
+            condition_b: 'environment is production',
+          },
+        },
+      }
+    : null;
+  const conditionalEntry = condIdx !== undefined ? entries[condIdx] : syntheticConditional;
+  if (conditionalEntry) {
+    const ids = conditionalEntry.memory_ids;
     // Nothing after seeding creates memory rows except the conditional encoding
     // (rollback restores revisions, supersede only marks), so active rows above the
     // max seeded id after the accept are exactly what it created. Store API, not the
     // raw handle — the escape hatch stays write-only (backdating), per the
     // dream-effectiveness precedent.
     const maxSeedId = Math.max(...keyToId.values());
-    await resolveDream(applyDeps, await freshDream(), 'accept', [condIdx], new Date().toISOString());
+    const applied = condIdx !== undefined
+      ? (await resolveDream(applyDeps, await freshDream(), 'accept', [condIdx], new Date().toISOString())).applied === 1
+      : (await applyEntry(applyDeps, run.dream_id!, entries.length, conditionalEntry, false)).outcome === 'applied';
     const created = await queries.listByIdRange({ after_id: maxSeedId, limit: 100 });
     const encoded = created.find(r => {
       try { return JSON.stringify(JSON.parse(r.metadata).condition_sources?.sort()) === JSON.stringify([...ids].sort()); }
       catch { return false; }
     });
     const originalsMarked = (await Promise.all(ids.map(async id => !!(await queries.get(id))?.last_contradicted))).every(Boolean);
-    probe('P3', 'conditional accept creates the branch encoding with provenance', !!encoded && originalsMarked,
-      encoded ? `encoded memory #${encoded.id}, originals marked last_contradicted=${originalsMarked}` : 'no encoded memory created');
+    probe('P3', 'conditional accept creates the branch encoding with provenance', applied && !!encoded && originalsMarked,
+      encoded
+        ? `${syntheticConditional ? 'deterministic no-LLM probe; ' : ''}encoded memory #${encoded.id}, originals marked last_contradicted=${originalsMarked}`
+        : `applied=${applied}, no encoded memory created`);
   } else {
     probe('P3', 'conditional accept creates the branch encoding with provenance',
-      mode === 'no-llm', mode === 'no-llm' ? 'skipped — no conditional entries in no-llm mode (expected)' : 'no conditional entry this run — cond cases fell back conservative; re-run or inspect (documented reasoner-drift limitation)');
+      false, 'no conditional entry this run — apply path was not exercised');
   }
 
   // P4: accepting a contested entry must be refused (review-only).
@@ -699,8 +721,10 @@ async function drill(
     probe('P4', 'contested accept is refused (review-only)', false, 'no pending contested entry to probe');
   }
 
-  gate('H11', 'apply/rollback probes all pass', probes.every(p => p.pass),
-    probes.filter(p => !p.pass).map(p => p.id).join(', ') || 'P1–P4 pass');
+  const requiredProbeIds = ['P1', 'P2', 'P3', 'P4'];
+  const failedProbeIds = requiredProbeIds.filter(id => !probes.some(p => p.id === id && p.pass));
+  gate('H11', 'apply/rollback probes all pass', requiredChecksPass(probes, requiredProbeIds),
+    failedProbeIds.join(', ') || 'P1–P4 executed and pass');
 
   // Stale-flag retirement (soft): the unrelated flagged pair's flag should be consumed.
   const staleFlagRow = await queries.get(requireId('unrel-b'));
@@ -738,6 +762,7 @@ async function drill(
   const softCount = caseResults.filter(r => r.status === 'soft_miss').length;
   const failCount = caseResults.filter(r => r.status === 'fail').length;
   const allHardPass = hardGates.every(g => g.pass);
+  const success = drillSucceeded(hardGates, caseResults);
 
   const report = {
     schema: 'kopeng.dream-drill/1',
@@ -752,11 +777,14 @@ async function drill(
       auto_applied: dream?.changes_auto_applied ?? 0, queued: dream?.changes_queued ?? 0,
     },
     verdict: {
+      pass: success,
       hard_gates_pass: allHardPass,
       cases: { pass: passCount, soft_miss: softCount, fail: failCount, total: caseResults.length },
-      summary: allHardPass
+      summary: success
         ? `All ${hardGates.length} hard gates hold under a dirty corpus; ${passCount}/${caseResults.length} cases fully correct, ${softCount} soft (reasoner/calibration), ${failCount} hard-correctness failures.`
-        : `HARD GATE FAILURE: ${hardGates.filter(g => !g.pass).map(g => g.id).join(', ')} — see hard_gates.`,
+        : !allHardPass
+          ? `HARD GATE FAILURE: ${hardGates.filter(g => !g.pass).map(g => g.id).join(', ')} — see hard_gates.`
+          : `CASE FAILURE: ${failCount} hard-correctness case(s) failed — see cases.`,
     },
     hard_gates: hardGates,
     cases: caseResults,
@@ -811,7 +839,7 @@ async function drill(
   console.log(`\n${report.verdict.summary}`);
   console.log(`Report: ${args.outPath}${args.keepDb ? `\nScratch DB kept: ${workingDbPath}` : ''}\n`);
 
-  return allHardPass ? 0 : 1;
+  return success ? 0 : 1;
 }
 
 main().catch((err: unknown) => {

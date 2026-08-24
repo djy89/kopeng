@@ -1,7 +1,9 @@
 import type Database from 'better-sqlite3';
 import type { IDreamStore, IOperatorConfigStore } from './interfaces.js';
-import type {
-  Dream, DreamDiff, MemoryRevision, DreamAuditEntry, OperatorConfig, DreamMode, DreamTrigger, ConsolidationLock,
+import {
+  PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON, REVISION_KEEP_PER_MEMORY,
+  type Dream, type DreamDiff, type MemoryRevision, type DreamAuditEntry, type OperatorConfig,
+  type DreamMode, type DreamTrigger, type ConsolidationLock,
 } from '../types/types.js';
 
 /** SQLite implementation of the dreaming-layer stores (D0.2). */
@@ -69,10 +71,16 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
   }
 
   async getLastCompletedDream(operatorId: string, scope: string | null, mode: DreamMode): Promise<Dream | null> {
+    // Excludes promotion + discovery-maintenance audit-carrier rows (P3, Phase
+    // 2): a carrier is a real completed dreams row that exists only to route
+    // archives through the audited apply path, not an actual dream pass —
+    // counting it satisfies the once-per-period gate and permanently blocks
+    // the whole-corpus sweep from firing.
     const row = this.db.prepare(
       `SELECT * FROM dreams WHERE operator_id = ? AND mode = ? AND scope IS ?
-        AND status = 'completed' ORDER BY started_at DESC, id DESC LIMIT 1`
-    ).get(operatorId, mode, scope) as Record<string, unknown> | undefined;
+        AND status = 'completed' AND COALESCE(reason, '') NOT IN (?, ?)
+       ORDER BY started_at DESC, id DESC LIMIT 1`
+    ).get(operatorId, mode, scope, PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON) as Record<string, unknown> | undefined;
     return row ? rowToDream(row) : null;
   }
 
@@ -84,6 +92,11 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
   }
 
   async listRecentDreams(limit: number, offset: number = 0): Promise<Dream[]> {
+    // Carriers are INCLUDED here (team-review #22 S3): they perform real,
+    // automatic archives, so dream-history is their one operator-facing record
+    // — the ops endpoint labels them `is_carrier`. The carrier exclusion lives
+    // only where it is load-bearing: getLastCompletedDream (the once-per-period
+    // scheduler gate) and listPendingDreams (the review queue).
     const rows = this.db.prepare(
       `SELECT * FROM dreams WHERE status = 'completed'
        ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?`
@@ -92,11 +105,15 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
   }
 
   async listPendingDreams(limit: number): Promise<Dream[]> {
+    // Carrier exclusion in the QUERY, matching listRecentDreams/getLastCompletedDream
+    // (team-review #22): carriers previously stayed out of the review queue only because
+    // their writers hardcode acceptance_status — an incidental value, not a rule.
     const rows = this.db.prepare(
       `SELECT * FROM dreams WHERE status = 'completed'
         AND acceptance_status IN ('pending', 'partial')
+        AND COALESCE(reason, '') NOT IN (?, ?)
        ORDER BY started_at DESC, id DESC LIMIT ?`
-    ).all(limit) as Record<string, unknown>[];
+    ).all(PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON, limit) as Record<string, unknown>[];
     return rows.map(rowToDream);
   }
 
@@ -119,23 +136,56 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
       const info = this.db.prepare(
         `INSERT INTO memory_revisions
           (memory_id, revision, content, content_hash, summary, embedding, embedding_model,
-           confidence, observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from, created_by_dream_id)
+           confidence, observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
+           scope, type, updated_at, last_seen, created_by_dream_id)
          SELECT id, @revision, content, content_hash, summary, embedding, embedding_model,
-           confidence, observation_count, metadata, @tags, last_contradicted, deprecated_at, valid_from, @dreamId
+           confidence, observation_count, metadata, @tags, last_contradicted, deprecated_at, valid_from,
+           scope, type, updated_at, last_seen, @dreamId
          FROM memories WHERE id = @id`
       ).run({ revision: next, tags: JSON.stringify(tags), dreamId: createdByDreamId ?? null, id: memoryId });
 
       if (info.changes === 0) throw new Error(`snapshotRevision: memory ${memoryId} not found`);
+
+      // Retention (team-review #22): bound the operator-edit revision class to the newest
+      // REVISION_KEEP_PER_MEMORY per memory. Dream-linked revisions are exempt — see the
+      // constant's doc in types.ts. Guarded on the snapshot's own class (r2 N2): a
+      // dream-linked snapshot cannot change the NULL-class set, so running the trim
+      // there was a guaranteed no-op per audited archive.
+      if (createdByDreamId == null) {
+        this.db.prepare(
+          `DELETE FROM memory_revisions
+            WHERE memory_id = ? AND created_by_dream_id IS NULL
+              AND revision NOT IN (
+                SELECT revision FROM memory_revisions
+                 WHERE memory_id = ? AND created_by_dream_id IS NULL
+                 ORDER BY revision DESC LIMIT ?)`
+        ).run(memoryId, memoryId, REVISION_KEEP_PER_MEMORY);
+      }
+
       return { id: Number(info.lastInsertRowid), revision: next };
     });
     return txn();
+  }
+
+  async deleteRevision(memoryId: number, revision: number): Promise<boolean> {
+    const info = this.db.prepare(
+      `DELETE FROM memory_revisions WHERE memory_id = ? AND revision = ?`
+    ).run(memoryId, revision);
+    return info.changes > 0;
+  }
+
+  async deleteRevisions(memoryId: number): Promise<number> {
+    const info = this.db.prepare(
+      `DELETE FROM memory_revisions WHERE memory_id = ?`
+    ).run(memoryId);
+    return info.changes;
   }
 
   async listRevisions(memoryId: number): Promise<MemoryRevision[]> {
     const rows = this.db.prepare(
       `SELECT id, memory_id, revision, content, content_hash, summary, confidence,
         observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
-        created_by_dream_id, created_at
+        scope, type, updated_at, last_seen, created_by_dream_id, created_at
        FROM memory_revisions WHERE memory_id = ? ORDER BY revision DESC`
     ).all(memoryId) as Record<string, unknown>[];
     return rows.map(rowToRevision);
@@ -145,7 +195,7 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
     const row = this.db.prepare(
       `SELECT id, memory_id, revision, content, content_hash, summary, confidence,
         observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
-        created_by_dream_id, created_at
+        scope, type, updated_at, last_seen, created_by_dream_id, created_at
        FROM memory_revisions WHERE memory_id = ? AND revision = ?`
     ).get(memoryId, revision) as Record<string, unknown> | undefined;
     return row ? rowToRevision(row) : null;
@@ -167,18 +217,26 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
       this.db.prepare(
         `INSERT INTO memory_revisions
           (memory_id, revision, content, content_hash, summary, embedding, embedding_model,
-           confidence, observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from, created_by_dream_id)
+           confidence, observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
+           scope, type, updated_at, last_seen, created_by_dream_id)
          SELECT id, @revision, content, content_hash, summary, embedding, embedding_model,
-           confidence, observation_count, metadata, @tags, last_contradicted, deprecated_at, valid_from, NULL
+           confidence, observation_count, metadata, @tags, last_contradicted, deprecated_at, valid_from,
+           scope, type, updated_at, last_seen, NULL
          FROM memories WHERE id = @id`
       ).run({ revision: next, tags: JSON.stringify(tags), id: memoryId });
 
       // Copy the revision back over the live row (FTS stays synced via the UPDATE trigger).
+      // scope/type/last_seen are NULL-safe COALESCEs: a legacy (pre-v8) revision has
+      // NULL in these columns and must never clobber the live values (ruling 7).
+      // updated_at is NOT restored from the revision — it always gets the restore's own
+      // stamp, since it is the correction clock, not part of what's being reverted.
       this.db.prepare(
         `UPDATE memories SET content = @content, content_hash = @content_hash, summary = @summary,
           embedding = @embedding, embedding_model = @embedding_model, confidence = @confidence,
           observation_count = @observation_count, metadata = @metadata,
           last_contradicted = @last_contradicted, deprecated_at = @deprecated_at, valid_from = @valid_from,
+          scope = COALESCE(@scope, scope), type = COALESCE(@type, type),
+          last_seen = COALESCE(@last_seen, last_seen),
           updated_at = datetime('now')
          WHERE id = @id`
       ).run({
@@ -186,7 +244,9 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
         embedding: r.embedding, embedding_model: r.embedding_model, confidence: r.confidence,
         observation_count: r.observation_count, metadata: r.metadata,
         last_contradicted: r.last_contradicted ?? null, deprecated_at: r.deprecated_at ?? null,
-        valid_from: r.valid_from ?? null, id: memoryId,
+        valid_from: r.valid_from ?? null,
+        scope: r.scope ?? null, type: r.type ?? null, last_seen: r.last_seen ?? null,
+        id: memoryId,
       });
 
       // Replace tags with the revision's snapshot.
@@ -352,6 +412,10 @@ function rowToRevision(row: Record<string, unknown>): MemoryRevision {
     last_contradicted: (row.last_contradicted as string | null) ?? null,
     deprecated_at: (row.deprecated_at as string | null) ?? null,
     valid_from: (row.valid_from as string | null) ?? null,
+    scope: (row.scope as string | null) ?? null,
+    type: (row.type as string | null) ?? null,
+    updated_at: (row.updated_at as string | null) ?? null,
+    last_seen: (row.last_seen as string | null) ?? null,
     created_by_dream_id: (row.created_by_dream_id as number | null) ?? null,
     created_at: row.created_at as string,
   };
@@ -383,6 +447,7 @@ function rowToConfig(row: Record<string, unknown>): OperatorConfig {
     auto_accept_exact_dup: !!row.auto_accept_exact_dup,
     auto_accept_decay: !!row.auto_accept_decay,
     reasoner_provider: (row.reasoner_provider as string | null) ?? null,
+    primary_scope: (row.primary_scope as string | null) ?? null,
     config: (row.config as string | null) ?? '{}',
     created_at: row.created_at as string,
     updated_at: row.updated_at as string,

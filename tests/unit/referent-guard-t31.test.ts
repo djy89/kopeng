@@ -26,7 +26,7 @@ import { createTestDatabase } from '../fixtures/test-helpers.js';
 import { MemoryQueries } from '../../src/database/queries.js';
 import { DreamQueries } from '../../src/database/dream-queries.js';
 import { runReferentGuardScenario } from '../../src/dreaming/replay.js';
-import { sequenceContent, repeatedToolContent, keyFilesContent } from '../fixtures/dreaming/template-noise.js';
+import { sequenceContent, repeatedToolContent, repeatedCommandContent, keyFilesContent } from '../fixtures/dreaming/template-noise.js';
 
 const CTX: ReasonerContext = { timeoutMs: 1000 };
 
@@ -97,6 +97,11 @@ describe('parseDiscoveryTemplate (T31)', () => {
     expect(p).toEqual({ family: 'repeated_tool', referent: 'bash::{"command":"npm run build"}' });
   });
 
+  it('parses the repeated_command template into the SAME repeated_tool family, canonical "bash" tool key (round-22 defect)', () => {
+    const p = parseDiscoveryTemplate(repeatedCommandContent('cargo test --workspace'));
+    expect(p).toEqual({ family: 'repeated_tool', referent: 'bash::cargo test --workspace' });
+  });
+
   it('classifies synthesizer list templates as referent_list', () => {
     expect(parseDiscoveryTemplate(keyFilesContent('kopeng', ['src/a.ts']))?.family).toBe('referent_list');
   });
@@ -146,6 +151,36 @@ describe('referentGuard (T31)', () => {
       mem(1, repeatedToolContent('Read', '{"file_path":"src/a.ts"}')),
       mem(2, repeatedToolContent('Grep', '{"file_path":"src/a.ts"}')),
     )?.kind).toBe('different_referent');
+  });
+
+  it('repeated_command family (round-22 defect): different commands → different_referent, not a reasoner call', () => {
+    expect(referentGuard(
+      mem(1, repeatedCommandContent('git diff --stat')),
+      mem(2, repeatedCommandContent('git diff HEAD~1 -- src/')),
+    )?.kind).toBe('different_referent');
+    expect(referentGuard(
+      mem(1, repeatedCommandContent('cargo test --workspace')),
+      mem(2, repeatedCommandContent('cargo fmt && cargo clippy && cargo test && cargo build')),
+    )?.kind).toBe('different_referent');
+    expect(referentGuard(
+      mem(1, repeatedCommandContent('python -c "import sys; print(sys.version)"')),
+      mem(2, repeatedCommandContent('python -c "import json; print(json.dumps({}))"')),
+    )?.kind).toBe('different_referent');
+  });
+
+  it('cross-family SAME command (repeated_tool "Bash" wrapper vs repeated_command wrapper): must NOT be routed unrelated', () => {
+    // Both templates report the identical command — a genuine duplicate claim,
+    // just phrased by two different detectors. Folding both into one referent
+    // namespace means the family+referent match and the pair falls through to
+    // the reasoner (same as any other same-referent pair) rather than being
+    // misrouted as different_referent/unrelated — the exact round-22 failure
+    // mode (was: repeated_command didn't parse at all, so referentGuard bailed
+    // and qwen3:8b read the near-identical prose wrapper as `duplicate`).
+    const r = referentGuard(
+      mem(1, repeatedToolContent('Bash', 'cargo test --workspace')),
+      mem(2, repeatedCommandContent('cargo test --workspace')),
+    );
+    expect(r).toBeNull();
   });
 
   it('key-files family: disjoint lists → different_referent; overlapping + numeric-only tail → numeric_reobservation', () => {

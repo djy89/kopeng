@@ -4,7 +4,14 @@ import logger from '../utils/logger.js';
 
 let observationsDb: Database.Database | null = null;
 
-const OBSERVATIONS_SCHEMA = `
+/**
+ * The observations-DB DDL — exported (round-2 fix A9) so the test fixture
+ * (tests/fixtures/test-helpers.ts) builds its in-memory DB from THIS schema
+ * instead of a hand-copied duplicate that drifts. The only other DDL copy is
+ * ensureHeldStatus's rebuild below, which is deliberately a pinned historical
+ * shape, not a duplicate of this one.
+ */
+export const OBSERVATIONS_SCHEMA = `
   CREATE TABLE IF NOT EXISTS observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     idempotency_key TEXT,
@@ -44,7 +51,7 @@ const OBSERVATIONS_SCHEMA = `
     started_at TEXT NOT NULL DEFAULT (datetime('now')),
     completed_at TEXT,
     status TEXT NOT NULL DEFAULT 'running'
-      CHECK(status IN ('running', 'completing', 'completed', 'failed')),
+      CHECK(status IN ('running', 'completing', 'completed', 'failed', 'held')),
     error TEXT
   );
 
@@ -88,9 +95,51 @@ export function getObservationsDatabase(memoryDbPath: string): Database.Database
 
   // Apply schema (idempotent — all statements use IF NOT EXISTS)
   observationsDb.exec(OBSERVATIONS_SCHEMA);
+  ensureHeldStatus(observationsDb);
 
   logger.info('Observations database initialized');
   return observationsDb;
+}
+
+/**
+ * Existing observations.db files carry the pre-Phase-3 CHECK on
+ * discovery_runs.status (no 'held'). SQLite cannot ALTER a CHECK, so when the
+ * stored CREATE sql lacks 'held' we rebuild the table in place (create-copy-
+ * drop-rename inside one transaction, index recreated). Idempotent: a rebuilt
+ * or fresh table contains 'held' in its stored sql and is left untouched.
+ */
+export function ensureHeldStatus(db: Database.Database): void {
+  const row = db.prepare(
+    `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'discovery_runs'`
+  ).get() as { sql: string } | undefined;
+  if (!row || row.sql.includes(`'held'`)) return;
+
+  logger.info('Rebuilding discovery_runs to admit held status (Phase 3)');
+  const rebuild = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE discovery_runs_p3 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_scope TEXT NOT NULL,
+        observation_start_id INTEGER,
+        observation_end_id INTEGER,
+        observations_analyzed INTEGER NOT NULL DEFAULT 0,
+        patterns_found INTEGER NOT NULL DEFAULT 0,
+        memories_created INTEGER NOT NULL DEFAULT 0,
+        memories_reinforced INTEGER NOT NULL DEFAULT 0,
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT,
+        status TEXT NOT NULL DEFAULT 'running'
+          CHECK(status IN ('running', 'completing', 'completed', 'failed', 'held')),
+        error TEXT
+      );
+      INSERT INTO discovery_runs_p3 SELECT * FROM discovery_runs;
+      DROP TABLE discovery_runs;
+      ALTER TABLE discovery_runs_p3 RENAME TO discovery_runs;
+      CREATE INDEX IF NOT EXISTS idx_discovery_project_status
+        ON discovery_runs(project_scope, status);
+    `);
+  });
+  rebuild();
 }
 
 /**

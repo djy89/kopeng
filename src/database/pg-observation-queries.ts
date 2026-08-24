@@ -1,6 +1,7 @@
 import type pg from 'pg';
 import type { Observation, ObservationInput, ObservationComplete, DiscoveryRun, ObservationStats, SessionSummary } from '../types/types.js';
 import type { IObservationStore } from './interfaces.js';
+import { GLOBAL_WATERMARK_STATUSES, SCOPE_WATERMARK_STATUSES } from './interfaces.js';
 
 // The pre-INSERT idempotency SELECT is a fast path, NOT the correctness
 // mechanism: concurrent observe-hook processes (one per tool call, multiplied
@@ -253,8 +254,15 @@ export class PgObservationQueries implements IObservationStore {
       by_tool[row.tool_name as string] = parseInt(row.count as string, 10);
     }
 
+    // Phase 4: oldest/newest are scoped like total/by_tool. §2's alias-group
+    // dormancy reads per-scope recency — a global MAX here made every scope
+    // share one activity clock (and a scope with no rows read the corpus-wide
+    // newest).
     const rangeResult = await this.pool.query(
-      'SELECT MIN(created_at) as oldest, MAX(created_at) as newest FROM observations'
+      projectScope
+        ? 'SELECT MIN(created_at) as oldest, MAX(created_at) as newest FROM observations WHERE project_scope = $1'
+        : 'SELECT MIN(created_at) as oldest, MAX(created_at) as newest FROM observations',
+      projectScope ? [projectScope] : []
     );
     const oldest = rangeResult.rows[0].oldest
       ? (rangeResult.rows[0].oldest instanceof Date ? rangeResult.rows[0].oldest.toISOString() : rangeResult.rows[0].oldest as string)
@@ -266,21 +274,30 @@ export class PgObservationQueries implements IObservationStore {
     return { total, by_project, by_tool, oldest, newest };
   }
 
-  async purgeOlderThan(olderThanDays: number, batchSize: number = 1000): Promise<number> {
+  async purgeOlderThan(olderThanDays: number, batchSize: number = 1000, exemptScopes: string[] = []): Promise<number> {
     let totalDeleted = 0;
+    const cutoffSql = `created_at < NOW() - INTERVAL '${olderThanDays} days'`;
+
+    // Exempt (held/ephemeral) scopes are excluded from BOTH statements.
+    // Built per call, not up front — the exempt list varies per run.
 
     // Windowed delete by row ID
     const maxIdResult = await this.pool.query(
-      `SELECT MAX(id) as max_id FROM observations WHERE created_at < NOW() - INTERVAL '${olderThanDays} days'`
+      `SELECT MAX(id) as max_id FROM observations WHERE ${cutoffSql}${exemptScopes.length ? ' AND NOT (project_scope = ANY($1))' : ''}`,
+      exemptScopes.length ? [exemptScopes] : []
     );
     const maxId = maxIdResult.rows[0]?.max_id;
     if (!maxId) return 0;
 
+    // The inner SELECT re-applies the cutoff + exemption — `id <= max` alone
+    // would sweep exempt (and fresh) rows sitting below the max id.
+    const deleteSql = `DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE id <= $1 AND ${cutoffSql}${exemptScopes.length ? ' AND NOT (project_scope = ANY($3))' : ''} LIMIT $2)`;
+
     let deleted: number;
     do {
       const result = await this.pool.query(
-        'DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE id <= $1 LIMIT $2)',
-        [maxId, batchSize]
+        deleteSql,
+        exemptScopes.length ? [maxId, batchSize, exemptScopes] : [maxId, batchSize]
       );
       deleted = result.rowCount ?? 0;
       totalDeleted += deleted;
@@ -303,16 +320,24 @@ export class PgObservationQueries implements IObservationStore {
   }
 
   async getLastWatermark(projectScope?: string): Promise<number> {
-    let sql = "SELECT MAX(observation_end_id) as watermark FROM discovery_runs WHERE status = 'completed'";
-    const params: string[] = [];
+    // Watermark predicates built FROM the shared constants (Phase 3, spec §6):
+    // the global cursor advances over 'held' rows, the per-scope one does not.
+    let sql = 'SELECT MAX(observation_end_id) as watermark FROM discovery_runs WHERE status = ANY($1)';
+    const params: (string | string[])[] = [
+      projectScope ? [...SCOPE_WATERMARK_STATUSES] : [...GLOBAL_WATERMARK_STATUSES],
+    ];
 
     if (projectScope) {
-      sql += ' AND project_scope = $1';
+      sql += ' AND project_scope = $2';
       params.push(projectScope);
     }
 
     const result = await this.pool.query(sql, params);
-    return result.rows[0]?.watermark ?? 0;
+    // MAX over the BIGINT observation_end_id arrives as a string from the pg
+    // driver (same as getMaxObservationId below); the contract is number.
+    const raw = result.rows[0]?.watermark;
+    if (raw == null) return 0;
+    return typeof raw === 'string' ? parseInt(raw, 10) : raw;
   }
 
   async getMaxObservationId(): Promise<number> {
@@ -390,6 +415,8 @@ export class PgObservationQueries implements IObservationStore {
   }
 
   async getActiveRun(projectScope?: string): Promise<DiscoveryRun | null> {
+    // 'held' is TERMINAL and deliberately absent here (Phase 3, Task 12) —
+    // mirrors the SQLite predicate; see observation-queries.ts for the why.
     let sql = "SELECT * FROM discovery_runs WHERE status IN ('running', 'completing')";
     const params: string[] = [];
 
@@ -424,6 +451,39 @@ export class PgObservationQueries implements IObservationStore {
 
     const result = await this.pool.query(sql, params);
     return result.rows.map((r: Record<string, unknown>) => rowToDiscoveryRun(r));
+  }
+
+  async getHeldRunSummary(): Promise<{ scope: string; observations_pending: number; observations_total: number; last_end_id: number }[]> {
+    // Pending = held rows above the scope's COMPLETED watermark (a completed
+    // re-drive run covers everything at or below its end id — CO6); the
+    // watermark predicate is built from SCOPE_WATERMARK_STATUSES, never a
+    // literal. Fully re-driven scopes (pending 0) drop out via HAVING.
+    // SUM over INTEGER arrives as a bigint string from the pg driver; Number() all.
+    const result = await this.pool.query<{ scope: string; observations_pending: string | number; observations_total: string | number; last_end_id: string | number }>(
+      `WITH scope_wm AS (
+         SELECT project_scope, MAX(observation_end_id) AS wm
+         FROM discovery_runs
+         WHERE status = ANY($1)
+         GROUP BY project_scope
+       )
+       SELECT h.project_scope AS scope,
+              COALESCE(SUM(CASE WHEN h.observation_end_id > COALESCE(w.wm, 0) THEN h.observations_analyzed ELSE 0 END), 0) AS observations_pending,
+              COALESCE(SUM(h.observations_analyzed), 0) AS observations_total,
+              COALESCE(MAX(h.observation_end_id), 0) AS last_end_id
+       FROM discovery_runs h
+       LEFT JOIN scope_wm w ON w.project_scope = h.project_scope
+       WHERE h.status = 'held'
+       GROUP BY h.project_scope
+       HAVING COALESCE(SUM(CASE WHEN h.observation_end_id > COALESCE(w.wm, 0) THEN h.observations_analyzed ELSE 0 END), 0) > 0
+       ORDER BY h.project_scope ASC`,
+      [[...SCOPE_WATERMARK_STATUSES]]
+    );
+    return result.rows.map(r => ({
+      scope: r.scope,
+      observations_pending: Number(r.observations_pending),
+      observations_total: Number(r.observations_total),
+      last_end_id: Number(r.last_end_id),
+    }));
   }
 
   close(): void {

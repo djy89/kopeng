@@ -15,6 +15,7 @@ import type { DiscoveryConfig } from '../types/types.js';
 import type { IConsolidationLock } from '../dreaming/lock.js';
 import type { ConsolidationReasoner } from '../dreaming/reasoner/reasoner.js';
 import { runDiscovery, setEmbeddingIndexRef } from './discovery-engine.js';
+import type { HoldPredicate } from './hold.js';
 import logger from '../utils/logger.js';
 
 export class DiscoveryScheduler {
@@ -28,6 +29,9 @@ export class DiscoveryScheduler {
   private config: DiscoveryConfig;
   private lock?: IConsolidationLock;
   private reasoner?: ConsolidationReasoner;
+  private canonicalizeScope?: (scope: string) => Promise<string>;
+  private resolveScope?: (raw: string, origin: string | null) => Promise<string>;
+  private isHeld?: HoldPredicate;
 
   constructor(
     observationStore: IObservationStore,
@@ -36,7 +40,13 @@ export class DiscoveryScheduler {
     config: DiscoveryConfig,
     lock?: IConsolidationLock,
     /** D2.2: the tier-2 classify-before-reinforce guard (absent → Phase-1 dedup). */
-    reasoner?: ConsolidationReasoner
+    reasoner?: ConsolidationReasoner,
+    /** T46: write-time scope canonicalization (absent → identity). */
+    canonicalizeScope?: (scope: string) => Promise<string>,
+    /** Phase 3 (Task 8): registry-aware scope resolution before detection grouping (absent → raw). */
+    resolveScope?: (raw: string, origin: string | null) => Promise<string>,
+    /** Round-2 CO5: the shared hold predicate (absent → shape-only ephemeralReason). */
+    isHeld?: HoldPredicate
   ) {
     this.observationStore = observationStore;
     this.memoryStore = memoryStore;
@@ -44,6 +54,9 @@ export class DiscoveryScheduler {
     this.config = config;
     this.lock = lock;
     this.reasoner = reasoner;
+    this.canonicalizeScope = canonicalizeScope;
+    this.resolveScope = resolveScope;
+    this.isHeld = isHeld;
 
     // Set the embedding index reference for the discovery engine
     setEmbeddingIndexRef(embeddingIndex);
@@ -201,7 +214,7 @@ export class DiscoveryScheduler {
         this.observationStore,
         this.memoryStore,
         this.embeddingIndex,
-        { config: this.config, reasoner: this.reasoner }
+        { config: this.config, reasoner: this.reasoner, canonicalizeScope: this.canonicalizeScope, resolveScope: this.resolveScope, isHeld: this.isHeld }
       );
       return result;
     } finally {

@@ -13,7 +13,8 @@ import {
   DuplicateCandidateSelector, DeterministicDiffGenerator,
 } from '../../src/dreaming/pipeline.js';
 import { NoOpReasoner } from '../../src/dreaming/reasoner/noop-reasoner.js';
-import { CountingReasoner } from '../../src/dreaming/replay.js';
+import { CountingReasoner, NullVectorSearch } from '../../src/dreaming/replay.js';
+import { readContradictionFlag, CONTRADICTION_FLAG_TAG } from '../../src/dreaming/contradiction.js';
 import type { DreamDiffEntry } from '../../src/types/types.js';
 
 /**
@@ -46,13 +47,13 @@ describe('T6 whole-corpus mode', () => {
   let dreams: DreamQueries;
   const NOW = Date.parse('2026-06-15T03:00:00Z'); // ISO week 2026-W25
 
-  async function seed(content: string, opts: { embedding?: Float32Array; confidence?: number; scope?: string } = {}): Promise<number> {
+  async function seed(content: string, opts: { embedding?: Float32Array; confidence?: number; scope?: string; metadata?: object; tags?: string[] } = {}): Promise<number> {
     const { id } = await memories.store({
       content, type: 'project', scope: opts.scope ?? 'global', source: 'test',
-      source_path: null, metadata: '{}',
+      source_path: null, metadata: opts.metadata ? JSON.stringify(opts.metadata) : '{}',
       embedding: opts.embedding ? buf(opts.embedding) : null,
       embedding_model: opts.embedding ? 'test' : '',
-      created_by: null, tags: [], confidence: opts.confidence ?? 0.7,
+      created_by: null, tags: opts.tags ?? [], confidence: opts.confidence ?? 0.7,
     });
     return id;
   }
@@ -235,6 +236,55 @@ describe('T6 whole-corpus mode', () => {
       expect(gate({ kind: 'pair', members: [{ id: 5 } as never, { id: 6 } as never] })).toBe(true);
       expect(gate({ kind: 'pair', members: [{ id: 100 } as never, { id: 101 } as never] })).toBe(false);
       expect(DEFAULT_WHOLE_CORPUS_SEGMENT).toBe(60);
+    });
+  });
+
+  describe('flag consumption respects the reasoner gate (pre-T17 baton-drop fix)', () => {
+    /**
+     * A sub-0.85-cosine flagged pair is selected ONLY because of its ingestion
+     * flag. If the T6 gate drops it (anchor outside the segment) while the
+     * engine still consumes its flag, the pair leaves the review pipeline with
+     * no queued entry — the baton drop. The flag must SURVIVE a gated-out pass
+     * and be consumed only on the pass whose segment classifies the pair.
+     */
+    it('an out-of-segment flagged pair keeps its flag; the flag is consumed only when its segment arrives', async () => {
+      await dreams.updateConfig('default', { config: JSON.stringify({ dream_whole_corpus_segment: 2 }) });
+      await seed('filler low id 1');
+      await seed('filler low id 2');
+      const a = await seed('deploys go through the blue path', { embedding: basis(0) });
+      const b = await seed('deploys go through the green path since June', {
+        embedding: blend(0, 1, 0.5), // cosine 0.5 — far below the 0.85 band floor
+        metadata: { contradiction_flag: { with: a, relation: 'preference_change', rationale: 'test-planted ingestion flag', at: '2026-06-14T00:00:00Z' } },
+        tags: [CONTRADICTION_FLAG_TAG],
+      });
+      expect(Math.min(a, b)).toBeGreaterThanOrEqual(2); // anchor sits OUTSIDE segment [0, 2)
+
+      const applyDeps = { memoryStore: memories, vectorIndex: new NullVectorSearch() };
+
+      // Pass 1 (segment [0,2)): the gate drops the flagged pair whole — no
+      // entry. The flag must survive so a later segment can still queue it.
+      const p1 = await runDreamPass(deps({ apply: applyDeps }), { trigger: 'manual' });
+      expect(p1.status).toBe('completed');
+      const d1 = await dreams.getDream(p1.dream_id!);
+      const e1: DreamDiffEntry[] = JSON.parse(d1!.output_diff!).entries;
+      expect(e1.some(e => e.memory_ids.includes(a) || e.memory_ids.includes(b))).toBe(false);
+      const bAfter1 = await memories.get(b);
+      expect(readContradictionFlag(bAfter1!.metadata)).not.toBeNull();
+      expect(bAfter1!.tags).toContain(CONTRADICTION_FLAG_TAG);
+
+      // Pass 2 (segment [2,4) covers the anchor): the pair is classified (NoOp
+      // → unconsumable → contested fallback). The queued entry is the baton —
+      // and only now is the flag consumed.
+      const p2 = await runDreamPass(deps({ apply: applyDeps }), { trigger: 'manual' });
+      expect(p2.status).toBe('completed');
+      const d2 = await dreams.getDream(p2.dream_id!);
+      const e2: DreamDiffEntry[] = JSON.parse(d2!.output_diff!).entries;
+      const contested = e2.find(e => e.change_class === 'contested'
+        && e.memory_ids.includes(a) && e.memory_ids.includes(b));
+      expect(contested).toBeDefined();
+      const bAfter2 = await memories.get(b);
+      expect(readContradictionFlag(bAfter2!.metadata)).toBeNull();
+      expect(bAfter2!.tags).not.toContain(CONTRADICTION_FLAG_TAG);
     });
   });
 

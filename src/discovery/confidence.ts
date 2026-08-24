@@ -7,8 +7,28 @@
  * - durabilityFactor: 1 + ln(observation_count) — derived, never stored (D1.1)
  */
 
+import type { PatternCandidate } from '../types/types.js';
+
 /** Maximum confidence auto-discovery can assign. Operator must explicitly confirm for higher. */
 export const AUTO_CONFIDENCE_CEILING = 0.85;
+
+/**
+ * The confidence a re-observation should WRITE, or null meaning "write nothing".
+ *
+ * Autonomous reinforcement may never REDUCE confidence. `reinforceConfidence` clamps
+ * internally (`Math.min(CEILING, currentConfidence + delta)`), so a bare ceiling-clamp
+ * on its output demotes a deliberate Hard Anchor (1.0) and a crystallized memory (0.97)
+ * to 0.85 (P1, tracker Round 12). Every other consumer of the anchor concept checks it;
+ * this is the highest-frequency writer and it did not.
+ *
+ * Callers MUST still bump usage (`reinforceOnAccess`) when this returns null: the memory
+ * was genuinely re-observed, so its decay clock and durability should advance. Only the
+ * confidence write is suppressed.
+ */
+export function reinforcedConfidenceFor(existing: number): number | null {
+  if (existing > AUTO_CONFIDENCE_CEILING) return null;
+  return reinforceConfidence(existing);
+}
 
 /** Default half-life (days) for types without a T30 tuned value. */
 export const DEFAULT_HALF_LIFE_DAYS = 60;
@@ -96,6 +116,37 @@ export function computeConfidence(evidenceCount: number, observationSpanDays: nu
     : 0;
 
   return Math.min(AUTO_CONFIDENCE_CEILING, base + spreadBonus);
+}
+
+/**
+ * Per-pattern-type confidence assignment for detected candidates (round-2 fix
+ * A4 — ONE definition; runDiscovery and the re-drive both call this, so the
+ * two paths cannot drift):
+ * - recurring_error / error_fix → enhanced error scoring (cross-session bonus,
+ *   fix shortcut) with `has_fix` honored;
+ * - sequence → the same session-count-primary curve, never with a fix bonus;
+ * - everything else → the base evidence-count curve.
+ * `distinct_sessions` falls back to counting the evidence snapshot's session
+ * ids when the detector didn't precompute it. Mutates `candidate.confidence`.
+ */
+export function assignCandidateConfidence(candidate: PatternCandidate): void {
+  if (candidate.pattern_type === 'recurring_error' || candidate.pattern_type === 'error_fix') {
+    const hasFix = candidate.has_fix === true;
+    const distinctSessions = candidate.distinct_sessions
+      ?? new Set(candidate.evidence_snapshot.map(e => e.session_id)).size;
+    candidate.confidence = computeErrorPatternConfidence(
+      candidate.evidence_count, distinctSessions, hasFix, candidate.observation_span_days
+    );
+  } else if (candidate.pattern_type === 'sequence') {
+    // Sequences use session count as primary signal (cross-session bonus)
+    const distinctSessions = candidate.distinct_sessions
+      ?? new Set(candidate.evidence_snapshot.map(e => e.session_id)).size;
+    candidate.confidence = computeErrorPatternConfidence(
+      candidate.evidence_count, distinctSessions, false, candidate.observation_span_days
+    );
+  } else {
+    candidate.confidence = computeConfidence(candidate.evidence_count, candidate.observation_span_days);
+  }
 }
 
 /**
@@ -208,11 +259,14 @@ export function computeErrorPatternConfidence(
 }
 
 /**
- * Check if a memory should be archived based on its effective confidence.
+ * THE archive line: effective confidence below this makes a memory a
+ * decay-archive candidate everywhere (dream decay tier, promotion, maintenance
+ * §2, corpus-health panel, effectiveness harness). The decision itself is
+ * `isDecayedAtRisk` in src/dreaming/scoring.ts, which re-exports this constant
+ * — it lives here (not there) only because scoring.ts already imports this
+ * module and the reverse import would be a cycle. ONE definition either way.
  */
-export function shouldArchive(effectiveConfidence: number): boolean {
-  return effectiveConfidence < 0.2;
-}
+export const DECAY_ARCHIVE_THRESHOLD = 0.2;
 
 // ── T30.3 auto-crystallization ──────────────────────────────────────────────
 //

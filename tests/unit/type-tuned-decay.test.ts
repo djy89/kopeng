@@ -3,7 +3,7 @@ import {
   computeEffectiveConfidence,
   resolveHalfLife,
   resolveFloor,
-  shouldArchive,
+  DECAY_ARCHIVE_THRESHOLD,
   DECAY_HALF_LIVES,
   DEFAULT_HALF_LIFE_DAYS,
   STRUCTURAL_FLOOR,
@@ -62,7 +62,7 @@ describe('decay floors', () => {
   it('a floored reference never decays below the floor — and never under the 0.2 archive line', () => {
     const ref = computeEffectiveConfidence(0.9, ago(120), NOW, false, 1, 'reference');
     expect(ref).toBeCloseTo(STRUCTURAL_FLOOR, 5); // clamped up to 0.4 from a deep-decayed value
-    expect(shouldArchive(ref)).toBe(false);
+    expect(ref).toBeGreaterThanOrEqual(DECAY_ARCHIVE_THRESHOLD);
   });
 
   it('the floor never RAISES a genuinely low-stored memory above its stored confidence', () => {

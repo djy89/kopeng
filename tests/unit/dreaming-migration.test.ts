@@ -117,4 +117,10 @@ describe('Dreaming migration (D0.1, SQLite v4)', () => {
     expect(m.observation_count).toBe(7);
     db.close();
   });
+
+  it('v8 adds scope/type/updated_at/last_seen to memory_revisions', () => {
+    const { db } = createTestDatabase();
+    const cols = (db.prepare(`PRAGMA table_info(memory_revisions)`).all() as { name: string }[]).map(c => c.name);
+    for (const c of ['scope', 'type', 'updated_at', 'last_seen']) expect(cols).toContain(c);
+  });
 });

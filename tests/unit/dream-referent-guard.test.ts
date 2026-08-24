@@ -67,69 +67,69 @@ function evidenceMeta(inputHashes: string[]): string {
 const selector = new DuplicateCandidateSelector({ now: () => NOW });
 const diffGen = new DeterministicDiffGenerator();
 
-function generate(memories: CandidateMemory[]) {
-  const groups = selector.select(memories);
+async function generate(memories: CandidateMemory[]) {
+  const groups = await selector.select(memories);
   return { groups, diff: diffGen.generate(groups.map(group => ({ group, verdict: null }))) };
 }
 
 describe('extractTemplateReferents', () => {
-  it('parses the synthesizer "Key reference files" template into key + referents', () => {
+  it('parses the synthesizer "Key reference files" template into key + referents', async () => {
     const parsed = extractTemplateReferents(keyFiles(['src/a.ts', 'src/b.ts']));
     expect(parsed).not.toBeNull();
     expect(parsed!.template).toContain('key reference files');
     expect([...parsed!.referents].sort()).toEqual(['src/a.ts', 'src/b.ts']);
   });
 
-  it('parses the "Infrastructure commands" template (different project-stripped head)', () => {
+  it('parses the "Infrastructure commands" template (different project-stripped head)', async () => {
     const c = `Infrastructure commands frequently run manually in kopeng:\n  - docker ps\n  - systemctl status\n\nThese are manual operations.`;
     const parsed = extractTemplateReferents(c);
     expect(parsed).not.toBeNull();
     expect([...parsed!.referents].sort()).toEqual(['docker ps', 'systemctl status']);
   });
 
-  it('returns null for non-template prose / operator notes', () => {
+  it('returns null for non-template prose / operator notes', async () => {
     expect(extractTemplateReferents('Just a plain operator note about the deploy.')).toBeNull();
     expect(extractTemplateReferents('Header without a list:\nstill prose, no bullets')).toBeNull();
   });
 });
 
 describe('isDifferentReferent (R13 guard)', () => {
-  it('fires for same-template memories naming disjoint files', () => {
+  it('fires for same-template memories naming disjoint files', async () => {
     expect(isDifferentReferent([
       mem({ id: 9101, content: keyFiles(['src/server.ts', 'src/index.ts']) }),
       mem({ id: 9102, content: keyFiles(['viz/app.js', 'viz/index.html']) }),
     ])).toBe(true);
   });
 
-  it('does NOT fire when the same file appears in both (overlapping referents)', () => {
+  it('does NOT fire when the same file appears in both (overlapping referents)', async () => {
     expect(isDifferentReferent([
       mem({ id: 1, content: keyFiles(['src/server.ts', 'src/index.ts']) }),
       mem({ id: 2, content: keyFiles(['src/server.ts', 'src/index.ts', 'src/new.ts']) }),
     ])).toBe(false);
   });
 
-  it('uses evidence input hashes as referents too — disjoint hashes ⇒ fires', () => {
+  it('uses evidence input hashes as referents too — disjoint hashes ⇒ fires', async () => {
     expect(isDifferentReferent([
       mem({ id: 1, content: keyFiles(['x']), metadata: evidenceMeta(['ha', 'hb']) }),
       mem({ id: 2, content: keyFiles(['y']), metadata: evidenceMeta(['hc', 'hd']) }),
     ])).toBe(true);
   });
 
-  it('shared evidence input hash rescues otherwise-disjoint content lists', () => {
+  it('shared evidence input hash rescues otherwise-disjoint content lists', async () => {
     expect(isDifferentReferent([
       mem({ id: 1, content: keyFiles(['x']), metadata: evidenceMeta(['shared']) }),
       mem({ id: 2, content: keyFiles(['y']), metadata: evidenceMeta(['shared']) }),
     ])).toBe(false);
   });
 
-  it('does not fire for non-template content (normal cosine path applies)', () => {
+  it('does not fire for non-template content (normal cosine path applies)', async () => {
     expect(isDifferentReferent([
       mem({ id: 1, content: 'plain fact one' }),
       mem({ id: 2, content: 'plain fact two' }),
     ])).toBe(false);
   });
 
-  it('does not fire when templates differ (different guard case)', () => {
+  it('does not fire when templates differ (different guard case)', async () => {
     const infra = `Infrastructure commands frequently run manually in kopeng:\n  - docker ps\n\nManual ops.`;
     expect(isDifferentReferent([
       mem({ id: 1, content: keyFiles(['src/a.ts']) }),
@@ -139,8 +139,8 @@ describe('isDifferentReferent (R13 guard)', () => {
 });
 
 describe('R13 live-pair shape never collapses deterministically', () => {
-  it('same-template / DIFFERENT-referent at cosine 0.97 routes reasoner-driven (not deterministic-safe)', () => {
-    const { groups, diff } = generate([
+  it('same-template / DIFFERENT-referent at cosine 0.97 routes reasoner-driven (not deterministic-safe)', async () => {
+    const { groups, diff } = await generate([
       mem({
         id: 9101,
         content: keyFiles(['src/server.ts', 'src/index.ts']),
@@ -164,13 +164,13 @@ describe('R13 live-pair shape never collapses deterministically', () => {
     expect(diff.entries[0].rationale).toContain('different-referent');
   });
 
-  it('control: same-template / SAME-referent (count text differs, file overlaps) still merges', () => {
+  it('control: same-template / SAME-referent (count text differs, file overlaps) still merges', async () => {
     // Same file referent in both; the surrounding prose differs (e.g. updated
     // access count) so the content is NOT byte-identical → stays semantic_duplicate
     // rather than collapsing to exact_duplicate.
     const a = `Key reference files frequently accessed in kopeng:\n  - src/server.ts\n  - src/index.ts\n\nAccessed 12 times across sessions.`;
     const b = `Key reference files frequently accessed in kopeng:\n  - src/server.ts\n  - src/index.ts\n\nAccessed 19 times across sessions.`;
-    const { groups, diff } = generate([
+    const { groups, diff } = await generate([
       mem({ id: 100, content: a, embedding: basis(0), metadata: evidenceMeta(['shared-1', 'shared-2']) }),
       mem({ id: 101, content: b, embedding: blend(0, 1, 0.97), metadata: evidenceMeta(['shared-1', 'shared-2']) }),
     ]);

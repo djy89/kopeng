@@ -8,7 +8,11 @@
  *            original D0.7 regression net, unchanged.
  *   Pass B — Phase-1.2 configuration (DuplicateCandidateSelector +
  *            DeterministicDiffGenerator): real detection tiers + real diff,
- *            gated on the §1.2 verify list.
+ *            gated on the §1.2 verify list, threshold-straddling boundary
+ *            gates (0.96/0.94 and 0.86/0.84), and a PINNED classify-call count.
+ *   Pass C — alias-scope grouping (Phase 5): the same case-variant pair with
+ *            and without the canonicalize closure must land in different tiers
+ *            (promote_global vs exact_dup), with Phase-2 provenance stamped.
  *
  * Exits non-zero if any gate fails. The clock is pinned (2026-06-15) so the
  * decay fixture scores deterministically.
@@ -22,14 +26,29 @@ import { DreamQueries } from '../src/database/dream-queries.js';
 import { MemoryQueries } from '../src/database/queries.js';
 import {
   runReplay, runScenario, runRotationScenario, runWholeCorpusScenario, runReferentGuardScenario,
+  runReversibilityScenario, SYNTHETIC_ALIAS_SCOPE_RAW, SYNTHETIC_ALIAS_SCOPE_CANONICAL,
   type ScenarioResult,
 } from '../src/dreaming/replay.js';
-import { DuplicateCandidateSelector, DeterministicDiffGenerator } from '../src/dreaming/pipeline.js';
+import { DuplicateCandidateSelector, DeterministicDiffGenerator, cosineSimilarity } from '../src/dreaming/pipeline.js';
 import type { DreamDiffEntry } from '../src/types/types.js';
-import { SYNTHETIC_CORPUS, GOLD_CASES } from '../tests/fixtures/dreaming/corpus.js';
+import { buildScopeResolution } from '../src/scopes/resolver.js';
+import {
+  SYNTHETIC_CORPUS, GOLD_CASES,
+  ALIAS_CORPUS, ALIAS_GOLD_RAW, ALIAS_GOLD_CANONICAL, ALIAS_TABLE,
+} from '../tests/fixtures/dreaming/corpus.js';
 import { R2_SCENARIOS } from '../tests/fixtures/dreaming/r2-scenarios.js';
 
 const NOW = Date.parse('2026-06-15T03:00:00Z'); // pinned — decay fixture is clock-sensitive
+
+/**
+ * Pass B's expected NoOp classify-call count — ONE call per reasoner-band pair
+ * in the corpus: 8–9 (cosine 0.90), 10–11 (0.88), 42–43 (0.94), 44–45 (0.86).
+ * The old "zero LLM calls" gate was tautological under NoOpReasoner (llm_calls
+ * is 0 by definition of the counter); pinning the CLASSIFY count instead means
+ * a band pair silently skipping — or leaking into — the reasoner path flips a
+ * gate. Update this alongside any band-fixture change, with the pair list.
+ */
+const EXPECTED_CLASSIFY_CALLS_B = 4;
 
 function freshStore(): DreamQueries {
   const db = new Database(':memory:');
@@ -93,6 +112,41 @@ async function main(): Promise<void> {
   console.log(`  Hard-Anchor violations: ${passB.metrics.anchor_violations.length === 0 ? 'none' : JSON.stringify(passB.metrics.anchor_violations)}`);
   console.log(`  reasoner: ${passB.metrics.reasoner.name} · classify calls ${passB.metrics.reasoner.classify_calls} · LLM calls ${passB.metrics.reasoner.llm_calls}`);
 
+  // ── Pass C: alias-scope grouping (Phase 5) — the same pair, with and without
+  //    the canonicalize closure, must land in DIFFERENT tiers ──
+  const storeC1 = freshStore();
+  const passC1 = await runReplay({
+    corpus: ALIAS_CORPUS, gold: ALIAS_GOLD_RAW, dreamStore: storeC1,
+    selector: new DuplicateCandidateSelector({ now: () => new Date(NOW) }),
+    diffGen: new DeterministicDiffGenerator(),
+    windowKey: 'replay-alias-raw', now: () => NOW,
+  });
+  const dreamC1 = passC1.run.dream_id !== null ? await storeC1.getDream(passC1.run.dream_id) : null;
+  const entriesC1 = dreamC1?.output_diff ? (JSON.parse(dreamC1.output_diff).entries as DreamDiffEntry[]) : [];
+
+  // The fixture table goes through the REAL resolver — the closure and the
+  // version are both taken from the resolution, exactly as src/server.ts wires
+  // them, so a fixture entry production would reject cannot power this gate.
+  const aliasResolution = buildScopeResolution(ALIAS_TABLE);
+  const canonicalize = (scope: string): string => aliasResolution.forward.get(scope) ?? scope;
+  const storeC2 = freshStore();
+  const passC2 = await runReplay({
+    corpus: ALIAS_CORPUS, gold: ALIAS_GOLD_CANONICAL, dreamStore: storeC2,
+    selector: new DuplicateCandidateSelector({ now: () => new Date(NOW), canonicalize }),
+    diffGen: new DeterministicDiffGenerator({ aliasVersion: aliasResolution.version, canonicalize }),
+    windowKey: 'replay-alias-canonical', now: () => NOW,
+  });
+  const dreamC2 = passC2.run.dream_id !== null ? await storeC2.getDream(passC2.run.dream_id) : null;
+  const entriesC2 = dreamC2?.output_diff ? (JSON.parse(dreamC2.output_diff).entries as DreamDiffEntry[]) : [];
+
+  const aliasRaw = entryFor(entriesC1, [50, 51]);
+  const aliasCanonical = entryFor(entriesC2, [50, 51]);
+  const aliasVariantMember = aliasCanonical?.provenance?.members.find(m => m.id === 51);
+
+  console.log('\n— Pass C: alias-scope grouping —');
+  console.log(`  raw:       entry=${aliasRaw?.change_class ?? 'none'} (tier ${aliasRaw?.tier ?? 'n/a'})`);
+  console.log(`  canonical: entry=${aliasCanonical?.change_class ?? 'none'} (tier ${aliasCanonical?.tier ?? 'n/a'}) · alias_table_version=${aliasCanonical?.provenance?.alias_table_version ?? 'none'}`);
+
   // ── R2 fire/collapse scenarios (expected error logs from injected failures) ──
   console.log('\n— R2 scenarios —');
   const scenarioResults: ScenarioResult[] = [];
@@ -146,6 +200,19 @@ async function main(): Promise<void> {
   console.log(`  ${referentGuard.ok ? 'PASS' : 'FAIL'}  ${referentGuard.name}`);
   for (const failure of referentGuard.failures) console.log(`        ${failure}`);
 
+  // ── Phase 2 reversibility scenario (G1 rescue loop, G3 stale keep-target, canonical survivor) ──
+  console.log('\n— Phase 2 reversibility scenario —');
+  const revDb = new Database(':memory:');
+  revDb.pragma('journal_mode = WAL');
+  revDb.pragma('foreign_keys = ON');
+  runMigrations(revDb);
+  const reversibility = await runReversibilityScenario({
+    memoryStore: new MemoryQueries(revDb),
+    dreamStore: new DreamQueries(revDb),
+  });
+  console.log(`  ${reversibility.ok ? 'PASS' : 'FAIL'}  ${reversibility.name}`);
+  for (const failure of reversibility.failures) console.log(`        ${failure}`);
+
   // ── Gates ──
   const exactPair = entryFor(entries, [1, 2]);
   const exactCluster = entryFor(entries, [3, 4, 5]);
@@ -154,6 +221,10 @@ async function main(): Promise<void> {
   const preference = entryFor(entries, [10, 11]);
   const crossScope = entryFor(entries, [16, 17]);
   const decay = entryFor(entries, [30]);
+  const straddleAbove = entryFor(entries, [40, 41]);
+  const straddleBand94 = entryFor(entries, [42, 43]);
+  const straddleBand86 = entryFor(entries, [44, 45]);
+  const belowBand = entryFor(entries, [46, 47]);
 
   const gates: Array<[string, boolean]> = [
     // Pass A — the Phase-0 baseline must keep behaving exactly as in D0.7
@@ -162,6 +233,7 @@ async function main(): Promise<void> {
     // Pass B — §1.2 verify list
     ['B: pass completed, diff queued as pending', passB.run.status === 'completed' && dreamB?.acceptance_status === 'pending' && dreamB?.changes_queued === entries.length && entries.length > 0],
     ['B: zero LLM calls', passB.metrics.reasoner.llm_calls === 0],
+    [`B: classify calls pinned to ${EXPECTED_CLASSIFY_CALLS_B} (one per band pair — not the tautological zero)`, passB.metrics.reasoner.classify_calls === EXPECTED_CLASSIFY_CALLS_B],
     ['B: no Hard-Anchor violations (locked memories untouched)', passB.metrics.anchor_violations.length === 0],
     ['B: phase-1.2 recall = 1.0', dB.phase12_recall === 1],
     ['B: zero false-positive groups (distractors silent)', dB.false_positive_groups === 0],
@@ -171,10 +243,37 @@ async function main(): Promise<void> {
     ['B: 0.85–0.95 band → reasoner-driven, never collapsed', contradiction?.tier === 'reasoner-driven' && preference?.tier === 'reasoner-driven'],
     ['B: cross-scope dup → promote_global signal, not a collapse', crossScope?.change_class === 'promote_global'],
     ['B: decayed memory → decay archive proposal, deterministic-safe', decay?.change_class === 'decay' && decay?.tier === 'deterministic-safe'],
+    // Threshold-straddling gates (Phase 5): each selector boundary is pinned from
+    // BOTH sides, so a drifted predicate flips a named gate instead of passing.
+    ['B: cosine 0.96 (just above 0.95) → merge, deterministic-safe', straddleAbove?.change_class === 'merge' && straddleAbove?.tier === 'deterministic-safe'],
+    ['B: cosine 0.94 (just below 0.95) → reasoner-driven, not collapsed', straddleBand94?.tier === 'reasoner-driven'],
+    ['B: cosine 0.86 (just above 0.85) → reasoner-driven band', straddleBand86?.tier === 'reasoner-driven'],
+    // The negative gate needs its positive preconditions: `undefined` must mean
+    // "the selector ignored the pair", never "the pair no longer exists" — and
+    // the pair's cosine must still actually straddle the floor from below (its
+    // three siblings pin their cosines implicitly via the tier they assert;
+    // "no entry" is true for ANY sub-band cosine, so this one pins it here).
+    ['B: cosine 0.84 (just below 0.85) → pair exists at the boundary but produces no entry',
+      (() => {
+        const m46 = SYNTHETIC_CORPUS.find(m => m.id === 46);
+        const m47 = SYNTHETIC_CORPUS.find(m => m.id === 47);
+        if (!m46?.embedding || !m47?.embedding) return false;
+        const cos = cosineSimilarity(m46.embedding, m47.embedding);
+        return cos !== null && cos >= 0.83 && cos < 0.85 && belowBand === undefined;
+      })()],
+    // Alias gates (Phase 5): grouping must be closure-sensitive in both directions.
+    ['C: fixture alias table fully accepted by the real resolver', aliasResolution.rejected.length === 0 && aliasResolution.forward.size === 1],
+    ['C: alias pair, no closure → promote_global (cross-scope on raw strings)', aliasRaw?.change_class === 'promote_global'],
+    ['C: alias pair, closure wired → exact_dup, deterministic-safe (same canonical scope)', aliasCanonical?.change_class === 'exact_dup' && aliasCanonical?.tier === 'deterministic-safe'],
+    ['C: provenance stamps raw + effective scope and the resolver version', aliasCanonical?.provenance?.alias_table_version === aliasResolution.version && aliasVariantMember?.scope === SYNTHETIC_ALIAS_SCOPE_RAW && aliasVariantMember?.effective_scope === SYNTHETIC_ALIAS_SCOPE_CANONICAL],
+    ['C: gold recall 1.0, zero FP, exactly one entry per pass',
+      passC1.metrics.detection.recall === 1 && passC1.metrics.detection.false_positive_groups === 0 && entriesC1.length === 1
+      && passC2.metrics.detection.recall === 1 && passC2.metrics.detection.false_positive_groups === 0 && entriesC2.length === 1],
     ['all R2 scenarios pass', scenarioResults.every(r => r.ok)],
     ['D1.4 rotation scenario passes', rotation.ok],
     ['T6 whole-corpus scenario passes (far-apart dup + id-segment drain)', wholeCorpus.ok],
     ['T31 referent-guard scenario passes (template noise: 0 LLM calls, 0 queue entries)', referentGuard.ok],
+    ['reversibility: rollback survives promotion (G1) + audited (G2) + G3 stale keep-target + canonical survivor', reversibility.ok],
   ];
 
   console.log('\n— Gates —');

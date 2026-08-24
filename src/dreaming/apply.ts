@@ -34,7 +34,9 @@
  *  the operator acts via update/archive_memory and rejects the entry.
  */
 import type { IMemoryStore, IDreamStore, IVectorSearch } from '../database/interfaces.js';
-import type { Dream, DreamAcceptance, DreamDiff, DreamDiffEntry, Memory, OperatorConfig } from '../types/types.js';
+import type { Dream, DreamAcceptance, DreamAuditEntry, DreamDiff, DreamDiffEntry, Memory, OperatorConfig } from '../types/types.js';
+import { normalizeContent } from './pipeline.js';
+import { isAnchored, isPinnedMetadata } from './scoring.js';
 import logger from '../utils/logger.js';
 
 export interface ApplyDeps {
@@ -47,6 +49,16 @@ export interface ApplyDeps {
    * not_actionable and stay pending; all other classes are unaffected.
    */
   embedText?: (text: string) => Promise<{ vector: Float32Array; model: string }>;
+  /**
+   * Phase 2: CURRENT alias resolution, used to prefer an already-canonical
+   * survivor on exact_dup collapses. `pickKeepTarget` (the selector's own
+   * keep-choice) never considers scope canonicality, so an alias-scoped row
+   * routinely gets proposed as the keep target over its canonical-scoped
+   * duplicate — this corrects that for essentially every cross-alias
+   * exact_dup group, not just diffs generated under a stale table. Absent ⇒
+   * no canonical-survivor preference; the staleness checks above still run.
+   */
+  canonicalizeScope?: (scope: string) => Promise<string>;
 }
 
 /** Why an entry did (not) apply. `anchored`/`not_actionable` leave it pending. */
@@ -119,6 +131,61 @@ export function computeAcceptance(entries: DreamDiffEntry[]): DreamAcceptance {
 }
 
 /**
+ * Phase 2: THE audited-archive primitive for every automated CONTENT-MUTATING
+ * archive. snapshot → archive → audit (compensate-unarchive on audit
+ * failure, invariant #11) → drop from the vector index. Re-checks
+ * missing/anchored/already-archived so callers stay idempotent.
+ *
+ * Bounded exception (ruling 4): `rollbackDreamCreation` archives directly with
+ * a BEST-EFFORT audit — a rollback's undo record is the operator action itself,
+ * and compensating there would un-do the rollback the operator just asked for.
+ */
+export async function auditedArchiveMemory(
+  deps: Pick<ApplyDeps, 'memoryStore' | 'dreamStore' | 'vectorIndex'>,
+  dreamId: number,
+  memoryId: number,
+  changeClass: DreamAuditEntry['change_class'],
+  opts: { action?: string; appliedAutomatically?: boolean; afterRef?: string; preloaded?: Memory | null } = {},
+): Promise<{ outcome: 'archived' | 'skipped_missing' | 'skipped_archived' | 'refused_anchored'; revision_id?: number }> {
+  // peek, not get: an audit-internal inspection must not write an access-log
+  // row (team-review #22 P2 — member reads are not reinforcement points).
+  // `preloaded` lets applyEntry reuse its revalidation reads (same lock hold).
+  const mem = opts.preloaded ?? await deps.memoryStore.peek(memoryId);
+  if (!mem) return { outcome: 'skipped_missing' };
+  if (isAnchored(mem)) {
+    // Hard Anchor (invariant #8) — never mutate, even if a stale diff asks.
+    logger.warn(`Dream ${dreamId} apply: memory ${memoryId} is anchored (locked=${mem.is_locked}, conf=${mem.confidence}, pinned=${isPinnedMetadata(mem.metadata)}) — refusing`);
+    return { outcome: 'refused_anchored' };
+  }
+  if (mem.is_archived) return { outcome: 'skipped_archived' };
+
+  const snap = await deps.dreamStore.snapshotRevision(memoryId, dreamId);
+  await deps.memoryStore.archive(memoryId);
+  try {
+    await deps.dreamStore.appendAudit({
+      dream_id: dreamId,
+      memory_id: memoryId,
+      revision_id: snap.id,
+      change_class: changeClass,
+      action: opts.action ?? 'archive',
+      applied_automatically: opts.appliedAutomatically ?? false,
+      before_ref: `revision:${snap.revision}`,
+      after_ref: opts.afterRef ?? 'archived',
+    });
+  } catch (err) {
+    await deps.memoryStore.unarchive(memoryId).catch(e =>
+      logger.error(`auditedArchiveMemory: compensation unarchive of ${memoryId} failed:`, e));
+    throw err;
+  }
+  try {
+    await deps.vectorIndex.remove(memoryId);
+  } catch (err) {
+    logger.warn(`auditedArchiveMemory: vector index remove(${memoryId}) failed (search filters archived ids):`, err);
+  }
+  return { outcome: 'archived', revision_id: snap.id };
+}
+
+/**
  * Execute one entry's proposal: archive every `archive_ids` member, each one
  * snapshot-first and audited. MUST run inside the consolidation lock.
  *
@@ -161,50 +228,109 @@ export async function applyEntry(
     };
   }
 
+  // One non-reinforcing read per member per apply (team-review #22 P2): the
+  // three revalidation steps + the archive loop previously re-`get()`ed the
+  // same rows ~3x each, planting an access-log row per read — on refused-stale
+  // entries that reinforced members of a proposal that applied NOTHING. Reads
+  // are cached for this applyEntry invocation only, so retries stay fresh.
+  const memberCache = new Map<number, Memory | null>();
+  const peekMember = async (id: number): Promise<Memory | null> => {
+    if (!memberCache.has(id)) memberCache.set(id, await deps.memoryStore.peek(id));
+    return memberCache.get(id)!;
+  };
+
+  // ── Phase 2 apply-time revalidation (stale-diff defense) ──
+  // 1. Keep-target liveness (G3): archiving members toward a dead survivor
+  //    is data loss — refuse and leave the entry pending for review.
+  let keepMem: Memory | null = null;
+  if (proposal.keep_id !== null) {
+    keepMem = await peekMember(proposal.keep_id);
+    if (!keepMem || keepMem.is_archived) {
+      return {
+        index, outcome: 'not_actionable', archived_ids: [], revision_ids: [],
+        detail: `stale diff: keep target #${proposal.keep_id} ${keepMem ? 'was archived' : 'no longer exists'} since the proposal — entry left pending`,
+      };
+    }
+  }
+  // 2. Content-hash revalidation (provenance present ⇒ Phase 2 diff).
+  if (entry.provenance) {
+    for (const p of entry.provenance.members) {
+      if (!p.content_hash) continue;
+      const live = await peekMember(p.id);
+      if (live && live.content_hash !== p.content_hash) {
+        return {
+          index, outcome: 'not_actionable', archived_ids: [], revision_ids: [],
+          detail: `stale diff: memory #${p.id} content changed since the proposal — entry left pending`,
+        };
+      }
+    }
+  }
+  // 3. Canonical-survivor preference (exact_dup only — the group is already
+  //    normalized-content-equal by construction, so swapping survivors
+  //    changes no information, only which scope wins). Gated on the SAME
+  //    predicate the selector used to form the exact_dup group in the first
+  //    place (normalizeContent), not raw content_hash equality: exact_dup
+  //    pairs are typically case/whitespace variants with DIFFERENT hashes
+  //    (content_hash is also globally unique, so two live rows can never
+  //    share one) — a hash-equality gate would make this branch dead code.
+  if (entry.change_class === 'exact_dup' && keepMem && deps.canonicalizeScope) {
+    const keepEffective = await deps.canonicalizeScope(keepMem.scope);
+    if (keepMem.scope !== keepEffective) {
+      const keepNorm = normalizeContent(keepMem.content);
+      for (const candidateId of proposal.archive_ids) {
+        const cand = await peekMember(candidateId);
+        if (cand && !cand.is_archived && cand.scope === keepEffective
+            && normalizeContent(cand.content) === keepNorm) {
+          const originalKeepId = proposal.keep_id!;
+          logger.info(`Dream ${dreamId} apply: preferring already-canonical survivor #${candidateId} (${cand.scope}) over #${originalKeepId} (${keepMem.scope})`);
+          proposal.archive_ids = proposal.archive_ids.filter(id => id !== candidateId).concat(originalKeepId);
+          proposal.keep_id = candidateId;
+          // The persisted diff (GET /api/dreams/:id/diff) must show the TRUE
+          // survivor, not the stale pre-swap proposal — merge the swapped
+          // values over `after` rather than replacing it wholesale.
+          entry.after = {
+            ...(typeof entry.after === 'object' && entry.after !== null ? entry.after : {}),
+            keep_id: candidateId,
+            archive_ids: proposal.archive_ids,
+          };
+          // Marker-guarded so a re-run of a pending entry (swap performed but
+          // not yet persisted) doesn't append the note twice.
+          if (!entry.rationale.includes('[apply-time: canonical-survivor swap')) {
+            entry.rationale += ` [apply-time: canonical-survivor swap — kept #${candidateId} on ${cand.scope}, archived proposed keep #${originalKeepId}]`;
+          }
+          break;
+        }
+      }
+    }
+  }
+
   const archivedIds: number[] = [];
   const revisionIds: number[] = [];
   let anchoredSkips = 0;
 
   for (const id of proposal.archive_ids) {
-    const mem = await deps.memoryStore.get(id);
-    if (!mem) {
-      logger.warn(`Dream ${dreamId} apply: memory ${id} no longer exists — skipping`);
-      continue;
+    const res = await auditedArchiveMemory(deps, dreamId, id, entry.change_class, {
+      action: 'archive',
+      appliedAutomatically,
+      afterRef: proposal.keep_id !== null ? `archived;kept=${proposal.keep_id}` : 'archived',
+      preloaded: memberCache.has(id) ? memberCache.get(id) : undefined,
+    });
+    switch (res.outcome) {
+      case 'skipped_missing':
+        logger.warn(`Dream ${dreamId} apply: memory ${id} no longer exists — skipping`);
+        continue;
+      case 'refused_anchored':
+        // Hard Anchor (invariant #8) — never mutate, even if a stale diff asks.
+        // auditedArchiveMemory already logged the locked/confidence detail.
+        anchoredSkips++;
+        continue;
+      case 'skipped_archived':
+        continue; // already at the proposed end state
+      case 'archived':
+        archivedIds.push(id);
+        revisionIds.push(res.revision_id!);
+        continue;
     }
-    if (mem.is_locked === 1 || mem.confidence >= 1.0) {
-      // Hard Anchor (invariant #8) — never mutate, even if a stale diff asks.
-      logger.warn(`Dream ${dreamId} apply: memory ${id} is anchored (locked=${mem.is_locked}, conf=${mem.confidence}) — refusing`);
-      anchoredSkips++;
-      continue;
-    }
-    if (mem.is_archived) continue; // already at the proposed end state
-
-    const snap = await deps.dreamStore.snapshotRevision(id, dreamId);
-    await deps.memoryStore.archive(id);
-    try {
-      await deps.dreamStore.appendAudit({
-        dream_id: dreamId,
-        memory_id: id,
-        revision_id: snap.id,
-        change_class: entry.change_class,
-        action: 'archive',
-        applied_automatically: appliedAutomatically,
-        before_ref: `revision:${snap.revision}`,
-        after_ref: proposal.keep_id !== null ? `archived;kept=${proposal.keep_id}` : 'archived',
-      });
-    } catch (err) {
-      // Invariant #11: no unaudited change survives — compensate, then fail.
-      await deps.memoryStore.unarchive(id).catch(e =>
-        logger.error(`Dream ${dreamId} apply: compensation unarchive of ${id} failed:`, e));
-      throw err;
-    }
-    try {
-      await deps.vectorIndex.remove(id);
-    } catch (err) {
-      logger.warn(`Dream ${dreamId} apply: vector index remove(${id}) failed (search filters archived ids):`, err);
-    }
-    archivedIds.push(id);
-    revisionIds.push(snap.id);
   }
 
   if (anchoredSkips > 0) {
@@ -216,9 +342,11 @@ export async function applyEntry(
   return { index, outcome: 'applied', archived_ids: archivedIds, revision_ids: revisionIds };
 }
 
-/** Hard Anchor on a live row (invariant #8) — apply-time re-check, stale-diff defense. */
+/** Hard Anchor on a live row (invariant #8) — apply-time re-check, stale-diff
+ *  defense. Delegates to THE contract (CR-1) so the supersede/conditional
+ *  executors honor `metadata.pinned` like every other automated mutation path. */
 function isAnchoredRow(mem: Memory): boolean {
-  return mem.is_locked === 1 || mem.confidence >= 1.0;
+  return isAnchored(mem);
 }
 
 /**
@@ -247,8 +375,10 @@ async function applySupersession(
     };
   }
 
-  const oldMem = await deps.memoryStore.get(deprecatedId);
-  const newMem = await deps.memoryStore.get(currentId);
+  // peek, not get — apply-time revalidation reads are not reinforcement points
+  // (team-review #22 r2: the executors must follow the same doctrine applyEntry does).
+  const oldMem = await deps.memoryStore.peek(deprecatedId);
+  const newMem = await deps.memoryStore.peek(currentId);
   if (!oldMem || !newMem) {
     return {
       index, outcome: 'not_actionable', archived_ids: [], revision_ids: [],
@@ -362,7 +492,7 @@ async function applyConditionalEncode(
 
   const sources: Memory[] = [];
   for (const id of sourceIds) {
-    const mem = await deps.memoryStore.get(id);
+    const mem = await deps.memoryStore.peek(id);
     if (!mem) {
       return {
         index, outcome: 'not_actionable', archived_ids: [], revision_ids: [],
@@ -402,7 +532,7 @@ async function applyConditionalEncode(
   });
   if (deduplicated) {
     // A prior (possibly compensated) attempt already created this encoding.
-    const existing = await deps.memoryStore.get(encodedId);
+    const existing = await deps.memoryStore.peek(encodedId);
     if (existing?.is_archived) await deps.memoryStore.unarchive(encodedId);
   }
   try {
@@ -622,6 +752,13 @@ export async function rollbackMemory(
     unarchived = await deps.memoryStore.unarchive(memoryId);
   }
 
+  // Phase 2 rescue semantics (operator ruling 2026-08-18): a rollback is the
+  // strongest access signal — refresh the decay clock so the next promotion
+  // pass cannot immediately re-archive what the operator just restored.
+  // (restoreRevision restored the snapshotted clock, which for a decay
+  // archive is by definition ancient.)
+  await deps.dreamStore.reinforceMemory(memoryId);
+
   // Vector index sync: the restored embedding came back with the row (stored,
   // not recomputed — content and vector stay consistent by construction).
   try {
@@ -665,7 +802,9 @@ export async function rollbackMemory(
  * memory with no revisions genuinely has nothing to undo, so returns null (404).
  */
 async function rollbackDreamCreation(deps: ApplyDeps, memoryId: number): Promise<RollbackResult | null> {
-  const mem = await deps.memoryStore.get(memoryId);
+  // peek — this path ARCHIVES the row (or 404s); reinforcing it would be
+  // backwards, and the 404 path must not touch the access log at all.
+  const mem = await deps.memoryStore.peek(memoryId);
   if (!mem || mem.is_archived) return null;
 
   let encodedByDream: number | null = null;

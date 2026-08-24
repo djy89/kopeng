@@ -58,6 +58,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ExpectedTasksHelper = Join-Path $PSScriptRoot 'expected-tasks.mjs'
+if (-not (Test-Path $ExpectedTasksHelper)) { throw "Heartbeat registry helper not found: $ExpectedTasksHelper" }
 
 function Test-Admin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -76,6 +78,8 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 if ($Uninstall) {
+  & node $ExpectedTasksHelper unregister corpus-health
+  if ($LASTEXITCODE -ne 0) { throw 'Failed to remove corpus-health from the heartbeat registry.' }
   Write-Host "Uninstalled. Done."
   return
 }
@@ -106,6 +110,14 @@ $Description = "Weekly corpus-health snapshot: appends /api/ops/corpus-health + 
 Register-ScheduledTask -TaskName $TaskName `
   -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal `
   -Description $Description | Out-Null
+
+try {
+  & node $ExpectedTasksHelper register corpus-health 168
+  if ($LASTEXITCODE -ne 0) { throw 'Heartbeat registry update failed.' }
+} catch {
+  Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+  throw "Registration rolled back because the heartbeat registry could not be updated: $_"
+}
 
 Write-Host "Registered task '$TaskName':"
 Write-Host "  Schedule : weekly on $DayOfWeek at $Time"

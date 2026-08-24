@@ -102,8 +102,9 @@ describe('ConsolidationLockManager (D0.4, SQLite)', () => {
   });
 
   // R4: the heartbeat re-acquires (same-holder extend) while fn runs, so a pass
-  // longer than the TTL is never stale-stolen mid-write. Real timers — the
-  // heartbeat is a wall-clock setInterval.
+  // longer than the TTL is not stale-stolen mid-write while its heartbeat lands
+  // (the lost-heartbeat detection branch itself is untested — lock.ts logs it).
+  // Real timers — the heartbeat is a wall-clock setInterval.
   describe('R4 heartbeat', () => {
     const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 

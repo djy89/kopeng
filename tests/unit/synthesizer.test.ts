@@ -190,3 +190,133 @@ describe('synthesizePatterns', () => {
     expect(result.find(r => r.content === 'Hot file detected')).toBeDefined();
   });
 });
+
+describe('synthesizePatterns — sequence chaining', () => {
+  function makeSeq(overrides: {
+    from: string;
+    to: string;
+    project_scope?: string;
+    evidence_count?: number;
+    distinct_sessions?: number;
+    observation_span_days?: number;
+  }): PatternCandidate {
+    const { from, to } = overrides;
+    return {
+      pattern_type: 'sequence',
+      description: `Workflow sequence: ${from} → ${to} (3 sessions, 60% coverage)`,
+      evidence_count: overrides.evidence_count ?? 5,
+      observation_span_days: overrides.observation_span_days ?? 2,
+      project_scope: overrides.project_scope ?? 'project:test-app',
+      confidence: 0,
+      content: `Workflow sequence detected: ${from} → ${to}. Observed in 3/5 sessions.`,
+      evidence_snapshot: [{
+        tool: from.replace(/\(.*/, ''),
+        input_hash: `${from}-${to}`,
+        session_id: 'session-1',
+        at: '2026-04-15T10:00:00Z',
+      }],
+      distinct_sessions: overrides.distinct_sessions ?? 3,
+      steps: [from, to],
+    };
+  }
+
+  it('chains overlapping bigrams into one multi-step workflow', () => {
+    const result = synthesizePatterns([
+      makeSeq({ from: 'Read(routes.ts)', to: 'Bash(tsc)' }),
+      makeSeq({ from: 'Bash(tsc)', to: 'Bash(npm)' }),
+    ]);
+
+    expect(result).toHaveLength(1);
+    const chain = result[0];
+    expect(chain.pattern_type).toBe('sequence');
+    expect(chain.description).toContain('Read(routes.ts) → Bash(tsc) → Bash(npm)');
+    expect(chain.content).toContain('Multi-step workflow detected');
+    // 'skill' is applied at storage (discovery-engine); the synthesizer marks workflow.
+    expect(chain.synthesized_tags).toEqual(['workflow']);
+    expect(chain.steps).toEqual(['Read(routes.ts)', 'Bash(tsc)', 'Bash(npm)']);
+    // Weakest-link evidence: min across members.
+    expect(chain.evidence_count).toBe(5);
+    expect(chain.distinct_sessions).toBe(3);
+  });
+
+  it('uses weakest-link (min) evidence across chained members', () => {
+    const result = synthesizePatterns([
+      makeSeq({ from: 'A', to: 'B', evidence_count: 9, distinct_sessions: 5 }),
+      makeSeq({ from: 'B', to: 'C', evidence_count: 4, distinct_sessions: 2 }),
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].evidence_count).toBe(4);
+    expect(result[0].distinct_sessions).toBe(2);
+  });
+
+  it('passes a lone (un-chainable) bigram through unchanged', () => {
+    const lone = makeSeq({ from: 'Read(a.ts)', to: 'Edit(a.ts)' });
+    const result = synthesizePatterns([lone]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toBe(lone);
+  });
+
+  it('does not chain bigrams across different project scopes', () => {
+    const result = synthesizePatterns([
+      makeSeq({ from: 'A', to: 'B', project_scope: 'project:app-a' }),
+      makeSeq({ from: 'B', to: 'C', project_scope: 'project:app-b' }),
+    ]);
+
+    // No overlap within a scope → both pass through, nothing chained.
+    expect(result).toHaveLength(2);
+    expect(result.every(r => r.synthesized_tags === undefined)).toBe(true);
+  });
+
+  it('chains sequences alongside repeated_tool synthesis independently', () => {
+    const result = synthesizePatterns([
+      makeSeq({ from: 'A', to: 'B' }),
+      makeSeq({ from: 'B', to: 'C' }),
+      makeCandidate({
+        tool: 'Read',
+        content: 'When working in this project, the operator frequently uses Read with: {"file_path":"c:\\app\\x.ts"}',
+      }),
+      makeCandidate({
+        tool: 'Read',
+        content: 'When working in this project, the operator frequently uses Read with: {"file_path":"c:\\app\\y.ts"}',
+      }),
+    ]);
+
+    // 1 chained workflow + 1 synthesized file_access group.
+    expect(result).toHaveLength(2);
+    expect(result.find(r => r.content.includes('Multi-step workflow'))).toBeDefined();
+    expect(result.find(r => r.content.includes('Key reference files'))).toBeDefined();
+  });
+
+  it('handles a pure cycle without looping — emits one chain, leaves the closing edge', () => {
+    // A→B→C→A: no node is a pure start, so chaining falls back to all 'from' nodes.
+    const result = synthesizePatterns([
+      makeSeq({ from: 'A', to: 'B' }),
+      makeSeq({ from: 'B', to: 'C' }),
+      makeSeq({ from: 'C', to: 'A' }),
+    ]);
+
+    expect(result).toHaveLength(2);
+    const chain = result.find(r => r.content.includes('Multi-step workflow'));
+    expect(chain!.steps).toEqual(['A', 'B', 'C']);
+    const leftover = result.find(r => r.synthesized_tags === undefined);
+    expect(leftover!.steps).toEqual(['C', 'A']); // closing edge passes through
+  });
+
+  it('caps a chain at 6 nodes and leaves the overflow bigram as passthrough', () => {
+    const result = synthesizePatterns([
+      makeSeq({ from: 'A', to: 'B' }),
+      makeSeq({ from: 'B', to: 'C' }),
+      makeSeq({ from: 'C', to: 'D' }),
+      makeSeq({ from: 'D', to: 'E' }),
+      makeSeq({ from: 'E', to: 'F' }),
+      makeSeq({ from: 'F', to: 'G' }),
+    ]);
+
+    expect(result).toHaveLength(2);
+    const chain = result.find(r => r.content.includes('Multi-step workflow'));
+    expect(chain!.steps).toEqual(['A', 'B', 'C', 'D', 'E', 'F']); // capped at 6 nodes
+    const leftover = result.find(r => r.synthesized_tags === undefined);
+    expect(leftover!.steps).toEqual(['F', 'G']); // overflow edge passes through
+  });
+});

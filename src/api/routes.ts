@@ -15,18 +15,26 @@ import { storeArtifact, getArtifact, getArtifactUrl, listArtifacts, deleteArtifa
 // Discovery imports
 import { scrubSecrets, truncate, shouldSuppressOutput, stripUnstorableCharsDeep } from '../utils/scrubber.js';
 import { runDiscoveryMaintenance } from '../discovery/maintenance.js';
+import { runRedrive, RedriveNotRuledError } from '../discovery/redrive.js';
+import { buildHoldPredicate } from '../discovery/hold.js';
 import type { ObservationEvent } from '../services/observation-bus.js';
 import { isActivityPath } from '../dreaming/activity-tracker.js';
 // Dreaming review/apply surface (D1.3)
 import { ConsolidationLockManager, uniqueHolder } from '../dreaming/lock.js';
 import { resolveDream, rollbackMemory } from '../dreaming/apply.js';
-import type { DreamDiff, DreamChangeClass } from '../types/types.js';
+import { PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON, type DreamDiff, type DreamChangeClass } from '../types/types.js';
 import type { AppContext } from '../types/app-context.js';
+import type { ScopeAliasService } from '../services/scope-alias.js';
+import { resolveWriteThroughAliases, type ScopeRegistryService } from '../services/scope-registry.js';
+import { UNROUTED_SCOPE } from '../scopes/minting.js';
 // Static surfacing (C1.2 / T12)
 import { surface } from '../surfacing/surface.js';
 // Corpus-health derived signals (ops endpoint)
-import { memoryStrength } from '../dreaming/scoring.js';
+import { isAnchored, isDecayedAtRisk } from '../dreaming/scoring.js';
 import { cosineSimilarity, COSINE_DUPLICATE_THRESHOLD, classifyDupPair } from '../dreaming/pipeline.js';
+import { buildScopeDrift } from '../scopes/drift.js';
+import { buildScopeResolution, type ScopeResolution, isGlobalScope, isScopeForm, slugifyScope, GLOBAL_SCOPE } from '../scopes/resolver.js';
+import { SCOPE_ALIASES_CONFIG_KEY } from '../services/scope-alias.js';
 import { bufferToEmbedding } from '../embeddings/embedder.js';
 
 // Zod schemas
@@ -35,7 +43,10 @@ const MemoryTypeEnum = z.enum(['user', 'feedback', 'project', 'reference', 'disc
 const StoreSchema = z.object({
   content: z.string().min(1).max(config.search.maxContentSize),
   type: MemoryTypeEnum.default('reference'),
-  scope: z.string().default('global'),
+  // Phase 3 (R-D): NO .default('global') — the silent-global leak. A scopeless
+  // write routes to the operator's primary scope / project:_unrouted triage via
+  // resolveWriteScope (identity-fallback to global only when no registry is wired).
+  scope: z.string().optional(),
   source: z.string().optional(),
   source_path: z.string().optional(),
   metadata: z.record(z.unknown()).default({}),
@@ -43,6 +54,20 @@ const StoreSchema = z.object({
   created_by: z.string().optional(),
   confidence: z.number().min(0).max(1).optional(),
 });
+
+// Phase 3 (Task 9): re-drive a held scope's stored observations after a ruling.
+const RedriveSchema = z.object({ scope: z.string().min(1) });
+
+// Phase 3 (Task 11): operator ruling on a registry row. Scope in the BODY —
+// path params can't carry `project:My Project` cleanly.
+const RuleScopeSchema = z.object({
+  scope: z.string().min(1),
+  action: z.enum(['confirm', 'merge_into', 'rename']),
+  target: z.string().optional(), // required for merge_into / rename (refine())
+}).refine(
+  (v) => v.action === 'confirm' || (typeof v.target === 'string' && v.target.length > 0),
+  { message: 'target is required for merge_into / rename' },
+);
 
 const TriggerDreamSchema = z.object({
   reason: z.string().max(500).optional(),
@@ -69,12 +94,37 @@ const RollbackSchema = z.object({
   revision: z.number().int().min(1).optional(),
 });
 
+/**
+ * F-A / R-3 (Phase-4 team round): scope-list request inputs are FAIL-OPEN by
+ * contract — the recall/surface hooks are fail-silent, so a rejecting Zod
+ * bound turns one garbage `.kopeng.json` entry into a silent total outage of
+ * surfacing (or recall) for that project. Sanitize instead of reject: keep
+ * non-empty strings of at most 128 chars, cap the list at 16 (filter first,
+ * so a garbage entry never consumes a slot). Shared by POST /api/surface and
+ * POST /api/memories/recall; pinned by tests/unit/scope-list-sanitization.test.ts.
+ */
+const SCOPE_ENTRY_MAX_LEN = 128;
+const SCOPE_LIST_MAX = 16;
+export function sanitizeScopeList(raw: readonly unknown[]): string[] {
+  return raw
+    .filter((s): s is string =>
+      typeof s === 'string' && s.length > 0 && s.length <= SCOPE_ENTRY_MAX_LEN)
+    .slice(0, SCOPE_LIST_MAX);
+}
+
 const SurfaceSchema = z.object({
   prompt: z.string().min(1).max(2000),
   /** Caller-derived project scope (e.g. `project:kopeng`). Takes priority over cwd. */
   project_scope: z.string().optional(),
   /** Raw cwd — basename is used as a fallback project scope when project_scope is absent. */
   cwd: z.string().optional(),
+  /**
+   * Declared anchor scopes (P4 `.kopeng.json` markers) — additive to
+   * project_scope. Unbounded here on purpose (F-A): entries are sanitized in
+   * the handler via sanitizeScopeList, never rejected — spec §4.4 promises
+   * "invalid entries skipped, fail-open — never a 400 for a bad anchor scope".
+   */
+  scopes: z.array(z.string()).optional(),
   caps: z
     .object({
       tools: z.number().int().min(0).max(10).optional(),
@@ -94,6 +144,14 @@ const OperatorConfigPatchSchema = z.object({
   auto_accept_exact_dup: z.boolean().optional(),
   auto_accept_decay: z.boolean().optional(),
   reasoner_provider: z.string().max(128).optional(),
+  // Phase 3: where scopeless writes land. Nullable — null clears the column
+  // (writes fall back to PRIMARY_SCOPE env, then project:_unrouted triage).
+  // Scope-form validated (fix round 1): a value routing would silently ignore
+  // must not 200. ZodNullable/Optional short-circuit null/undefined, so the
+  // refine only runs on real strings.
+  primary_scope: z.string().max(256)
+    .refine(isScopeForm, { message: "primary_scope must be 'global', 'project:<name>', or 'client:<name>' (or null to clear)" })
+    .nullable().optional(),
   config: z.record(z.unknown()).optional(),
 });
 
@@ -145,12 +203,18 @@ const ListQuerySchema = z.object({
   cursor: z.coerce.number().int().optional(),
   include_archived: z.coerce.boolean().default(false),
   fields: z.enum(['full', 'lite']).default('full'),
+  // CR-2 opt-in: expand=aliases widens `scope` to its alias group. The DEFAULT
+  // stays exact-match — the T46 migration driver's residual check depends on
+  // an exact scope match to prove a scope is empty post-migration.
+  expand: z.enum(['aliases']).optional(),
 });
 
 // Ops: dream history + corpus health query params.
 const DreamHistoryQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(20),
-  offset: z.coerce.number().int().min(0).default(0),
+  // Bounded (team-review #22 r2): offset feeds a memo key, and an unbounded
+  // client-controlled dimension is a cache-eviction lever on the shared ops memo.
+  offset: z.coerce.number().int().min(0).max(10_000).default(0),
 });
 
 const CorpusHealthQuerySchema = z.object({
@@ -350,10 +414,40 @@ function reinforceSurfaced(queries: IMemoryStore, ids: number[]): void {
   });
 }
 
+/**
+ * Phase 3: alias table first (T46), then registry minting — the composition is
+ * the SHARED `resolveWriteThroughAliases` (round-2 fix A3), never hand-rolled.
+ * Absent services ⇒ identity. The primary scope arrives already canonicalized
+ * (the service canonicalizes it at load — round-2 fix CO1), so the scopeless
+ * branch needs no alias handling of its own.
+ */
+async function resolveWriteScope(
+  scopeAliases: ScopeAliasService | undefined,
+  scopeRegistry: ScopeRegistryService | undefined,
+  rawScope: string | undefined,
+  origin?: string | null,
+): Promise<{ scope: string; meta?: Record<string, unknown>; extraMetadata?: Record<string, unknown> }> {
+  if (rawScope === undefined) {
+    if (!scopeRegistry) return { scope: GLOBAL_SCOPE }; // pre-Phase-3 fallback when no registry wired
+    const primary = await scopeRegistry.getPrimaryScope();
+    const scope = primary ?? UNROUTED_SCOPE;
+    return { scope, meta: { scope_defaulted: { stored_as: scope, primary_scope_set: primary !== null } } };
+  }
+  const r = await resolveWriteThroughAliases(scopeAliases, scopeRegistry, rawScope, origin ?? null);
+  if (r.rerouted) {
+    return {
+      scope: r.scope,
+      meta: { scope_rerouted: r.rerouted },
+      extraMetadata: { raw_scope: r.rerouted.raw },
+    };
+  }
+  return { scope: r.scope };
+}
+
 export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
   // R7: destructure the AppContext once — route bodies keep their original names.
   const { queries, observations: observationStore, dreams: dreamStore, operatorConfig: operatorConfigStore } = ctx.stores;
-  const { embeddingIndex, memoryCache, discoveryScheduler, observationBus, activityTracker, dreamRunner, reasonerStatus } = ctx.services;
+  const { embeddingIndex, memoryCache, discoveryScheduler, observationBus, activityTracker, dreamRunner, reasonerStatus, scopeAliases, scopeRegistry } = ctx.services;
   const dbLifecycle = ctx.lifecycle;
 
   // Admin-key gate. Originally only the operator-mutating endpoints (PATCH
@@ -459,13 +553,15 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       embeddingBuf = embeddingToBuffer(vec);
     }
 
+    const resolved = await resolveWriteScope(scopeAliases, scopeRegistry, input.scope);
+
     const result = await queries.store({
       content: input.content,
       type: input.type,
-      scope: input.scope,
+      scope: resolved.scope,
       source: 'slot',
       source_path: null,
-      metadata: JSON.stringify({ pinned: true, slot_key: input.slot_key }),
+      metadata: JSON.stringify({ pinned: true, slot_key: input.slot_key, ...resolved.extraMetadata }),
       embedding: embeddingBuf,
       embedding_model: config.embedding.model,
       created_by: null,
@@ -485,7 +581,7 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     }
 
     reply.status(201);
-    return { data: slot };
+    return { data: slot, ...(resolved.meta ? { meta: resolved.meta } : {}) };
   });
 
   app.put('/api/slots/:slot_key', { preHandler: [requireAdminKey] }, async (request, reply) => {
@@ -497,16 +593,24 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       return { error: 'Slot not found' };
     }
 
+    // Phase 3: a slot patch that supplies a scope resolves through the registry.
+    // Truthy check, deliberately — pre-Phase-3 behavior preserved: an omitted OR
+    // empty-string scope keeps the current one.
+    const resolved = input.scope
+      ? await resolveWriteScope(scopeAliases, scopeRegistry, input.scope)
+      : { scope: existing.scope, meta: undefined, extraMetadata: undefined };
+
     const metadata = {
       ...parseMetadata(existing.metadata),
       pinned: true,
       slot_key: existing.slot_key,
+      ...resolved.extraMetadata,
     };
 
     const result = await queries.update(existing.id, {
       content: input.content ?? existing.content,
       type: input.type ?? existing.type,
-      scope: input.scope ?? existing.scope,
+      scope: resolved.scope,
       metadata: JSON.stringify(metadata),
       tags: input.tags ?? existing.tags,
     });
@@ -525,7 +629,7 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       return { error: 'Failed to update slot' };
     }
 
-    return { data: slot };
+    return { data: slot, ...(resolved.meta ? { meta: resolved.meta } : {}) };
   });
 
   app.delete('/api/slots/:slot_key', { preHandler: [requireAdminKey] }, async (request, reply) => {
@@ -558,13 +662,15 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       embeddingBuf = embeddingToBuffer(vec);
     }
 
+    const resolved = await resolveWriteScope(scopeAliases, scopeRegistry, input.scope);
+
     const result = await queries.store({
       content: input.content,
       type: input.type,
-      scope: input.scope,
+      scope: resolved.scope,
       source: input.source || null,
       source_path: input.source_path || null,
-      metadata: JSON.stringify(input.metadata),
+      metadata: JSON.stringify({ ...input.metadata, ...resolved.extraMetadata }),
       embedding: embeddingBuf,
       embedding_model: config.embedding.model,
       created_by: input.created_by || null,
@@ -582,7 +688,7 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     reply.status(result.deduplicated ? 200 : 201);
     return {
       data: memory,
-      meta: { deduplicated: result.deduplicated, duration_ms: Date.now() - start },
+      meta: { deduplicated: result.deduplicated, duration_ms: Date.now() - start, ...resolved.meta },
     };
   });
 
@@ -592,6 +698,13 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     const input = BatchStoreSchema.parse(request.body);
 
     const items = [];
+    // Honest aggregate routing meta (fix round 1): counts + the last example,
+    // never one item's routing presented as the batch's. The durable per-row
+    // record is metadata.raw_scope on each stored row.
+    let reroutedCount = 0;
+    let lastRerouted: unknown;
+    let defaultedCount = 0;
+    let lastDefaulted: unknown;
     for (const mem of input.memories) {
       let embeddingBuf: Buffer | null = null;
       if (isEmbedderReady()) {
@@ -599,13 +712,17 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
         embeddingBuf = embeddingToBuffer(vec);
       }
 
+      const resolved = await resolveWriteScope(scopeAliases, scopeRegistry, mem.scope);
+      if (resolved.meta?.scope_rerouted) { reroutedCount++; lastRerouted = resolved.meta.scope_rerouted; }
+      if (resolved.meta?.scope_defaulted) { defaultedCount++; lastDefaulted = resolved.meta.scope_defaulted; }
+
       items.push({
         content: mem.content,
         type: mem.type,
-        scope: mem.scope,
+        scope: resolved.scope,
         source: mem.source || null,
         source_path: mem.source_path || null,
-        metadata: JSON.stringify(mem.metadata),
+        metadata: JSON.stringify({ ...mem.metadata, ...resolved.extraMetadata }),
         embedding: embeddingBuf,
         embedding_model: config.embedding.model,
         created_by: mem.created_by || null,
@@ -627,7 +744,11 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
 
     return {
       data: { ids: result.ids, duplicates: result.duplicates, inserted: result.ids.length - result.duplicates },
-      meta: { duration_ms: Date.now() - start },
+      meta: {
+        duration_ms: Date.now() - start,
+        ...(reroutedCount > 0 ? { scope_rerouted: { count: reroutedCount, last: lastRerouted } } : {}),
+        ...(defaultedCount > 0 ? { scope_defaulted: { count: defaultedCount, last: lastDefaulted } } : {}),
+      },
     };
   });
 
@@ -691,23 +812,46 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       return { error: 'Memory not found' };
     }
 
-    // F3/T22: a confidence change is snapshot-first (mirror the dream apply
-    // path's snapshot->mutate discipline) so a manual demotion / re-anchor is
-    // reversible via POST /api/memories/:id/rollback. Snapshot BEFORE any
-    // mutation captures the pre-change confidence (+ content/tags) into
-    // memory_revisions — the append-only audit record rollback restores from.
+    // Phase 2: EVERY effective PUT mutation is snapshot-first (F3/T22 covered
+    // only confidence). A byte-identical PUT snapshots nothing. These revisions
+    // carry created_by_dream_id = NULL — revision-only reversibility, no
+    // dream_audit_log row (operator ruling 2026-08-18 #4).
     const confidenceChanged =
       input.confidence !== undefined && input.confidence !== existing.confidence;
-    if (confidenceChanged && dreamStore) {
+    // Phase 3: only a patch that SUPPLIES a scope resolves through the registry.
+    // Truthy check, deliberately — pre-Phase-3 behavior preserved: an omitted OR
+    // empty-string scope keeps the current one.
+    const resolved = input.scope
+      ? await resolveWriteScope(scopeAliases, scopeRegistry, input.scope)
+      : { scope: existing.scope, meta: undefined, extraMetadata: undefined };
+    const scope = resolved.scope;
+    const nextContent = input.content ?? existing.content;
+    const nextType = (input.type ?? existing.type) as MemoryType;
+    // nextMetadata compares serialized strings, so a semantically-equal but
+    // key-reordered metadata patch still snapshots — harmless (an extra
+    // revision, never a lost one).
+    let nextMetadata = input.metadata ? JSON.stringify(input.metadata) : existing.metadata;
+    if (resolved.extraMetadata) {
+      nextMetadata = JSON.stringify({ ...parseMetadata(nextMetadata), ...resolved.extraMetadata });
+    }
+    const nextTags = input.tags ?? existing.tags;
+    const tagsChanged = JSON.stringify([...nextTags].sort()) !== JSON.stringify([...existing.tags].sort());
+    const mutated = confidenceChanged
+      || nextContent !== existing.content
+      || nextType !== existing.type
+      || scope !== existing.scope
+      || nextMetadata !== existing.metadata
+      || tagsChanged;
+    if (mutated && dreamStore) {
       await dreamStore.snapshotRevision(memoryId);
     }
 
     const result = await queries.update(memoryId, {
-      content: input.content ?? existing.content,
-      type: (input.type ?? existing.type) as MemoryType,
-      scope: input.scope ?? existing.scope,
-      metadata: input.metadata ? JSON.stringify(input.metadata) : existing.metadata,
-      tags: input.tags ?? existing.tags,
+      content: nextContent,
+      type: nextType,
+      scope,
+      metadata: nextMetadata,
+      tags: nextTags,
     });
 
     // Re-embed if content changed
@@ -729,6 +873,7 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
         content_changed: result.contentChanged,
         confidence_changed: confidenceChanged,
         duration_ms: Date.now() - start,
+        ...resolved.meta,
       },
     };
   });
@@ -815,25 +960,68 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
 
     const queryVec = await embed(input.query);
 
-    // Normalize: accept both `scope` (string) and `scopes` (array); `scopes` takes priority
-    const requestedScopes: string[] = input.scopes ?? (input.scope ? [input.scope] : []);
+    // Normalize: accept both `scope` (string) and `scopes` (array); `scopes` takes priority.
+    //
+    // R-3 (team round): `scopes` entries are SANITIZED, not Zod-rejected —
+    // recall's tolerance is contractual (the hook is fail-silent). Semantics,
+    // pinned by tests/unit/scope-list-sanitization.test.ts:
+    //  - the sanitized list IS the requested list, so 1 valid + 1 garbage
+    //    entry behaves as a single-scope request incl. its documented global
+    //    fallback below;
+    //  - a NON-EMPTY list that sanitizes to empty degrades to ['global'] —
+    //    the caller asked for scoping, so we never widen to an unscoped
+    //    whole-corpus search (the no-cross-project-bleed doctrine; global is
+    //    recall's only sanctioned fallback);
+    //  - an explicitly empty `scopes: []` keeps its pre-existing meaning: no
+    //    scope filter.
+    let requestedScopes: string[];
+    if (input.scopes !== undefined) {
+      const sanitized = sanitizeScopeList(input.scopes);
+      requestedScopes = sanitized.length > 0 || input.scopes.length === 0
+        ? sanitized
+        : [GLOBAL_SCOPE];
+    } else {
+      requestedScopes = input.scope ? [input.scope] : [];
+    }
+
+    // T46: expand each requested scope to its alias group so un-migrated rows
+    // (still stored under an alias) and post-migration rows (stored under the
+    // canonical) are both reachable. A scope with no aliases expands to
+    // exactly itself, so a no-table request stays byte-identical to today.
+    const effectiveScopes = scopeAliases && requestedScopes.length > 0
+      ? await scopeAliases.expand(requestedScopes)
+      : requestedScopes;
 
     // Get scope-filtered candidate IDs. Multiple scopes → union of IDs (no cross-project bleed).
+    // Branch on the CALLER's original scope count (requestedScopes), not the
+    // post-expansion count: a single requested scope with a registered alias
+    // still needs the single-scope global-fallback behavior below. Branching
+    // on effectiveScopes.length instead would route any aliased scope into
+    // the multi-scope branch the moment an alias is registered for it, whose
+    // empty-union early-return never retries against global — silently
+    // breaking the documented recall fallback for exactly the scopes this
+    // feature targets.
     let candidateIds: number[] | undefined;
     if (requestedScopes.length > 0) {
       if (requestedScopes.length === 1) {
         const [singleScope] = requestedScopes;
-        candidateIds = await queries.getFilteredIds({ scope: singleScope, include_archived: false });
-        if (candidateIds.length === 0 && singleScope !== 'global') {
-          // Single-scope fallback: project has no memories → search global only
-          candidateIds = await queries.getFilteredIds({ scope: 'global', include_archived: false });
+        // Query the full alias group for this one requested scope (itself
+        // when unaliased).
+        candidateIds = effectiveScopes.length === 1
+          ? await queries.getFilteredIds({ scope: effectiveScopes[0], include_archived: false })
+          : [...new Set((await Promise.all(
+              effectiveScopes.map(s => queries.getFilteredIds({ scope: s, include_archived: false }))
+            )).flat())];
+        if (candidateIds.length === 0 && !isGlobalScope(singleScope)) {
+          // Single-scope fallback: scope (and its alias group) has no memories → search global only
+          candidateIds = await queries.getFilteredIds({ scope: GLOBAL_SCOPE, include_archived: false });
           if (candidateIds.length === 0) {
             return { data: [], meta: { duration_ms: Date.now() - start } };
           }
         }
       } else {
         const idSets = await Promise.all(
-          requestedScopes.map(s => queries.getFilteredIds({ scope: s, include_archived: false }))
+          effectiveScopes.map(s => queries.getFilteredIds({ scope: s, include_archived: false }))
         );
         candidateIds = [...new Set(idSets.flat())];
         if (candidateIds.length === 0) {
@@ -929,11 +1117,27 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     const start = Date.now();
     const input = SearchSchema.parse(request.body);
 
+    // CR-2: expand the requested scope through the alias table (same read-time
+    // semantics as recall) so an alias-scoped search reaches rows stored under
+    // the canonical and vice versa. Only branch to the union path when
+    // expansion actually widens the scope set — no service, no table, or no
+    // alias for this scope keeps the single-scope call byte-identical to today.
+    let searchScope: string | undefined = input.scope;
+    let searchScopes: string[] | undefined;
+    if (input.scope && scopeAliases) {
+      const effectiveScopes = await scopeAliases.expand([input.scope]);
+      if (effectiveScopes.length > 1) {
+        searchScopes = effectiveScopes;
+        searchScope = undefined;
+      }
+    }
+
     const { results, total, reranked } = await hybridSearch(queries, embeddingIndex, {
       query: input.query,
       mode: input.mode,
       type: input.type,
-      scope: input.scope,
+      scope: searchScope,
+      scopes: searchScopes,
       tags: input.tags,
       limit: input.limit,
       offset: input.offset,
@@ -952,20 +1156,70 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
         offset: input.offset,
         has_more: input.offset + input.limit < total,
         reranked,
+        // R-2: disclose the union branch (mirrors the list route's
+        // expand=aliases marker); absent when no expansion happened.
+        ...(searchScopes ? { expanded_scopes: searchScopes } : {}),
         duration_ms: Date.now() - start,
       },
     };
   });
 
   // --- List memories ---
-  app.get('/api/memories', async (request) => {
+  app.get('/api/memories', async (request, reply) => {
     const start = Date.now();
     const raw = request.query as Record<string, string>;
     const input = ListQuerySchema.parse(raw);
 
+    // CR-2: expand=aliases is a one-shot merged view over the alias group —
+    // cursor pagination can't compose with a multi-scope merge, so the
+    // combination is refused outright (deterministic contract, independent of
+    // whether the service/scope would make the param a no-op below).
+    if (input.expand === 'aliases' && input.cursor !== undefined) {
+      reply.status(400);
+      return { error: 'expand=aliases does not support cursor pagination' };
+    }
+
     const tags = input.tags ? input.tags.split(',').map(t => t.trim()).filter(Boolean) : undefined;
     const lite = input.fields === 'lite';
     const limit = lite ? input.limit : Math.min(input.limit, config.search.maxLimit);
+
+    // Opt-in alias-group expansion; no service or no scope ⇒ param ignored and
+    // the DEFAULT exact-match path below runs unchanged (the T46 migration
+    // driver's residual check depends on that exactness).
+    let expandedScopes: string[] | undefined;
+    if (input.expand === 'aliases' && input.scope && scopeAliases) {
+      const group = await scopeAliases.expand([input.scope]);
+      if (group.length > 1) expandedScopes = group;
+    }
+
+    if (expandedScopes) {
+      // Per-member list calls (same limit each), merged, deduped by id,
+      // newest-first, sliced back to limit.
+      const pages = await Promise.all(expandedScopes.map(s => queries.list({
+        type: input.type,
+        scope: s,
+        tags,
+        limit,
+        include_archived: input.include_archived,
+        lite,
+      })));
+      const byId = new Map<number, (typeof pages)[number]['memories'][number]>();
+      for (const page of pages) {
+        for (const m of page.memories) byId.set(m.id, m);
+      }
+      const merged = [...byId.values()].sort((a, b) => b.id - a.id);
+      const memories = merged.slice(0, limit);
+
+      return {
+        data: memories,
+        meta: {
+          limit,
+          has_more: pages.some(p => p.has_more) || merged.length > limit,
+          expanded_scopes: expandedScopes,
+          duration_ms: Date.now() - start,
+        },
+      };
+    }
 
     const { memories, has_more } = await queries.list({
       type: input.type,
@@ -1537,7 +1791,15 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
   if (dreamStore) {
     // embedText (D2.2): operator-accepted conditional entries create the branch
     // encoding as a new memory, which needs a fresh embedding (invariant #10).
-    const applyDeps = { memoryStore: queries, dreamStore, vectorIndex: embeddingIndex, embedText: embedWithModel };
+    const applyDeps = {
+      memoryStore: queries, dreamStore, vectorIndex: embeddingIndex, embedText: embedWithModel,
+      // Deliberately `undefined` (not an identity fn) when no alias service is
+      // wired — ApplyDeps.canonicalizeScope absent means "skip the canonical-
+      // survivor preference entirely", which an identity function would defeat
+      // silently. Do not "simplify" this to the module-level canonicalizeScope
+      // helper above (which always resolves, alias service or not).
+      canonicalizeScope: scopeAliases ? (s: string) => scopeAliases.canonicalize(s) : undefined,
+    };
     const parseDiff = (raw: string | null): DreamDiff =>
       raw ? (JSON.parse(raw) as DreamDiff) : { entries: [] };
 
@@ -1587,7 +1849,9 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
         const entry = diffEntries[i];
         const members = [];
         for (const memberId of entry.memory_ids) {
-          const mem = await queries.get(memberId);
+          // peek — the comment above declares these reads non-reinforcing;
+          // get() was writing an access-log row per member per poll anyway.
+          const mem = await queries.peek(memberId);
           if (!mem) {
             members.push({ id: memberId, missing: true });
             continue;
@@ -1696,12 +1960,40 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     });
 
     // --- Revision history for a memory ---
-    app.get('/api/memories/:id/revisions', async (request, reply) => {
+    // Admin-gated (team-review #22 S1): revisions serve PRE-EDIT content
+    // verbatim, so a public read would defeat redaction — an operator PUT that
+    // scrubs a secret must not leave the old text readable by anyone on the
+    // port. No hook/MCP/viz consumer reads this over HTTP (the drill uses the
+    // in-process store), so gating it does not break the public-reads contract.
+    app.get('/api/memories/:id/revisions', { preHandler: [requireAdminKey] }, async (request, reply) => {
       const { id } = request.params as { id: string };
       const memId = parseInt(id, 10);
       if (isNaN(memId)) { reply.status(400); return { error: 'Invalid memory ID' }; }
       const revisions = await dreamStore.listRevisions(memId);
       return { data: revisions, meta: { count: revisions.length } };
+    });
+
+    // --- Revision purge (team-review #22 S1): the deliberate redaction path ---
+    // Snapshots are retention-bounded for operator edits (REVISION_KEEP_PER_MEMORY)
+    // but a genuine secret must be excisable NOW, including from dream-linked
+    // revisions. Purging a dream-linked revision forfeits that apply's rollback —
+    // an explicit admin trade, which is why there is no bulk/unscoped variant.
+    app.delete('/api/memories/:id/revisions/:revision', { preHandler: [requireAdminKey] }, async (request, reply) => {
+      const { id, revision } = request.params as { id: string; revision: string };
+      const memId = parseInt(id, 10);
+      const rev = parseInt(revision, 10);
+      if (isNaN(memId) || isNaN(rev) || rev < 1) { reply.status(400); return { error: 'Invalid memory ID or revision' }; }
+      const deleted = await dreamStore.deleteRevision(memId, rev);
+      if (!deleted) { reply.status(404); return { error: 'No such memory revision' }; }
+      return { data: { memory_id: memId, revision: rev, deleted: true } };
+    });
+
+    app.delete('/api/memories/:id/revisions', { preHandler: [requireAdminKey] }, async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const memId = parseInt(id, 10);
+      if (isNaN(memId)) { reply.status(400); return { error: 'Invalid memory ID' }; }
+      const count = await dreamStore.deleteRevisions(memId);
+      return { data: { memory_id: memId, deleted: count } };
     });
 
     // --- Rollback: restore a revision snapshot over the live row ---
@@ -1796,8 +2088,240 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       // wedge later PATCHes); the awaited `run` still surfaces the error here.
       configPatchChain = run.catch(() => {});
       const cfg = await run;
+      // T46: a PATCH may have changed the scope_aliases key in the config
+      // blob — drop the service's cache so the next write/recall sees it
+      // immediately instead of waiting out the TTL.
+      scopeAliases?.invalidate();
+      // Phase 3: same posture for primary_scope — the registry service caches
+      // it; drop the cache so the next write routes against the new value.
+      scopeRegistry?.invalidate();
       return { data: cfg };
     });
+
+    // --- Phase 3 (Task 11): operator ruling on a registry row ---
+    // RECORDS the ruling (status/rename + alias entry); it NEVER migrates rows
+    // or re-drives held observations behind the operator's back (spec §12) —
+    // those follow-up commands are returned in meta.follow_ups for the operator
+    // to run. merge_into / rename append their alias entry through the SAME
+    // serialized configPatchChain as the PATCH above (T26): an independent
+    // read-merge-write here would re-open the blob TOCTOU that chain closed.
+    // Registered inside this block because the chain (and the alias table)
+    // live on the operator-config store; a registry without that store is a
+    // degraded install with nothing to rule against.
+    if (scopeRegistry) {
+      app.post('/api/admin/scopes/rule', { preHandler: [requireAdminKey] }, async (request, reply) => {
+        const input = RuleScopeSchema.parse(request.body);
+        const { scope, action } = input;
+
+        // updateStatus/rename are silent no-ops on a missing scope — the 404
+        // needs an explicit existence check. The row is kept: a rename needs
+        // its PRE-rename slug for the tombstone (I1, below).
+        const rows = await scopeRegistry.snapshotRows();
+        const ruledRow = rows.find((r) => r.scope === scope);
+        if (!ruledRow) {
+          reply.status(404);
+          return { error: `No registry row for scope "${scope}"` };
+        }
+
+        // Round-2 fix CO4: reserved rows (the seeded triage scope, rename
+        // tombstones) are system state — confirming one is meaningless,
+        // renaming one would free a tombstoned quarantine suffix (the exact
+        // R-A merge the tombstone exists to prevent), and merge_into would
+        // alias a system scope away. Refuse them all, naming the row.
+        if (ruledRow.reserved) {
+          reply.status(400);
+          return { error: `Registry row "${scope}" is reserved (system scope or rename tombstone) — rulings do not apply to reserved rows` };
+        }
+
+        const ruledAt = new Date().toISOString();
+
+        if (action === 'confirm') {
+          await scopeRegistry.updateStatus(scope, 'confirmed', ruledAt);
+          opsMemo.delete(SCOPE_REGISTRY_MEMO_KEY); // S2: rulings reflect immediately
+          return { data: { scope, action, status: 'confirmed', ruled_at: ruledAt } };
+        }
+
+        const target = input.target!; // refine() guarantees it for merge_into / rename
+
+        // `global` is never a mintable or renameable scope (decideMint Rule 1
+        // passes it before any lookup), so a global target would be inert as a
+        // rename and merge-shaped as an alias — refuse rather than accept-and-drift.
+        if (target === GLOBAL_SCOPE) {
+          reply.status(400);
+          return { error: 'Ruling target cannot be "global"' };
+        }
+
+        if (action === 'rename' && rows.some((r) => r.scope === target)) {
+          // The store's rename throws on the PK conflict anyway; pre-check for
+          // a deterministic 409 on both backends.
+          reply.status(409);
+          return { error: `Rename refused: target scope "${target}" already has a registry row` };
+        }
+
+        // Validate + append {scope: target} to config.scope_aliases through the
+        // serialized chain. The WOULD-BE table runs through the shared
+        // buildScopeResolution: the new entry must be accepted AND must not
+        // flip a previously-accepted entry to rejected (adding {scope: target}
+        // can reject an existing entry keyed by `target` as chained — silently
+        // breaking a working alias would be the Phase-1 watchdog failure).
+        type RuleChainResult = { ok: true } | { ok: false; httpStatus: 400 | 500; reason: string };
+        const run = configPatchChain.then(async (): Promise<RuleChainResult> => {
+          const current = await operatorConfigStore.getConfig('default');
+          let blob: Record<string, unknown>;
+          try {
+            const parsed = JSON.parse(current?.config ?? '{}');
+            blob = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+              ? parsed as Record<string, unknown>
+              : {};
+          } catch {
+            blob = {};
+          }
+          // Validate against the RAW stored table + the new entry — that is
+          // what the live resolver will see, so it predicts the real verdict
+          // (an accepted-only base could pass an entry the resolver then
+          // rejects, e.g. a chain through a currently-rejected entry's value).
+          const storedRaw = blob[SCOPE_ALIASES_CONFIG_KEY];
+          const rawTable = typeof storedRaw === 'object' && storedRaw !== null && !Array.isArray(storedRaw)
+            ? storedRaw as Record<string, unknown>
+            : {};
+          const before = buildScopeResolution(rawTable);
+          const wouldBe = { ...rawTable, [scope]: target };
+          const after = buildScopeResolution(wouldBe);
+          const own = after.rejected.find((r) => r.alias === scope);
+          if (own) {
+            return { ok: false, httpStatus: 400, reason: `alias entry {"${scope}": "${target}"} rejected: ${own.reason}` };
+          }
+          const broken = after.rejected.find((r) => r.alias !== scope && before.forward.has(r.alias));
+          if (broken) {
+            return { ok: false, httpStatus: 400, reason: `alias entry {"${scope}": "${target}"} would break accepted alias "${broken.alias}": ${broken.reason}` };
+          }
+          if (action === 'rename') {
+            // Re-key BEFORE the alias write: the likely failure (a PK conflict
+            // raced past the pre-check) must abort with the table untouched.
+            await scopeRegistry.rename(scope, target, slugifyScope(target));
+            // I1 (final review): TOMBSTONE the freed scope — reserved +
+            // confirmed, under its ORIGINAL claim slug — so bySlug counting
+            // still sees the historical claimant and the next slug collision
+            // takes the NEXT suffix instead of re-minting the freed one, whose
+            // alias entry now points at the renamed claimant's project (suffix
+            // reuse would sweep a brand-new claimant's rows there — the R-A
+            // cross-claimant merge). claimant_raw is the freed scope itself so
+            // the real claimant's byClaimant resolution stays unpolluted.
+            await scopeRegistry.register({
+              scope,
+              slug: ruledRow.slug,
+              claimant_raw: scope,
+              origin_cwd: null,
+              status: 'confirmed',
+              reserved: true,
+            });
+          }
+          blob[SCOPE_ALIASES_CONFIG_KEY] = wouldBe;
+          try {
+            await operatorConfigStore.updateConfig('default', { config: JSON.stringify(blob) });
+          } catch (err) {
+            // Round-2 fix CO7 (M1's sibling): for a rename, the re-key +
+            // tombstone landed BEFORE this write — a bare 500 would hide that,
+            // and a retried rename would 409 off the tombstone while the freed
+            // scope's rows sit unaliased. Name the partial state and the one
+            // recovery that works. (merge_into reaches here with NOTHING
+            // written yet, so its plain failure stays a plain failure.)
+            if (action === 'rename') {
+              const msg = err instanceof Error ? err.message : String(err);
+              return {
+                ok: false,
+                httpStatus: 500,
+                reason: `Ruling partially applied: registry row "${scope}" was renamed to "${target}" (tombstone in place) but its alias entry {"${scope}": "${target}"} failed to persist (${msg}). ` +
+                  `Do NOT retry the rename — the re-key already landed and would 409 off the tombstone. ` +
+                  `Recover by adding the entry {"${scope}": "${target}"} to config.scope_aliases via PATCH /api/operator-config (resend the FULL map — the blob key replaces whole).`,
+              };
+            }
+            throw err;
+          }
+          if (action === 'merge_into') {
+            // Ensure the canonical target has its own registry row (idempotent
+            // ON CONFLICT DO NOTHING): without one, the target's next write
+            // slug-collides with the merged row and QUARANTINES — the ruling
+            // must not plant that trap.
+            await scopeRegistry.register({
+              scope: target,
+              slug: slugifyScope(target),
+              claimant_raw: target,
+              origin_cwd: null,
+              status: 'confirmed',
+            });
+          }
+          // Spec §12: every ruling confirms — merge_into confirms the merged
+          // row under its own name; rename confirms the claimant under the
+          // operator-chosen scope (keyed by `target` after the re-key). M1
+          // (final review): this runs INSIDE the chain so a store failure
+          // after the alias entry landed names the partial state instead of
+          // surfacing as an unexplanatory 500.
+          const confirmScope = action === 'rename' ? target : scope;
+          try {
+            await scopeRegistry.updateStatus(confirmScope, 'confirmed', ruledAt);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return {
+              ok: false,
+              httpStatus: 500,
+              reason: `Ruling partially applied: alias entry {"${scope}": "${target}"} is live but the confirming status update failed (${msg}). ` +
+                `Registry row "${confirmScope}" remains unconfirmed — retry with {"scope": "${confirmScope}", "action": "confirm"} to complete the ruling.`,
+            };
+          }
+          return { ok: true };
+        });
+        // Keep the chain alive even if this run rejects (same posture as PATCH).
+        configPatchChain = run.catch(() => {});
+        let result: RuleChainResult;
+        try {
+          result = await run;
+        } catch (err) {
+          // A rename PK conflict that raced past the pre-check (stale snapshot)
+          // surfaces here from the store — map it to the same deterministic 409
+          // instead of a 500. Both backends: better-sqlite3 SQLITE_CONSTRAINT*
+          // codes / "UNIQUE constraint failed", pg 23505 / "duplicate key".
+          const code = (err as { code?: string }).code;
+          const uniqueViolation = code === '23505'
+            || (typeof code === 'string' && code.startsWith('SQLITE_CONSTRAINT'))
+            || /UNIQUE constraint|duplicate key/i.test(err instanceof Error ? err.message : '');
+          if (action === 'rename' && uniqueViolation) {
+            reply.status(409);
+            return { error: `Rename refused: target scope "${target}" already has a registry row` };
+          }
+          throw err;
+        }
+        if (!result.ok) {
+          // A partial-apply (alias landed and/or the registry re-keyed) still
+          // changed live state — invalidate before reporting it (S2: the ops
+          // memo too, so the operator sees the partial state, not a snapshot
+          // from before it).
+          if (result.httpStatus === 500) {
+            scopeAliases?.invalidate();
+            opsMemo.delete(SCOPE_REGISTRY_MEMO_KEY);
+          }
+          reply.status(result.httpStatus);
+          return { error: result.reason };
+        }
+        // The alias table changed — same invalidation posture as the PATCH
+        // handler (the service's registry writes in the chain already
+        // invalidated the registry cache). S2: rulings also drop the ops memo
+        // key so the ruling is visible on the next poll.
+        scopeAliases?.invalidate();
+        scopeRegistry.invalidate();
+        opsMemo.delete(SCOPE_REGISTRY_MEMO_KEY);
+
+        const meta = {
+          follow_ups: [
+            `npm run migrate:scope-aliases -- --only ${scope} (dry-run first)`,
+            `POST /api/admin/discovery/redrive {"scope": "${scope}"} (if this scope has held observations)`,
+          ],
+        };
+        return action === 'merge_into'
+          ? { data: { scope, action, target, status: 'confirmed', ruled_at: ruledAt }, meta }
+          : { data: { scope, action, target, slug: slugifyScope(target), status: 'confirmed', ruled_at: ruledAt }, meta };
+      });
+    }
   }
 
   // --- Discovery listing + maintenance (requires observation store only) ---
@@ -1819,6 +2343,10 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     });
 
     // --- Discovery runs list ---
+    // Unfiltered by design (Phase 3, Task 12): held rows appear with their
+    // status — this raw listing is the debug surface for run bookkeeping, so it
+    // must show every terminal state. Pinned (at the store level) in
+    // tests/unit/held-run-consumers.test.ts.
     app.get('/api/discoveries/runs', async (request) => {
       const { project_scope, limit } = request.query as { project_scope?: string; limit?: string };
       const runs = await observationStore.listDiscoveryRuns(project_scope, parseInt(limit || '20', 10));
@@ -1826,9 +2354,85 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     });
 
     // --- Admin: Discovery maintenance ---
-    app.post('/api/admin/discovery/maintain', { preHandler: [requireAdminKey] }, async () => {
-      const result = await runDiscoveryMaintenance(observationStore, queries);
+    app.post('/api/admin/discovery/maintain', { preHandler: [requireAdminKey] }, async (_request, reply) => {
+      // Round-2 CO5+S1a: §1's purge exemption runs the SHARED hold predicate
+      // (ephemeral-shaped AND not alias-mapped) — wired on BOTH call shapes,
+      // since the purge is not an archive site and runs without audit deps too.
+      const maintenanceOpts = {
+        isHeld: buildHoldPredicate(scopeAliases ? (s: string) => scopeAliases.canonicalize(s) : undefined),
+      };
+      if (dreamStore) {
+        const lock = new ConsolidationLockManager({ store: dreamStore, holder: uniqueHolder('discovery-maintenance') });
+        const { acquired, result } = await lock.withLock(() =>
+          runDiscoveryMaintenance(observationStore, queries, {
+            dreamStore, vectorIndex: embeddingIndex,
+            // GATE 1 (team-review #22): §2's decay-class archives honor
+            // auto_accept_decay and §3 honors the auto_promote_global blob flag,
+            // both read from operator_config like the nightly chain.
+            configStore: operatorConfigStore ?? null,
+            // r2: §3's distinct-scope count must not be faked by alias variants.
+            canonicalizeScope: scopeAliases ? (s: string) => scopeAliases.canonicalize(s) : undefined,
+            // Phase 4: §2's dormancy freeze reads recency over the WHOLE alias
+            // group, so a row adrift on a variant shares its siblings' clock.
+            expandScope: scopeAliases ? (s: string) => scopeAliases.expand([s]) : undefined,
+          }, maintenanceOpts));
+        if (!acquired) {
+          reply.status(423);
+          return { error: 'Consolidation lock held elsewhere — retry shortly' };
+        }
+        return { data: result };
+      }
+      const result = await runDiscoveryMaintenance(observationStore, queries, undefined, maintenanceOpts);
       return { data: result };
+    });
+
+    // --- Admin: time-preserving re-drive for held scopes (Phase 3, Task 9) ---
+    // Re-runs the detection pipeline over a HELD scope's stored observations
+    // once the operator has ruled it (alias entry, registry resolution, or a
+    // confirmed registry row). 200 {data} | 409 unruled | 423 lock busy.
+    // Invariant: creates no observation rows, rewrites no timestamps.
+    app.post('/api/admin/discovery/redrive', { preHandler: [requireAdminKey] }, async (request, reply) => {
+      const { scope } = RedriveSchema.parse(request.body);
+
+      // The ruled resolution chain: the SHARED alias-first composition (A3).
+      // origin = null — a re-drive is a deliberate operator act, not a write
+      // from an observing session's cwd.
+      const resolveTo = async (raw: string): Promise<string> =>
+        (await resolveWriteThroughAliases(scopeAliases, scopeRegistry, raw, null)).scope;
+      // Second half of the refusal predicate: an unchanged resolution still
+      // proceeds when the operator CONFIRMED the scope as legitimate as-is.
+      // Reserved rows are EXCLUDED (round-2 fix CO3): a tombstone or
+      // project:_unrouted is confirmed as system state, not as a scope the
+      // operator blessed for minting — re-driving into one would mint memories
+      // under a scope no ruling ever released.
+      const isConfirmed = scopeRegistry
+        ? async (s: string) => (await scopeRegistry.snapshotRows())
+            .some(r => r.scope === s && r.status === 'confirmed' && !r.reserved)
+        : undefined;
+
+      const options = { scope, resolveTo, isConfirmed, config: config.discovery };
+      try {
+        if (dreamStore) {
+          const lock = new ConsolidationLockManager({ store: dreamStore, holder: uniqueHolder('discovery-redrive') });
+          const { acquired, result } = await lock.withLock(() =>
+            runRedrive(observationStore, queries, embeddingIndex, options));
+          if (!acquired) {
+            reply.status(423);
+            return { error: 'Consolidation lock held elsewhere — retry shortly' };
+          }
+          return { data: result };
+        }
+        // Dreaming not configured at all — unlocked fallback, same posture as
+        // the maintenance route above.
+        const result = await runRedrive(observationStore, queries, embeddingIndex, options);
+        return { data: result };
+      } catch (err) {
+        if (err instanceof RedriveNotRuledError) {
+          reply.status(409);
+          return { error: err.message };
+        }
+        throw err;
+      }
     });
   }
 
@@ -1927,6 +2531,11 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       observationStore.getLastObservationAt(),
     ]);
     const oneHourAgo = Date.now() - 3_600_000;
+    // Held runs COUNT here (Phase 3, Task 12): runs_last_hour is a liveness
+    // sparkline, and a held pass consumed observations and stamped completed_at
+    // — an hour of purely ephemeral traffic must not read as a dead engine
+    // (the exact starvation scenario the held status exists to fix). The filter
+    // is deliberately status-blind. Pinned in tests/unit/held-run-consumers.test.ts.
     const runsLastHour = recentRuns.filter(r => {
       if (!r.completed_at) return false;
       return new Date(r.completed_at).getTime() >= oneHourAgo;
@@ -1941,6 +2550,9 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
         runs_last_hour: runsLastHour,
         last_observation_at: lastObservationAt,
         last_run_at: lastRun?.completed_at ?? lastRun?.started_at ?? null,
+        // Held runs INCLUDED, labeled (Phase 3, Task 12): the row shape carries
+        // `status` so the viz can render a held pass distinctly instead of it
+        // vanishing from the sparkline. Pinned in tests/unit/held-run-consumers.test.ts.
         recent_runs: recentRuns.slice(0, 20).map(r => ({
           id: r.id,
           project_scope: r.project_scope,
@@ -1996,6 +2608,10 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
   // faster than the TTL retires them (corpus-health quantizes `sample` too).
   const OPS_CACHE_TTL_MS = 60_000;
   const OPS_CACHE_MAX_KEYS = 128;
+  // Round-2 fix S2: /api/ops/scope-registry rides the same memo; the ruling
+  // endpoint deletes this key so an operator ruling is visible immediately.
+  const SCOPE_REGISTRY_MEMO_KEY = 'scope-registry';
+  const SCOPE_REGISTRY_ROW_CAP = 500;
   const opsMemo = new Map<string, { at: number; value: Promise<unknown> }>();
   function memoizeOps<T>(key: string, compute: () => Promise<T>): Promise<T> {
     const now = Date.now();
@@ -2004,7 +2620,14 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     for (const [k, v] of opsMemo) {
       if (now - v.at >= OPS_CACHE_TTL_MS) opsMemo.delete(k);
     }
-    if (opsMemo.size >= OPS_CACHE_MAX_KEYS) opsMemo.clear();
+    // Evict oldest-first, never clear() (team-review #22 r2): a full flush let
+    // one endpoint's key churn (dream-history offsets) evict another's expensive
+    // entry (the corpus-health O(n^2) scan) — the exact guard this cap protects.
+    while (opsMemo.size >= OPS_CACHE_MAX_KEYS) {
+      const oldest = opsMemo.keys().next().value;
+      if (oldest === undefined) break;
+      opsMemo.delete(oldest);
+    }
     const value = compute().catch((err: unknown) => {
       opsMemo.delete(key); // never cache a failure
       throw err;
@@ -2032,6 +2655,10 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       return { data: { enabled: false } };
     }
     const recent = await observationStore.listDiscoveryRuns(undefined, 100);
+    // Held runs EXCLUDED (Phase 3, Task 12): a held run minted nothing, so its
+    // observations_analyzed would dilute the aggregates and inflate sample_size
+    // without adding a single create/reinforce decision. Failed runs likewise.
+    // Pinned in tests/unit/held-run-consumers.test.ts.
     const completed = recent.filter(r => r.status === 'completed');
     const totals = completed.reduce((acc, r) => {
       acc.observations_analyzed += r.observations_analyzed;
@@ -2059,12 +2686,19 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
   // Completed-only by design (mirrors getLastCompletedDream semantics — this is a
   // record of what dreaming *changed*, not a pass-failure log). Failed passes are
   // intentionally excluded; surface them separately if pass-health is ever needed.
+  // Memoized like the two heavy ops endpoints (team-review #22 P4): output_diff
+  // is re-parsed per row per request, and Phase-2 provenance makes diffs larger —
+  // a 10s viz poll doesn't need a fresh parse of history that changes nightly.
   app.get('/api/ops/dream-history', async (request) => {
     if (!dreamStore) {
       return { data: { enabled: false, dreams: [] } };
     }
     const q = DreamHistoryQuerySchema.parse(request.query);
-    const dreams = await dreamStore.listRecentDreams(q.limit, q.offset);
+    return memoizeOps(`dream-history:${q.limit}:${q.offset}`, () => computeDreamHistory(q.limit, q.offset));
+  });
+
+  async function computeDreamHistory(limit: number, offset: number) {
+    const dreams = await dreamStore!.listRecentDreams(limit, offset);
     const rows = dreams.map(d => {
       // Derive change counts from the stored diff resolution (auto-applied/accepted/
       // rejected vs still-pending). Falls back to the dream's own counters.
@@ -2089,6 +2723,10 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
         mode: d.mode,
         trigger_source: d.trigger_source,
         window_key: d.window_key,
+        // Audit-carrier rows (promotion decay / discovery maintenance) are real
+        // archives and belong in history — labeled so the viz can render them
+        // distinctly (team-review #22 S3).
+        is_carrier: d.reason === PROMOTION_CARRIER_REASON || d.reason === MAINTENANCE_CARRIER_REASON,
         status: d.status,
         acceptance_status: d.acceptance_status,
         started_at: d.started_at,
@@ -2105,14 +2743,15 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
         },
       };
     });
-    return { data: { enabled: true, dreams: rows }, meta: { limit: q.limit, offset: q.offset, count: rows.length } };
-  });
+    return { data: { enabled: true, dreams: rows }, meta: { limit, offset, count: rows.length } };
+  }
 
   // --- Corpus health snapshot ---
   // Point-in-time signals that dreaming keeps the corpus leaner/cleaner.
   // Cheap aggregates (count, mean confidence, contradiction-flagged) come straight
   // from SQL. The two derived signals — duplicate-pair count (cosine > threshold)
-  // and decayed/at-risk count (memoryStrength < 0.2) — are computed over a BOUNDED
+  // and decayed/at-risk count (the shared `isDecayedAtRisk` archive-line predicate,
+  // anchored rows excluded like every archiver) — are computed over a BOUNDED
   // sample (default 2000 active rows, ascending id), like /api/ops/top-decaying's
   // on-demand compute. The dup scan is O(n^2) over the sample; the cap keeps it cheap.
   app.get('/api/ops/corpus-health', async (request) => {
@@ -2124,16 +2763,22 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
   });
 
   async function computeCorpusHealth(sampleCap: number) {
-    const [stats, sample] = await Promise.all([
+    const [stats, sample, scopeResolution] = await Promise.all([
       queries.getCorpusHealthStats(),
       queries.getCorpusHealthSample(sampleCap),
+      readScopeResolution(),
     ]);
+    // Same alias closure the dream pass uses (team-review #22 A2): without it an
+    // alias-variant pair the selector collapses as same-scope exact_dup would be
+    // bucketed cross_scope here — `actionable` reading 0 during exactly the state
+    // it exists to expose. Fail-open: readScopeResolution degrades to identity.
+    const canonicalize = (s: string) => scopeResolution.forward.get(s) ?? s;
 
     const now = new Date();
     let decayedAtRisk = 0;
     const vectors: { row: (typeof sample)[number]; vec: Float32Array }[] = [];
     for (const m of sample) {
-      if (memoryStrength(m, now) < 0.2) decayedAtRisk++;
+      if (!isAnchored(m) && isDecayedAtRisk(m, now)) decayedAtRisk++;
       if (m.embedding) vectors.push({ row: m, vec: bufferToEmbedding(m.embedding) });
     }
 
@@ -2150,7 +2795,7 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       for (let j = i + 1; j < vectors.length; j++) {
         if (cosineSimilarity(vectors[i].vec, vectors[j].vec) >= COSINE_DUPLICATE_THRESHOLD) {
           duplicatePairs.total++;
-          duplicatePairs[classifyDupPair(vectors[i].row, vectors[j].row)]++;
+          duplicatePairs[classifyDupPair(vectors[i].row, vectors[j].row, canonicalize)]++;
         }
       }
       if (i % 16 === 15) await new Promise(resolve => setImmediate(resolve));
@@ -2177,6 +2822,123 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     };
   }
 
+  // --- Scope drift (T43 Phase A, detector half) ---
+  // T46's write-time canonicalization is an EXACT-STRING lookup, so it only
+  // catches variants already in the operator's alias table. A brand-new casing
+  // variant of a known entity still lands verbatim — the layer closed KNOWN
+  // drift, and nothing watched for NEW drift. This endpoint is that watch.
+  //
+  // The headline number is `summary.active_rows_adrift`: live rows sitting on a
+  // scope variant the alias table does not cover. It reads 0 on a reconciled
+  // corpus, so any rise is new drift rather than a backlog to interpret.
+  //
+  // Cost: one GROUP BY (scope, type) — no content scanning, no O(n^2) — so it
+  // joins the light 10s ops cadence rather than the memoized heavy pair.
+  app.get('/api/ops/scope-drift', async () => {
+    const [aggregates, coverage] = await Promise.all([
+      queries.getScopeAggregates(),
+      readScopeResolution(),
+    ]);
+    const report = buildScopeDrift(aggregates, coverage);
+    return {
+      data: report,
+      meta: {
+        // Rejected-count and table-version live in data.summary (computed inside
+        // buildScopeDrift from this same coverage) — deliberately NOT duplicated
+        // here so the response has one source of truth for each number. Only the
+        // accepted-entry count is meta-only.
+        alias_table_entries: Object.keys(coverage.table).length,
+        note: '`active_rows_adrift` counts ACTIVE rows on un-aliased variants only. '
+          + 'Archived rows stranded on an alias scope are a known, accepted migration residue '
+          + '(recall excludes archived rows) and are reported per-variant as `archived` without '
+          + 'counting as drift. `summary.alias_entries_rejected` > 0 means the operator table '
+          + 'holds mappings the write path ignores — coverage is computed from the ACCEPTED map '
+          + 'only; `summary.alias_table_version` identifies the accepted table it was computed against.',
+      },
+    };
+  });
+
+  // --- Scope registry (Phase 3, Task 10) ---
+  // Read-only visibility into what the minting layer has done: the registry rows
+  // with per-status counts (provisional mints awaiting a ruling, quarantined slug
+  // collisions), the held (ephemeral) discovery backlogs, and the two triage
+  // counters — active rows sitting in project:_unrouted, and active rows whose
+  // write was rerouted (metadata.raw_scope preserved, spec §12). Public, no key —
+  // same threat model as /api/stats.
+  //
+  // Round-2 fix S2: the response is BOUNDED (first SCOPE_REGISTRY_ROW_CAP rows,
+  // meta.truncated + meta.row_total when clipped — counts stay full-registry)
+  // and memoized on the shared 60s ops memo: the registry grows without limit
+  // (rows are never deleted, see nextQuarantineN's invariant) and the two
+  // metadata-scan counters are per-poll SQL, so an unbounded unmemoized
+  // response was the odd one out among the ops endpoints. A ruling deletes the
+  // memo key (below), so operator actions reflect immediately; a mint is at
+  // most 60s stale — the standard ops-snapshot posture.
+  app.get('/api/ops/scope-registry', async () => {
+    if (!scopeRegistry) {
+      return { data: { enabled: false, rows: [] } };
+    }
+    return memoizeOps(SCOPE_REGISTRY_MEMO_KEY, async () => {
+      const [rows, held, unroutedActiveRows, reroutedRows] = await Promise.all([
+        scopeRegistry.snapshotRows(),
+        // Held summary needs the observation store; absent (ingestion not wired)
+        // degrades this field to [] rather than failing the endpoint.
+        observationStore ? observationStore.getHeldRunSummary() : Promise.resolve([]),
+        queries.countActiveByScope(UNROUTED_SCOPE),
+        queries.countActiveWithMetadataKey('raw_scope'),
+      ]);
+      const counts = { provisional: 0, confirmed: 0, quarantined: 0 };
+      for (const row of rows) counts[row.status]++;
+      const truncated = rows.length > SCOPE_REGISTRY_ROW_CAP;
+      return {
+        data: {
+          enabled: true,
+          rows: truncated ? rows.slice(0, SCOPE_REGISTRY_ROW_CAP) : rows,
+          counts,
+          held,
+          unrouted_active_rows: unroutedActiveRows,
+          rerouted_rows: reroutedRows,
+        },
+        meta: { row_total: rows.length, truncated },
+      };
+    });
+  });
+
+  /**
+   * The ACCEPTED alias resolution for the drift detector's coverage check.
+   *
+   * Phase 1: this is deliberately no longer a parser. It prefers the live
+   * ScopeAliasService — the same cached snapshot the write path canonicalizes
+   * through — and falls back to running the SHARED resolver over the stored
+   * blob when no service is wired (SQLite-only installs, tests). Both branches
+   * agree by construction; the old private validator accepted mappings the
+   * service rejected, which let the endpoint report full coverage while rows
+   * kept landing on the variant.
+   *
+   * Fail-open to the empty resolution: a missing or corrupt table degrades to
+   * "nothing is covered yet", never to a 500 on an ops poll.
+   *
+   * The fallback branch is UNCACHED by design (full blob parse + hash per call):
+   * server.ts always constructs ScopeAliasService, so in production the cached
+   * snapshot() branch is the one that runs — the fallback exists for tests and
+   * hand-built AppContexts. If a deployment ever wires this without the service,
+   * give it the service instead of adding caching here.
+   */
+  async function readScopeResolution(): Promise<ScopeResolution> {
+    try {
+      if (scopeAliases) return await scopeAliases.snapshot();
+      if (!operatorConfigStore) return buildScopeResolution(null);
+      // No-arg getConfig defaults to the 'default' operator on both backends —
+      // the same call shape ScopeAliasService.load() uses, kept identical so a
+      // future multi-operator change cannot diverge the two read paths.
+      const cfg = await operatorConfigStore.getConfig();
+      const parsed = JSON.parse(cfg?.config ?? '{}');
+      return buildScopeResolution(parsed?.[SCOPE_ALIASES_CONFIG_KEY]);
+    } catch {
+      return buildScopeResolution(null);
+    }
+  }
+
   // --- Static surfacing (C1.2 / T12) ---
   // Maps a natural-language prompt + optional project context → capped,
   // precision-filtered, class-labelled candidate tools / skills / conventions.
@@ -2199,8 +2961,15 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     }
 
     const result = await surface(
-      { queries, embeddingIndex },
-      { prompt: input.prompt, projectScope, caps: input.caps },
+      {
+        queries,
+        embeddingIndex,
+        canonicalizeScope: scopeAliases ? (s: string) => scopeAliases.canonicalize(s) : undefined,
+        expandScope: scopeAliases ? (s: string) => scopeAliases.expand([s]) : undefined,
+      },
+      // F-A: sanitized, not Zod-bounded — one bad marker entry must never 400
+      // the whole request (the catalog lanes still serve).
+      { prompt: input.prompt, projectScope, anchorScopes: input.scopes ? sanitizeScopeList(input.scopes) : undefined, caps: input.caps },
     );
 
     return {

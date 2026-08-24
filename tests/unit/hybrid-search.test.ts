@@ -202,3 +202,73 @@ describe('hybridSearch — reranked path confidence pipeline (R1)', () => {
     expect(withArchived.results.map(r => r.memory.id)).toContain(archivedId);
   });
 });
+
+describe('hybridSearch — scopes[] union prefilter (CR-2)', () => {
+  let queries: MemoryQueries;
+
+  // Deliberately NOT case variants of each other: SQLite scope filtering is
+  // COLLATE NOCASE (documented T46 exception), so a case-only pair would match
+  // through the fold alone and never prove the union did the work.
+  const SCOPE_A = 'client:variant-x';
+  const SCOPE_B = 'client:legacy-tool';
+
+  beforeEach(() => {
+    ({ queries } = createTestDatabase());
+  });
+
+  async function seed(content: string, scope: string): Promise<number> {
+    const memory = await queries.store(createTestMemory({ content, scope, confidence: 1.0 }));
+    return memory.id;
+  }
+
+  function search(overrides: Partial<Parameters<typeof hybridSearch>[2]> = {}) {
+    return hybridSearch(queries, stubIndex, {
+      query: 'gronkle',
+      mode: 'keyword',
+      limit: 10,
+      offset: 0,
+      include_archived: false,
+      rerank: false,
+      ...overrides,
+    });
+  }
+
+  it('scopes[] prefilters on the union of all listed scopes', async () => {
+    const aId = await seed('gronkle probe content alpha', SCOPE_A);
+    const bId = await seed('gronkle probe content beta', SCOPE_B);
+    await seed('gronkle probe content gamma', 'project:elsewhere');
+
+    const { results } = await search({ scopes: [SCOPE_A, SCOPE_B] });
+    expect(results.map(r => r.memory.id).sort((x, y) => x - y))
+      .toEqual([aId, bId].sort((x, y) => x - y));
+    expect(results.map(r => r.memory.scope).sort()).toEqual([SCOPE_A, SCOPE_B].sort());
+  });
+
+  it('scopes wins over scope when both are present', async () => {
+    const aId = await seed('gronkle probe content alpha', SCOPE_A);
+    const bId = await seed('gronkle probe content beta', SCOPE_B);
+    const otherId = await seed('gronkle probe content gamma', 'project:elsewhere');
+
+    const { results } = await search({ scope: 'project:elsewhere', scopes: [SCOPE_A, SCOPE_B] });
+    const ids = results.map(r => r.memory.id);
+    expect(ids.sort((x, y) => x - y)).toEqual([aId, bId].sort((x, y) => x - y));
+    expect(ids).not.toContain(otherId);
+  });
+
+  it('single-scope `scope` filtering is unchanged (back-compat)', async () => {
+    const aId = await seed('gronkle probe content alpha', SCOPE_A);
+    const bId = await seed('gronkle probe content beta', SCOPE_B);
+
+    const { results } = await search({ scope: SCOPE_A });
+    expect(results.map(r => r.memory.id)).toEqual([aId]);
+    expect(results.map(r => r.memory.id)).not.toContain(bId);
+  });
+
+  it('an empty scopes[] union early-returns empty results', async () => {
+    await seed('gronkle probe content alpha', SCOPE_A);
+
+    const { results, total } = await search({ scopes: ['client:nowhere-1', 'client:nowhere-2'] });
+    expect(results).toEqual([]);
+    expect(total).toBe(0);
+  });
+});

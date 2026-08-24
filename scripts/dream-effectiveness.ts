@@ -19,7 +19,10 @@
  *   5. AFTER: re-measure retrieval + corpus-health against the same (now-mutated)
  *      index — archived ids are removed from the index by the apply path.
  *   6. EMIT { before, after, deltas, changesApplied, goldQueries, ... } to stdout
- *      and to --out (default scratch/dream-effectiveness.json).
+ *      and to --out (default scratch/dream-effectiveness.json). `--quiet`
+ *      suppresses the stdout copy (CI logs); the file + gates always emit.
+ *   7. GATE (Phase 5): re-read the emitted file and assert the headline per
+ *      lane — non-zero exit on any failure. See the gate block for the rules.
  *
  * HONESTY / LIMITATIONS (also embedded in the report):
  *   - This measures the SHAPE of the claim, not a production number. The default
@@ -52,7 +55,7 @@ import {
 import { DbWindowMemorySource, runDreamPass } from '../src/dreaming/dream-engine.js';
 import { NoOpReasoner } from '../src/dreaming/reasoner/noop-reasoner.js';
 import { ConsolidationLockManager } from '../src/dreaming/lock.js';
-import { memoryStrength } from '../src/dreaming/scoring.js';
+import { isAnchored, isDecayedAtRisk } from '../src/dreaming/scoring.js';
 import { scoreQuery, type RetrievalScores } from './lib/retrieval-metrics.js';
 import {
   EFFECTIVENESS_CORPUS, EFFECTIVENESS_GOLD, EFFECTIVENESS_CLOCK,
@@ -63,12 +66,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, '..');
 
-const ARCHIVE_STRENGTH_THRESHOLD = 0.2; // mirrors shouldArchive() / corpus-health
-
 interface Args {
   dbPath: string | null;
   k: number;
   outPath: string;
+  /** Suppress the full-report stdout dump (the file + gates still emit) — for CI logs. */
+  quiet: boolean;
 }
 
 function parseArgs(): Args {
@@ -76,12 +79,14 @@ function parseArgs(): Args {
   let dbPath: string | null = null;
   let k = 5;
   let outPath = path.join(projectRoot, 'scratch', 'dream-effectiveness.json');
+  let quiet = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--db' && argv[i + 1]) dbPath = argv[++i];
     else if (argv[i] === '--k' && argv[i + 1]) k = parseInt(argv[++i], 10) || 5;
     else if (argv[i] === '--out' && argv[i + 1]) outPath = argv[++i];
+    else if (argv[i] === '--quiet') quiet = true;
   }
-  return { dbPath, k, outPath };
+  return { dbPath, k, outPath, quiet };
 }
 
 // ── Corpus-health snapshot (same definitions as GET /api/ops/corpus-health) ──
@@ -103,7 +108,7 @@ async function corpusHealth(queries: MemoryQueries, now: Date, sampleCap: number
   let decayedAtRisk = 0;
   const vectors: Float32Array[] = [];
   for (const m of sample) {
-    if (memoryStrength(m, now) < ARCHIVE_STRENGTH_THRESHOLD) decayedAtRisk++;
+    if (!isAnchored(m) && isDecayedAtRisk(m, now)) decayedAtRisk++;
     if (m.embedding) vectors.push(bufferToEmbedding(m.embedding));
   }
 
@@ -180,7 +185,7 @@ async function seedSynthetic(queries: MemoryQueries): Promise<Map<string, number
   for (const m of EFFECTIVENESS_CORPUS) {
     const { id } = await queries.store({
       content: m.content,
-      type: 'reference',
+      type: m.type ?? 'reference',
       scope: m.scope,
       source: 'dream-effectiveness',
       source_path: null,
@@ -207,8 +212,14 @@ async function seedSynthetic(queries: MemoryQueries): Promise<Map<string, number
 function backdate(queries: MemoryQueries, id: number, lastSeen: string, updatedAt: string): void {
   // queries exposes the better-sqlite3 db via its constructor capture; reach the
   // raw handle through a narrow cast — this is sandbox seeding, not a store API.
+  // created_at is backdated too (to the earlier of the two stamps): store()
+  // stamps it with seed wall-clock, which sits AFTER the pinned harness clock —
+  // any age-based rule (crystallization's age>=7d, supersession ordering) would
+  // otherwise see a row "created in the future".
   const db = (queries as unknown as { db: Database.Database }).db;
-  db.prepare('UPDATE memories SET last_seen = ?, updated_at = ? WHERE id = ?').run(lastSeen, updatedAt, id);
+  const createdAt = lastSeen < updatedAt ? lastSeen : updatedAt;
+  db.prepare('UPDATE memories SET last_seen = ?, updated_at = ?, created_at = ? WHERE id = ?')
+    .run(lastSeen, updatedAt, createdAt, id);
 }
 
 // ── Change capture from the audit log ──
@@ -312,7 +323,10 @@ async function main(): Promise<void> {
     tz: 'UTC',
     now: nowMs,
     apply: { memoryStore: queries, vectorIndex: index },
-  }, { trigger: 'manual', reason: 'dream-effectiveness harness' });
+    // Unique per invocation: without this, a SECOND run against the same --db
+    // copy collapses on the day's window (a benign non-run) and the completed
+    // gate misreads it as a dreaming defect.
+  }, { trigger: 'manual', reason: 'dream-effectiveness harness', windowKey: `effectiveness-${Date.now()}` });
 
   const changesApplied = run.dream_id !== null ? await changesFromDream(dreamStore, run.dream_id) : [];
 
@@ -384,12 +398,48 @@ async function main(): Promise<void> {
     ],
   };
 
-  // Emit to stdout + file.
+  // Emit to file (+ stdout unless --quiet).
   const json = JSON.stringify(report, null, 2);
   fs.mkdirSync(path.dirname(args.outPath), { recursive: true });
   fs.writeFileSync(args.outPath, json);
-  process.stdout.write(json + '\n');
+  if (!args.quiet) process.stdout.write(json + '\n');
   console.error(`\nReport written to ${args.outPath}`);
+
+  // Gates read the file just written — the artifact consumers actually see —
+  // so a serialization/emit bug sits INSIDE the gated surface, not beside it.
+  const emitted = JSON.parse(fs.readFileSync(args.outPath, 'utf8')) as typeof report;
+
+  // ── Gates (Phase 5) ──
+  // The headline booleans used to be report-only: computing `retrieval_held` and
+  // never asserting it meant only a crash could exit non-zero — a harness that
+  // cannot fail. Synthetic mode asserts the full claim per lane (the corpus is
+  // BUILT to contain exact-dups AND decayed rows, so a quiet lane is a defect —
+  // the exact-dup lane alone must not be able to satisfy the shrink/archive
+  // gates). Copy-db mode asserts only that the pass itself completed — an
+  // arbitrary copy may legitimately be clean, and there is no gold set to hold
+  // retrieval to.
+  const gates: Array<[string, boolean]> = synthetic
+    ? [
+        ['dream pass completed', emitted.dream_run.status === 'completed'],
+        ['corpus shrank (active count dropped)', emitted.headline.corpus_shrank === true],
+        ['duplicate pairs dropped', emitted.headline.duplicate_pairs_dropped === true],
+        ['retrieval held (NDCG + MRR did not drop)', emitted.headline.retrieval_held === true],
+        ['at least one archive applied via the audit log', emitted.headline.memories_archived > 0],
+        ['decay lane live: decayed-at-risk count dropped',
+          emitted.after.corpus_health.decayed_at_risk_count < emitted.before.corpus_health.decayed_at_risk_count],
+        ['decay lane live: at least one decay-class archive applied',
+          emitted.changesApplied.some(c => c.change_class === 'decay' && c.action === 'archive')],
+      ]
+    : [
+        ['dream pass completed', emitted.dream_run.status === 'completed'],
+      ];
+
+  console.error('\n— Gates —');
+  let failedGates = 0;
+  for (const [name, ok] of gates) {
+    if (!ok) failedGates++;
+    console.error(`  ${ok ? 'PASS' : 'FAIL'}  ${name}`);
+  }
 
   // Flush WAL and close before deleting the temp copy.
   db.pragma('wal_checkpoint(TRUNCATE)');
@@ -398,6 +448,13 @@ async function main(): Promise<void> {
     for (const ext of ['', '-wal', '-shm']) {
       try { fs.rmSync(workingDbPath + ext, { force: true }); } catch { /* best-effort */ }
     }
+  }
+
+  if (failedGates > 0) {
+    console.error(`\n${failedGates} gate(s) FAILED`);
+    process.exitCode = 1;
+  } else {
+    console.error('\nAll gates passed.');
   }
 }
 

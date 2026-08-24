@@ -19,6 +19,7 @@ import { createTestDatabase, createTestMemory } from '../fixtures/test-helpers.j
 import type { MemoryQueries } from '../../src/database/queries.js';
 import type { IVectorSearch } from '../../src/database/interfaces.js';
 import type { VectorSearchResult } from '../../src/embeddings/index.js';
+import { CLAUDE_INDEX_TAG, SKILL_TAG } from '../../src/types/types.js';
 import { surface } from '../../src/surfacing/surface.js';
 
 // ── Mock the embedder ──────────────────────────────────────────────────────
@@ -420,6 +421,36 @@ describe('surface()', () => {
     void id;
   });
 
+  // R-4 (team round): the dedup above never exercised a row GENUINELY reachable
+  // by two classes in one request. A project-lane row tagged BOTH claude-index
+  // and skill matches the procedural-skill lane (SKILL_TAG) and the per-project
+  // convention lane (CLAUDE_INDEX_TAG); with the three materialise calls
+  // interleaving under Promise.all, the check-then-act on `seenIds` (the add
+  // lands only after an awaited queries.get) let it surface in both classes.
+  it('a row reachable by two classes surfaces in exactly one (cross-class dedup is race-free)', async () => {
+    await queries.store(
+      createTestMemory({
+        content: 'Dual Lane: recurring zibbet dual lane workflow',
+        type: 'discovery',
+        scope: 'project:dual',
+        tags: ['claude-index', 'skill'],
+        metadata: meta('skill:dual-lane', 'Dual Lane'),
+      }),
+    );
+
+    const result = await surface(
+      { queries, embeddingIndex: notReadyIndex },
+      { prompt: 'recurring zibbet dual lane workflow', projectScope: 'project:dual' },
+    );
+
+    const appearances = [...result.tools, ...result.skills, ...result.conventions]
+      .filter(i => i.key === 'skill:dual-lane');
+    expect(appearances).toHaveLength(1);
+    // Skills materialise before conventions, so the skill class claims it.
+    expect(result.skills.some(s => s.key === 'skill:dual-lane')).toBe(true);
+    expect(result.conventions.some(c => c.key === 'skill:dual-lane')).toBe(false);
+  });
+
   // Extra: semantic ranking used when embedder is ready — the closest match ranks first
   it('uses semantic search when embedder is ready — closest match ranks first', async () => {
     mockEmbedderReady = true;
@@ -500,5 +531,297 @@ describe('surface()', () => {
         expect(['hard', 'advisory']).toContain(item.binding);
       }
     }
+  });
+
+  // Procedural-skill lane: auto-discovered workflow memories (type discovery,
+  // project scope, tag 'skill') surface under the skills class, distinct from
+  // the client:claude-skill catalog lane. This is what the discovery engine now
+  // writes for sequence patterns (external_key/name in metadata).
+  it('surfaces procedural skill memories from the project scope', async () => {
+    await queries.store(
+      createTestMemory({
+        content: 'Read(routes.ts) → Bash(tsc): recurring typescript compile verification workflow',
+        type: 'discovery',
+        scope: 'project:test-app',
+        tags: ['auto-discovered', 'sequence', 'skill'],
+        metadata: meta('skill:read(routes.ts)>bash(tsc)', 'Read(routes.ts) → Bash(tsc)'),
+      }),
+    );
+
+    const result = await surface(
+      { queries, embeddingIndex: notReadyIndex },
+      { prompt: 'verify typescript compile workflow', projectScope: 'project:test-app' },
+    );
+
+    const skill = result.skills.find(s => s.key === 'skill:read(routes.ts)>bash(tsc)');
+    expect(skill).toBeDefined();
+    // Auto-derived skills surface as advisory (unconfirmed), unlike catalog skills.
+    expect(skill!.binding).toBe('advisory');
+    expect(skill!.title).toBe('Read(routes.ts) → Bash(tsc)');
+  });
+
+  it('does not surface project-scoped procedural skills without a project scope', async () => {
+    await queries.store(
+      createTestMemory({
+        content: 'Read(routes.ts) → Bash(tsc): recurring typescript compile verification workflow',
+        type: 'discovery',
+        scope: 'project:test-app',
+        tags: ['auto-discovered', 'sequence', 'skill'],
+        metadata: meta('skill:read(routes.ts)>bash(tsc)', 'Read(routes.ts) → Bash(tsc)'),
+      }),
+    );
+
+    // No projectScope → the procedural (project-scoped) lane is not searched.
+    const result = await surface(
+      { queries, embeddingIndex: notReadyIndex },
+      { prompt: 'verify typescript compile workflow' },
+    );
+
+    expect(result.skills).toHaveLength(0);
+  });
+
+  // Union: catalog (hard) + procedural (advisory) skills coexist in the skills class.
+  it('unions catalog + procedural skills with correct per-lane binding', async () => {
+    await addCatalogMemory(queries, {
+      scope: 'client:claude-skill',
+      name: 'Handoff',
+      externalKey: 'skill:handoff',
+      description: 'generate handoff prompt workflow',
+      tags: ['claude-index', 'skill'],
+    });
+    await addCatalogMemory(queries, {
+      scope: 'project:test-app',
+      name: 'Read → Bash',
+      externalKey: 'skill:read>bash',
+      description: 'handoff workflow build verify',
+      tags: ['auto-discovered', 'sequence', 'skill'],
+    });
+
+    const result = await surface(
+      { queries, embeddingIndex: notReadyIndex },
+      { prompt: 'generate handoff workflow', projectScope: 'project:test-app' },
+    );
+
+    const cat = result.skills.find(s => s.key === 'skill:handoff');
+    const proc = result.skills.find(s => s.key === 'skill:read>bash');
+    expect(cat).toBeDefined();
+    expect(proc).toBeDefined();
+    expect(cat!.binding).toBe('hard');       // curated catalog → hard
+    expect(proc!.binding).toBe('advisory');  // auto-derived → advisory
+    expect(result.skills.length).toBeLessThanOrEqual(2);
+  });
+
+  it('enforces the skills cap across the catalog + procedural union', async () => {
+    for (let i = 0; i < 2; i++) {
+      await addCatalogMemory(queries, {
+        scope: 'client:claude-skill',
+        name: `Cat ${i}`,
+        externalKey: `skill:cat-${i}`,
+        description: `workflow deploy skill variant ${i}`,
+        tags: ['claude-index', 'skill'],
+      });
+      await addCatalogMemory(queries, {
+        scope: 'project:test-app',
+        name: `Proc ${i}`,
+        externalKey: `skill:proc-${i}`,
+        description: `workflow deploy skill variant ${i}`,
+        tags: ['auto-discovered', 'sequence', 'skill'],
+      });
+    }
+
+    const result = await surface(
+      { queries, embeddingIndex: notReadyIndex },
+      { prompt: 'workflow deploy skill', projectScope: 'project:test-app' },
+    );
+
+    // 4 matching skills across both lanes, but the class cap (2) still holds.
+    expect(result.skills.length).toBeLessThanOrEqual(2);
+  });
+
+  it('surfaces a procedural skill via the semantic path (embedder ready)', async () => {
+    const id = await addCatalogMemory(queries, {
+      scope: 'project:test-app',
+      name: 'Read → Bash',
+      externalKey: 'skill:read>bash',
+      description: 'unrelated lexical tokens xyz', // no FTS overlap → must match semantically
+      tags: ['auto-discovered', 'sequence', 'skill'],
+    });
+
+    const queryVec = new Float32Array(384); queryVec[0] = 1.0;
+    const memVec = new Float32Array(384); memVec[0] = 1.0; // cosine 1.0
+    const stubIndex = makeStubIndex([{ id, vec: memVec }]);
+    mockEmbed.mockImplementation(async () => queryVec);
+
+    const result = await surface(
+      { queries, embeddingIndex: stubIndex },
+      { prompt: 'find the compile workflow', projectScope: 'project:test-app' },
+    );
+
+    const proc = result.skills.find(s => s.key === 'skill:read>bash');
+    expect(proc).toBeDefined();
+    expect(proc!.binding).toBe('advisory');
+  });
+
+  // ── Phase 4 (T8): scope identity resolution for the project lanes ────────
+  // The procedural-skill lane and the per-project convention lane resolve
+  // projectScope + anchorScopes through the optional canonicalizeScope /
+  // expandScope closures. No closures ⇒ byte-identical pre-change fan-out.
+
+  describe('scope identity resolution (Phase 4 T8)', () => {
+    /** Wrap the real store so the exact getFilteredIds fan-out is pinned. */
+    function recordingQueries(base: MemoryQueries): {
+      proxy: MemoryQueries;
+      calls: Array<{ scope?: string; tags?: string[] }>;
+    } {
+      const calls: Array<{ scope?: string; tags?: string[] }> = [];
+      const proxy = new Proxy(base, {
+        get(target, prop) {
+          if (prop === 'getFilteredIds') {
+            return async (filter: { scope?: string; tags?: string[]; include_archived?: boolean }) => {
+              calls.push({ scope: filter.scope, tags: filter.tags });
+              return target.getFilteredIds(filter);
+            };
+          }
+          const v = Reflect.get(target, prop);
+          return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+        },
+      }) as MemoryQueries;
+      return { proxy, calls };
+    }
+
+    async function seedSkill(scope: string, externalKey: string, content: string): Promise<number> {
+      const result = await queries.store(
+        createTestMemory({
+          content,
+          type: 'discovery',
+          scope,
+          tags: ['auto-discovered', 'sequence', 'skill'],
+          metadata: meta(externalKey, externalKey),
+        }),
+      );
+      return result.id;
+    }
+
+    it('alias-variant projectScope finds the canonical-scope skill when closures are wired', async () => {
+      // Differently-NAMED alias, not a case variant: the SQLite scope filter is
+      // COLLATE NOCASE, so a pure case variant would match without any closure
+      // and the test would not discriminate threaded from unthreaded.
+      await seedSkill(
+        'client:acme-foods',
+        'skill:grep(config)>read(manifest)',
+        'Grep(config) → Read(manifest): recurring manifest verification workflow',
+      );
+
+      const result = await surface(
+        {
+          queries,
+          embeddingIndex: notReadyIndex,
+          canonicalizeScope: async s => (s === 'client:acme-legacy' ? 'client:acme-foods' : s),
+          expandScope: async s =>
+            s === 'client:acme-foods' ? ['client:acme-foods', 'client:acme-legacy'] : [s],
+        },
+        { prompt: 'recurring manifest verification workflow', projectScope: 'client:acme-legacy' },
+      );
+
+      const skill = result.skills.find(s => s.key === 'skill:grep(config)>read(manifest)');
+      expect(skill).toBeDefined();
+      expect(skill!.binding).toBe('advisory');
+    });
+
+    it('an anchor scope in anchorScopes pulls that scope\'s procedural skills', async () => {
+      await seedSkill(
+        'client:acme',
+        'skill:anchor-workflow',
+        'Read(spec) → Bash(deploy): recurring anchor deployment workflow',
+      );
+
+      const result = await surface(
+        { queries, embeddingIndex: notReadyIndex },
+        {
+          prompt: 'recurring anchor deployment workflow',
+          projectScope: 'project:elsewhere',
+          anchorScopes: ['client:acme'],
+        },
+      );
+
+      const skill = result.skills.find(s => s.key === 'skill:anchor-workflow');
+      expect(skill).toBeDefined();
+      expect(skill!.binding).toBe('advisory');
+    });
+
+    it('silently skips global and malformed anchor scopes (never throws)', async () => {
+      const { proxy, calls } = recordingQueries(queries);
+
+      const result = await surface(
+        { queries: proxy, embeddingIndex: notReadyIndex },
+        { prompt: 'recurring deployment workflow check', anchorScopes: ['global', 'not-a-scope'] },
+      );
+
+      expect(result.skills).toHaveLength(0);
+      const searched = calls.map(c => c.scope);
+      expect(searched).not.toContain('global');
+      expect(searched).not.toContain('not-a-scope');
+      // Both entries filtered + no projectScope ⇒ the procedural lane is skipped.
+      expect(calls.filter(c => c.tags?.includes(SKILL_TAG))).toHaveLength(0);
+    });
+
+    it('no closures ⇒ the pre-change scope fan-out, pinned exactly', async () => {
+      await seedSkill(
+        'project:test-app',
+        'skill:baseline-workflow',
+        'Read(routes) → Bash(tsc): recurring compile verification workflow',
+      );
+
+      const { proxy, calls } = recordingQueries(queries);
+      const result = await surface(
+        { queries: proxy, embeddingIndex: notReadyIndex },
+        { prompt: 'recurring compile verification workflow', projectScope: 'project:test-app' },
+      );
+
+      // The exact scope list the store saw — byte-identical to pre-T8 behavior.
+      expect(calls).toEqual([
+        { scope: 'client:claude-tool', tags: [CLAUDE_INDEX_TAG] },
+        { scope: 'client:claude-skill', tags: [CLAUDE_INDEX_TAG] },
+        { scope: 'project:test-app', tags: [SKILL_TAG] },
+        { scope: 'client:claude-convention', tags: [CLAUDE_INDEX_TAG] },
+        { scope: 'project:test-app', tags: [CLAUDE_INDEX_TAG] },
+      ]);
+      expect(result.skills.some(s => s.key === 'skill:baseline-workflow')).toBe(true);
+    });
+
+    it('caps the project-lane fan-out at 16 scopes', async () => {
+      const anchors = Array.from({ length: 20 }, (_, i) => `client:anchor-${i}`);
+      const { proxy, calls } = recordingQueries(queries);
+
+      await surface(
+        { queries: proxy, embeddingIndex: notReadyIndex },
+        { prompt: 'recurring deployment workflow check', anchorScopes: anchors },
+      );
+
+      const procedural = calls.filter(c => c.tags?.includes(SKILL_TAG));
+      expect(procedural).toHaveLength(16);
+      expect(procedural.map(c => c.scope)).toEqual(anchors.slice(0, 16));
+    });
+
+    it('a throwing closure fails open to the raw scope', async () => {
+      await seedSkill(
+        'project:Raw-Variant',
+        'skill:failopen-workflow',
+        'Grep(logs) → Read(alerts): recurring failopen triage workflow',
+      );
+
+      const result = await surface(
+        {
+          queries,
+          embeddingIndex: notReadyIndex,
+          canonicalizeScope: async () => { throw new Error('alias table down'); },
+          expandScope: async () => { throw new Error('alias table down'); },
+        },
+        { prompt: 'recurring failopen triage workflow', projectScope: 'project:Raw-Variant' },
+      );
+
+      const skill = result.skills.find(s => s.key === 'skill:failopen-workflow');
+      expect(skill).toBeDefined();
+    });
   });
 });

@@ -1,6 +1,14 @@
 import type Database from 'better-sqlite3';
 import type { Observation, ObservationInput, ObservationComplete, DiscoveryRun, ObservationStats, SessionSummary } from '../types/types.js';
 import type { IObservationStore } from './interfaces.js';
+import { GLOBAL_WATERMARK_STATUSES, SCOPE_WATERMARK_STATUSES } from './interfaces.js';
+
+/**
+ * Rows per INSERT transaction when loading the purge-exemption temp table
+ * (S1b). Well under every SQLite bound-parameter compile-time cap; the value
+ * only tunes insert batching, never correctness.
+ */
+export const PURGE_EXEMPT_CHUNK = 500;
 
 function rowToObservation(row: Record<string, unknown>): Observation {
   return {
@@ -96,12 +104,14 @@ export class ObservationQueries implements IObservationStore {
       SELECT COUNT(*) as count FROM observations WHERE id > ? AND project_scope = ?
     `);
 
+    // Watermark predicates built FROM the shared constants (Phase 3, spec §6):
+    // the global cursor advances over 'held' rows, the per-scope one does not.
     this.lastWatermark = db.prepare(`
-      SELECT MAX(observation_end_id) as watermark FROM discovery_runs WHERE status = 'completed'
+      SELECT MAX(observation_end_id) as watermark FROM discovery_runs WHERE status IN (${GLOBAL_WATERMARK_STATUSES.map(() => '?').join(',')})
     `);
 
     this.lastWatermarkProject = db.prepare(`
-      SELECT MAX(observation_end_id) as watermark FROM discovery_runs WHERE status = 'completed' AND project_scope = ?
+      SELECT MAX(observation_end_id) as watermark FROM discovery_runs WHERE status IN (${SCOPE_WATERMARK_STATUSES.map(() => '?').join(',')}) AND project_scope = ?
     `);
 
     this.insertRun = db.prepare(`
@@ -111,6 +121,10 @@ export class ObservationQueries implements IObservationStore {
 
     this.getRunById = db.prepare('SELECT * FROM discovery_runs WHERE id = ?');
 
+    // 'held' is TERMINAL and deliberately absent here (Phase 3, Task 12): if a
+    // held row ever read as active, one ephemeral-scope batch would block every
+    // future discovery pass behind the stale-run threshold. Pinned in
+    // tests/unit/held-run-consumers.test.ts.
     this.getActiveRunStmt = db.prepare(`
       SELECT * FROM discovery_runs WHERE status IN ('running', 'completing') ORDER BY id DESC LIMIT 1
     `);
@@ -288,36 +302,72 @@ export class ObservationQueries implements IObservationStore {
       by_tool[row.tool_name] = row.count;
     }
 
-    const oldest = (this.db.prepare('SELECT MIN(created_at) as oldest FROM observations').get() as { oldest: string | null }).oldest;
-    const newest = (this.db.prepare('SELECT MAX(created_at) as newest FROM observations').get() as { newest: string | null }).newest;
+    // Phase 4: oldest/newest are scoped like total/by_tool. §2's alias-group
+    // dormancy reads per-scope recency — a global MAX here made every scope
+    // share one activity clock (and a scope with no rows read the corpus-wide
+    // newest).
+    const rangeQuery = projectScope
+      ? 'SELECT MIN(created_at) as oldest, MAX(created_at) as newest FROM observations WHERE project_scope = ?'
+      : 'SELECT MIN(created_at) as oldest, MAX(created_at) as newest FROM observations';
+    const range = this.db.prepare(rangeQuery).get(...(projectScope ? [projectScope] : [])) as
+      { oldest: string | null; newest: string | null };
 
-    return { total, by_project, by_tool, oldest, newest };
+    return { total, by_project, by_tool, oldest: range.oldest, newest: range.newest };
   }
 
-  async purgeOlderThan(olderThanDays: number, batchSize: number = 1000): Promise<number> {
+  async purgeOlderThan(olderThanDays: number, batchSize: number = 1000, exemptScopes: string[] = []): Promise<number> {
     let totalDeleted = 0;
     const cutoff = new Date(Date.now() - olderThanDays * 86400000).toISOString().replace('T', ' ').replace('Z', '');
 
-    // Windowed delete by row ID to avoid long-running locks
-    const getMaxId = this.db.prepare(
-      'SELECT MAX(id) as max_id FROM observations WHERE created_at < ?'
-    );
+    // Exempt (held/ephemeral) scopes are excluded from BOTH statements, via a
+    // temp-table anti-join loaded in bounded chunks (round-2 fix S1b): binding
+    // the whole list inline as `NOT IN (?, ?, …)` dies on SQLite's
+    // bound-parameter cap once the exempt set grows past it, killing the
+    // ENTIRE purge — the failure mode where holding more scopes silently stops
+    // retention. Temp tables are connection-local, so concurrent purges on
+    // other connections can't collide; rows are cleared per call because the
+    // exempt list varies per run.
+    const exemptSql = exemptScopes.length
+      ? ' AND project_scope NOT IN (SELECT scope FROM temp.purge_exempt_scopes)'
+      : '';
+    if (exemptScopes.length) {
+      this.db.exec('CREATE TEMP TABLE IF NOT EXISTS purge_exempt_scopes (scope TEXT PRIMARY KEY)');
+      this.db.prepare('DELETE FROM temp.purge_exempt_scopes').run();
+      const insert = this.db.prepare('INSERT OR IGNORE INTO temp.purge_exempt_scopes (scope) VALUES (?)');
+      const insertChunk = this.db.transaction((chunk: string[]) => {
+        for (const scope of chunk) insert.run(scope);
+      });
+      for (let i = 0; i < exemptScopes.length; i += PURGE_EXEMPT_CHUNK) {
+        insertChunk(exemptScopes.slice(i, i + PURGE_EXEMPT_CHUNK));
+      }
+    }
 
-    const maxIdRow = getMaxId.get(cutoff) as { max_id: number | null };
-    if (!maxIdRow.max_id) return 0;
+    try {
+      // Windowed delete by row ID to avoid long-running locks
+      const maxIdRow = this.db.prepare(
+        `SELECT MAX(id) as max_id FROM observations WHERE created_at < ?${exemptSql}`
+      ).get(cutoff) as { max_id: number | null };
+      if (!maxIdRow.max_id) return 0;
 
-    const deleteStmt = this.db.prepare(
-      'DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE id <= ? LIMIT ?)'
-    );
+      // The inner SELECT re-applies the cutoff + exemption — `id <= max` alone
+      // would sweep exempt (and fresh) rows sitting below the max id.
+      const deleteStmt = this.db.prepare(
+        `DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE id <= ? AND created_at < ?${exemptSql} LIMIT ?)`
+      );
 
-    let deleted: number;
-    do {
-      const result = deleteStmt.run(maxIdRow.max_id, batchSize);
-      deleted = result.changes;
-      totalDeleted += deleted;
-    } while (deleted === batchSize);
+      let deleted: number;
+      do {
+        const result = deleteStmt.run(maxIdRow.max_id, cutoff, batchSize);
+        deleted = result.changes;
+        totalDeleted += deleted;
+      } while (deleted === batchSize);
 
-    return totalDeleted;
+      return totalDeleted;
+    } finally {
+      // Leave no per-call state behind (the table itself is connection-scoped
+      // and reused; only its rows are per-call).
+      if (exemptScopes.length) this.db.prepare('DELETE FROM temp.purge_exempt_scopes').run();
+    }
   }
 
   async getUnprocessedCount(lastWatermark: number, projectScope?: string): Promise<number> {
@@ -329,8 +379,8 @@ export class ObservationQueries implements IObservationStore {
 
   async getLastWatermark(projectScope?: string): Promise<number> {
     const row = projectScope
-      ? this.lastWatermarkProject.get(projectScope) as { watermark: number | null }
-      : this.lastWatermark.get() as { watermark: number | null };
+      ? this.lastWatermarkProject.get(...SCOPE_WATERMARK_STATUSES, projectScope) as { watermark: number | null }
+      : this.lastWatermark.get(...GLOBAL_WATERMARK_STATUSES) as { watermark: number | null };
     return row.watermark ?? 0;
   }
 
@@ -429,6 +479,32 @@ export class ObservationQueries implements IObservationStore {
 
     const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
     return rows.map(rowToDiscoveryRun);
+  }
+
+  async getHeldRunSummary(): Promise<{ scope: string; observations_pending: number; observations_total: number; last_end_id: number }[]> {
+    // Pending = held rows above the scope's COMPLETED watermark (a completed
+    // re-drive run covers everything at or below its end id — CO6); the
+    // watermark predicate is built from SCOPE_WATERMARK_STATUSES, never a
+    // literal. Fully re-driven scopes (pending 0) drop out via HAVING.
+    const scopeWm = SCOPE_WATERMARK_STATUSES.map(() => '?').join(',');
+    return this.db.prepare(
+      `WITH scope_wm AS (
+         SELECT project_scope, MAX(observation_end_id) AS wm
+         FROM discovery_runs
+         WHERE status IN (${scopeWm})
+         GROUP BY project_scope
+       )
+       SELECT h.project_scope AS scope,
+              COALESCE(SUM(CASE WHEN h.observation_end_id > COALESCE(w.wm, 0) THEN h.observations_analyzed ELSE 0 END), 0) AS observations_pending,
+              COALESCE(SUM(h.observations_analyzed), 0) AS observations_total,
+              COALESCE(MAX(h.observation_end_id), 0) AS last_end_id
+       FROM discovery_runs h
+       LEFT JOIN scope_wm w ON w.project_scope = h.project_scope
+       WHERE h.status = 'held'
+       GROUP BY h.project_scope
+       HAVING observations_pending > 0
+       ORDER BY h.project_scope ASC`
+    ).all(...SCOPE_WATERMARK_STATUSES) as { scope: string; observations_pending: number; observations_total: number; last_end_id: number }[];
   }
 
   close(): void {

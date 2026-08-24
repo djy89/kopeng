@@ -5,7 +5,7 @@ import {
   reinforceConfidence,
   computeEffectiveConfidence,
   durabilityFactor,
-  shouldArchive,
+  DECAY_ARCHIVE_THRESHOLD,
   AUTO_CONFIDENCE_CEILING,
 } from '../../src/discovery/confidence.js';
 
@@ -182,14 +182,11 @@ describe('computeErrorPatternConfidence', () => {
   });
 });
 
-describe('shouldArchive', () => {
-  it('should archive when effective confidence < 0.2', () => {
-    expect(shouldArchive(0.19)).toBe(true);
-    expect(shouldArchive(0.1)).toBe(true);
-  });
-
-  it('should not archive when effective confidence >= 0.2', () => {
-    expect(shouldArchive(0.2)).toBe(false);
-    expect(shouldArchive(0.5)).toBe(false);
+describe('DECAY_ARCHIVE_THRESHOLD', () => {
+  // The archive-line decision itself lives in isDecayedAtRisk (scoring.ts,
+  // covered by tests/unit/decay-predicate.test.ts); this pins the one shared
+  // threshold value the predicate compares against, strictly-below.
+  it('is the 0.2 archive line', () => {
+    expect(DECAY_ARCHIVE_THRESHOLD).toBe(0.2);
   });
 });

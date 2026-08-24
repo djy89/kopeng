@@ -12,6 +12,11 @@ interface HybridSearchOptions {
   mode: 'hybrid' | 'semantic' | 'keyword';
   type?: MemoryType;
   scope?: string;
+  /**
+   * Union prefilter over several scopes (CR-2 alias expansion). When present
+   * (non-empty) it wins over `scope`, which is kept unchanged for back-compat.
+   */
+  scopes?: string[];
   tags?: string[];
   limit: number;
   offset: number;
@@ -35,13 +40,30 @@ export async function hybridSearch(
 
   // Pre-filter candidates by type/scope/tags
   let candidateIds: number[] | undefined;
-  if (options.type || options.scope || options.tags?.length) {
-    candidateIds = await queries.getFilteredIds({
-      type: options.type,
-      scope: options.scope,
-      tags: options.tags,
-      include_archived: options.include_archived,
-    });
+  if (options.type || options.scopes?.length || options.scope || options.tags?.length) {
+    if (options.scopes?.length) {
+      // Union across the listed scopes (alias-group search): one filtered-id
+      // query per scope, deduped. `scopes` wins over `scope` when both are set.
+      const ids = new Set<number>();
+      for (const s of options.scopes) {
+        for (const id of await queries.getFilteredIds({
+          type: options.type,
+          scope: s,
+          tags: options.tags,
+          include_archived: options.include_archived,
+        })) {
+          ids.add(id);
+        }
+      }
+      candidateIds = [...ids];
+    } else {
+      candidateIds = await queries.getFilteredIds({
+        type: options.type,
+        scope: options.scope,
+        tags: options.tags,
+        include_archived: options.include_archived,
+      });
+    }
     if (candidateIds.length === 0) {
       return { results: [], total: 0, reranked: false };
     }

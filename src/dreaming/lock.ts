@@ -38,7 +38,9 @@ export interface LockOptions {
   operatorId?: string;
   /**
    * R4: heartbeat interval for withLock — a same-holder re-acquire that extends
-   * the TTL while `fn` runs, so a long pass is never stale-stolen mid-write.
+   * the TTL while `fn` runs, so a long pass is not stale-stolen mid-write while
+   * its heartbeat lands (a lost heartbeat — re-acquire failure or an event-loop
+   * stall past the TTL — is detected and logged below, not silently ignored).
    * Defaults to ttlMs / 3. Set 0 to disable (tests that exercise stale-steal).
    */
   heartbeatMs?: number;

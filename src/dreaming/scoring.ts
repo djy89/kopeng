@@ -22,9 +22,9 @@
  *   discovery re-observation). Only these reset the decay clock.
  */
 
-import { computeEffectiveConfidence, durabilityFactor } from '../discovery/confidence.js';
+import { computeEffectiveConfidence, durabilityFactor, DECAY_ARCHIVE_THRESHOLD } from '../discovery/confidence.js';
 
-export { durabilityFactor };
+export { durabilityFactor, DECAY_ARCHIVE_THRESHOLD };
 
 /** The stored inputs strength is derived from. Subset of the Memory row. */
 export interface StrengthInputs {
@@ -37,6 +37,35 @@ export interface StrengthInputs {
   // them falls back to the default 60d half-life and no floor (pre-T30 behavior).
   type?: string;
   tags?: readonly string[];
+}
+
+/** The stored inputs the Hard-Anchor contract is decided from. Subset of the
+ *  Memory row; `is_locked` absorbs the boolean-vs-number split across row
+ *  shapes (`CandidateMemory` boolean, `Memory` number, sample rows boolean). */
+export interface AnchorInputs {
+  is_locked: boolean | number | null;
+  confidence: number;
+  metadata?: string | null;
+}
+
+/** THE Hard-Anchor contract (CR-1): pinned / locked / operator-confirmed rows are
+ *  never mutated by ANY automated path. Consumers: dream selector eligibility,
+ *  auditedArchiveMemory apply-time re-check, promotion decay selection,
+ *  maintenance §2 sweep, corpus-health panel. */
+export function isAnchored(m: AnchorInputs): boolean {
+  return !!m.is_locked || m.confidence >= 1.0 || isPinnedMetadata(m.metadata);
+}
+
+/** `metadata.pinned === true` — the operator pin promotion always honored and
+ *  the dream/maintenance paths ignored until CR-1 unified them here. */
+export function isPinnedMetadata(metadata: string | null | undefined): boolean {
+  if (!metadata) return false;
+  try {
+    const parsed = JSON.parse(metadata) as { pinned?: unknown };
+    return parsed.pinned === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -54,4 +83,21 @@ export function memoryStrength(memory: StrengthInputs, now: Date = new Date()): 
     memory.type,
     memory.tags
   );
+}
+
+export interface DecayPredicateOptions { dormant?: boolean }
+
+/** THE archive-line predicate (ruling R4-B: dormancy is an explicit per-site
+ *  input — promotion/dream/panel pass nothing (no freeze), maintenance §2
+ *  passes its D1.1 dormant-scope freeze). */
+export function isDecayedAtRisk(memory: StrengthInputs, now: Date, opts?: DecayPredicateOptions): boolean {
+  return computeEffectiveConfidence(
+    memory.confidence,
+    memory.last_seen ?? memory.updated_at,
+    now,
+    opts?.dormant ?? false,
+    memory.observation_count ?? 1,
+    memory.type,
+    memory.tags
+  ) < DECAY_ARCHIVE_THRESHOLD;
 }

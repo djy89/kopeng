@@ -6,6 +6,7 @@ import { findConsolidationCandidates } from './consolidation.js';
 import { autoArchiveDecayed, type ArchiveResult } from './auto-archive.js';
 import logger from '../utils/logger.js';
 import { crystallizeEligible, type CrystallizeResult } from './crystallize.js';
+import config from '../config/config.js';
 
 export interface PromotionResult {
   timestamp: string;
@@ -250,6 +251,20 @@ export async function runPromotion(
     let crystallizeResult: CrystallizeResult | undefined;
     if (crystallize) {
       crystallizeResult = await crystallizeEligible({ memoryStore: queries, dreamStore, dryRun });
+    }
+
+    // Step 6 (S7): access-log retention — trim rows past the window after a
+    // real pass. Reporting-only data (the archive line reads no access log,
+    // CX-14); logged only, never part of PromotionResult, never fatal.
+    if (!dryRun) {
+      try {
+        const trimmed = await queries.trimAccessLog(config.retention.accessLogDays);
+        if (trimmed > 0) {
+          logger.info(`access-log retention: trimmed ${trimmed} rows older than ${config.retention.accessLogDays}d`);
+        }
+      } catch (err) {
+        logger.warn('access-log retention failed (non-fatal):', err);
+      }
     }
 
     const duration = Date.now() - start;

@@ -76,4 +76,15 @@ Get-ChildItem $LogDir -Filter 'corpus-health-*.log' -ErrorAction SilentlyContinu
   Select-Object -Skip 30 |
   Remove-Item -Force -ErrorAction SilentlyContinue
 
+# Heartbeat (S8/CX-9): append one JSON line so `npm run heartbeats` can tell a
+# healthy-silent task from a disabled/deleted one. A heartbeat-write failure
+# must never affect the task's own exit code, hence the swallowed catch.
+$ok = ($Code -eq 0)
+try {
+  $MetricsDir = Join-Path $env:USERPROFILE '.kopeng\metrics'
+  New-Item -ItemType Directory -Force -Path $MetricsDir | Out-Null
+  $hb = @{ ts = (Get-Date).ToUniversalTime().ToString('o'); task = 'corpus-health'; ok = [bool]$ok } | ConvertTo-Json -Compress
+  Add-Content -LiteralPath (Join-Path $MetricsDir 'heartbeats.jsonl') -Value $hb -Encoding utf8
+} catch {}
+
 exit $Code

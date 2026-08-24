@@ -18,9 +18,10 @@
  */
 import { describe, it, expect } from 'vitest';
 import { isLoopbackHost, isReadOnlyBlocked } from '../../scripts/viz-server.js';
+import { isLoopbackHost as serverIsLoopbackHost } from '../../src/config/first-run.js';
 
 describe('isLoopbackHost', () => {
-  it.each(['127.0.0.1', '::1', 'localhost'])('treats %s as loopback', (host) => {
+  it.each(['127.0.0.1', '127.1.2.3', '::1', 'localhost'])('treats %s as loopback', (host) => {
     expect(isLoopbackHost(host)).toBe(true);
   });
 
@@ -30,6 +31,23 @@ describe('isLoopbackHost', () => {
       expect(isLoopbackHost(host)).toBe(false);
     },
   );
+
+  // Team-review fix: the viz and the server MUST agree on what "loopback"
+  // means — a host the server binds as local (127.0.0.2) must not strand the
+  // viz read-only. One probe list, two implementations, identical verdicts.
+  it('agrees with src/config/first-run.ts isLoopbackHost on every probe', () => {
+    const probes = [
+      '127.0.0.1', '127.0.0.2', '127.1.2.3', '::1', 'localhost',
+      '0.0.0.0', '::', '', '192.0.2.50', '10.0.0.1', 'kopeng.local',
+      '127.example.test', '127.0.0.1.example', '127.1', '0x7f.0.0.1',
+      '2130706433', '::ffff:127.0.0.1', '127.256.0.1', 'LOCALHOST',
+    ];
+    for (const host of probes) {
+      expect(isLoopbackHost(host), `viz vs server disagree on '${host}'`).toBe(
+        serverIsLoopbackHost(host),
+      );
+    }
+  });
 });
 
 describe('remote bind without the admin opt-in is read-only', () => {

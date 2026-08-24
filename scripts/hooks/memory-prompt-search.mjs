@@ -27,7 +27,7 @@
  */
 
 import { readFileSync, writeFileSync, unlinkSync, appendFileSync, mkdirSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { join, basename, resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 // T32: the canonical/critical detection machinery (SOT_RE/ABS_PATH_RE/sotNearPath)
@@ -71,6 +71,17 @@ const CRITICAL_TAG = 'critical';
 const METRICS_DIR = join(homedir(), '.kopeng', 'metrics');
 const SUGGESTIONS_LOG = join(METRICS_DIR, 'suggestions.jsonl');
 const HINT_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
+// P4 anchor marker: a `.kopeng.json` dropped in a directory declares the scopes
+// that directory belongs to (`{"scopes":["client:acme","project:fuel-dashboard"]}`).
+// The recall hook walks UP from the payload's cwd and ADDS every declared scope to
+// the recall request — `project:<basename(cwd)>` and `global` are never replaced, so
+// a tree with no marker recalls exactly as it did before. Format chosen by the P4
+// survey (~/.kopeng/reports/p4-anchor-survey.md): a JSON file, not a fenced block in
+// CLAUDE.md/AGENTS.md, so the scope database is machine-readable and independent of prose.
+const ANCHOR_MARKER = '.kopeng.json';
+const ANCHOR_MAX_DEPTH = 12;  // bounded walk — a hook must never wander an unbounded tree
+const ANCHOR_MAX_SCOPES = 16; // bounded contribution — one stray marker can't bloat the request
+const ANCHOR_MAX_SCOPE_LEN = 128; // F-A: matches the server's sanitizer bound — oversized entries dropped at the source
 const REQUEST_TIMEOUT_MS = 3000;
 const SURFACE_TIMEOUT_MS = 2000; // /api/surface: its own tighter leash, under the 3s ceiling (invariant #1)
 const MIN_PROMPT_LEN = 25;
@@ -263,6 +274,47 @@ export function armCriticalMemoriesHint(memories, projectScope, sessionId) {
   } catch { /* never block recall on the gate */ }
 }
 
+/**
+ * P4 (exported for tests): collect the scopes declared by `.kopeng.json` anchor markers
+ * at `startDir` and every ancestor, nearest first, deduped. ADDITIVE by contract — the
+ * caller keeps its own base scopes and merges these on top; no marker anywhere returns [],
+ * which is byte-identical to the pre-P4 behavior.
+ *
+ * FAIL-OPEN like every other guard in this file: an unreadable, malformed, or
+ * wrong-shaped marker is skipped and the walk CONTINUES (a broken child marker must not
+ * hide a good parent one). Bounded on all axes — ANCHOR_MAX_DEPTH levels, ANCHOR_MAX_SCOPES
+ * scopes, ANCHOR_MAX_SCOPE_LEN chars per entry (the server's sanitizer bound, F-A) — so a
+ * pathological tree can neither stall the hook nor bloat the recall request.
+ * Runs BEFORE the request AbortSignal is armed, so the walk never eats the 3s budget.
+ */
+export function readAnchorScopes(startDir, { maxDepth = ANCHOR_MAX_DEPTH, maxScopes = ANCHOR_MAX_SCOPES } = {}) {
+  const scopes = [];
+  const seen = new Set();
+  try {
+    if (!startDir) return scopes;
+    let dir = resolve(String(startDir));
+    for (let depth = 0; depth < maxDepth; depth++) {
+      try {
+        const parsed = JSON.parse(readFileSync(join(dir, ANCHOR_MARKER), 'utf-8'));
+        if (Array.isArray(parsed?.scopes)) {
+          for (const raw of parsed.scopes) {
+            if (typeof raw !== 'string') continue;
+            const scope = raw.trim();
+            if (!scope || scope.length > ANCHOR_MAX_SCOPE_LEN || seen.has(scope)) continue;
+            seen.add(scope);
+            scopes.push(scope);
+            if (scopes.length >= maxScopes) return scopes;
+          }
+        }
+      } catch { /* missing or malformed marker — keep walking */ }
+      const parent = dirname(dir);
+      if (parent === dir) break; // filesystem root
+      dir = parent;
+    }
+  } catch { /* never block recall on scope resolution */ }
+  return scopes;
+}
+
 async function recall(body, signal) {
   try {
     const res = await fetch(`${API_URL}/api/memories/recall`, {
@@ -285,13 +337,21 @@ async function recall(body, signal) {
  * Runs under its OWN tighter AbortSignal (SURFACE_TIMEOUT_MS, under the 3s ceiling) — if
  * /api/surface stalls it aborts to empty without dragging the fast recall calls up to 3s.
  */
-async function fetchSurface(prompt, projectScope, signal) {
+async function fetchSurface(prompt, projectScope, signal, anchorScopes = []) {
   const empty = { tools: [], skills: [], conventions: [] };
   try {
+    // Phase 4 (T9): declared anchor scopes ride along so the server can resolve
+    // canonical + alias-group + anchor scopes in one place. Omitted when empty —
+    // an unmarked tree sends the exact pre-Task-9 body (and an old server's
+    // non-strict Zod schema strips the field anyway when present).
     const res = await fetch(`${API_URL}/api/surface`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, project_scope: projectScope }),
+      body: JSON.stringify({
+        prompt,
+        project_scope: projectScope,
+        ...(anchorScopes.length > 0 ? { scopes: anchorScopes } : {}),
+      }),
       signal,
     });
     if (!res.ok) return empty;
@@ -334,8 +394,12 @@ export function triggerCacheRefreshDue(projectScope, nowMs = Date.now()) {
  */
 async function fetchMemoriesLite(scope, signal) {
   try {
+    // Phase 4 (T9): expand=aliases widens the scope to its alias group so
+    // trigger-term canonicals still stored under an alias variant stay in the
+    // index during migration. Opt-in server-side; an old server's non-strict
+    // query schema strips the unknown param (exact-match, the pre-T9 behavior).
     const res = await fetch(
-      `${API_URL}/api/memories?scope=${encodeURIComponent(scope)}&fields=lite&limit=500`,
+      `${API_URL}/api/memories?scope=${encodeURIComponent(scope)}&fields=lite&limit=500&expand=aliases`,
       { signal },
     );
     if (!res.ok) return null;
@@ -408,6 +472,13 @@ async function main() {
   const query = hasHint ? `${errorContext} ${prompt}`.slice(0, 400) : prompt.slice(0, 200);
   const recallLimit = hasHint ? 5 : 3;
 
+  // P4: resolve anchor-marker scopes BEFORE the signal is armed — a few bounded sync
+  // reads, so the 3s recall ceiling is unaffected. Merged on top of the base pair, never
+  // replacing it: no marker ⇒ [projectScope, 'global'], exactly the pre-P4 request.
+  // T9: hoisted — the same walk result also rides the /api/surface body below.
+  const anchorScopes = readAnchorScopes(cwd);
+  const recallScopes = [...new Set([projectScope, 'global', ...anchorScopes])];
+
   const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
   // /api/surface gets its own tighter leash (invariant #1: "its own short timeout") so a
   // stalled surface can't drag a fast recall up to the 3s ceiling. It fails to empty on abort.
@@ -425,9 +496,9 @@ async function main() {
     : Promise.resolve(null);
 
   const [memories, tools, surfaceResult, triggerRows] = await Promise.all([
-    recall({ query, scopes: [projectScope, 'global'], threshold: 0.40, limit: recallLimit }, signal),
+    recall({ query, scopes: recallScopes, threshold: 0.40, limit: recallLimit }, signal),
     recall({ query: prompt, scope: 'client:claude-tool', threshold: 0.45, limit: 3 }, signal),
-    fetchSurface(prompt, projectScope, surfaceSignal),
+    fetchSurface(prompt, projectScope, surfaceSignal, anchorScopes),
     triggerFetch,
   ]);
 

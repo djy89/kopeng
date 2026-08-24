@@ -262,46 +262,46 @@ describe('D2.2 ingestion guard (classifyForIngestion)', () => {
 describe('D2.2 selector guards (DuplicateCandidateSelector)', () => {
   const selector = new DuplicateCandidateSelector({ now: () => new Date(NOW) });
 
-  it('flagged pairs are claimed first as flagged_contradiction groups', () => {
+  it('flagged pairs are claimed first as flagged_contradiction groups', async () => {
     const a = cm(1, 'Use pnpm for installs.', basis(0));
     const b = cm(2, 'Use bun for installs.', blend(0, 1, 0.88), {
       tags: [CONTRADICTION_FLAG_TAG],
       metadata: JSON.stringify({ [CONTRADICTION_FLAG_KEY]: buildContradictionFlag(1, verdict('preference_change'), NOW_ISO) }),
     });
-    const groups = selector.select([a, b]);
+    const groups = await selector.select([a, b]);
     expect(groups).toHaveLength(1);
     expect(groups[0].signal).toBe('flagged_contradiction');
     expect(groups[0].members.map(m => m.id)).toEqual([1, 2]); // [partner, flagged]
     expect(groups[0].similarity).toBeCloseTo(0.88, 5);
   });
 
-  it('an anchored partner produces no flagged group (Hard Anchor wins)', () => {
+  it('an anchored partner produces no flagged group (Hard Anchor wins)', async () => {
     const anchored = cm(1, 'Operator-confirmed truth.', basis(0), { confidence: 1.0 });
     const flagged = cm(2, 'Contradicting discovery.', blend(0, 1, 0.9), {
       tags: [CONTRADICTION_FLAG_TAG],
       metadata: JSON.stringify({ [CONTRADICTION_FLAG_KEY]: buildContradictionFlag(1, verdict('contested'), NOW_ISO) }),
     });
-    expect(selector.select([anchored, flagged])).toHaveLength(0);
+    expect(await selector.select([anchored, flagged])).toHaveLength(0);
   });
 
-  it('band pairs touching a deprecated memory are not re-litigated', () => {
+  it('band pairs touching a deprecated memory are not re-litigated', async () => {
     const deprecated = cm(1, 'Use pnpm for installs.', basis(0), { deprecated_at: '2026-06-10T00:00:00Z' });
     const current = cm(2, 'Use bun for installs.', blend(0, 1, 0.9));
-    expect(selector.select([deprecated, current])).toHaveLength(0);
+    expect(await selector.select([deprecated, current])).toHaveLength(0);
   });
 
-  it('a pair where BOTH carry last_contradicted is not re-banded', () => {
+  it('a pair where BOTH carry last_contradicted is not re-banded', async () => {
     const a = cm(1, 'Use PostgreSQL in production.', basis(0), { last_contradicted: NOW_ISO });
     const b = cm(2, 'Use SQLite locally.', blend(0, 1, 0.9), { last_contradicted: NOW_ISO });
-    expect(selector.select([a, b])).toHaveLength(0);
+    expect(await selector.select([a, b])).toHaveLength(0);
   });
 
-  it('condition-provenance links are never dup edges (collapse or band)', () => {
+  it('condition-provenance links are never dup edges (collapse or band)', async () => {
     const source = cm(1, 'Use PostgreSQL as the database backend.', basis(0));
     const encoded = cm(3, 'When in production: Use PostgreSQL as the database backend.', blend(0, 1, 0.97), {
       metadata: JSON.stringify({ condition_sources: [1, 2] }),
     });
-    expect(selector.select([source, encoded])).toHaveLength(0);
+    expect(await selector.select([source, encoded])).toHaveLength(0);
   });
 });
 

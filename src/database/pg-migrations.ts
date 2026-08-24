@@ -333,6 +333,42 @@ const migrations: Migration[] = [
       ALTER TABLE memory_revisions ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ;
     `,
   },
+  {
+    version: 10,
+    name: 'phase2_memory_revisions_full_row',
+    sql: `
+      ALTER TABLE memory_revisions ADD COLUMN IF NOT EXISTS scope TEXT;
+      ALTER TABLE memory_revisions ADD COLUMN IF NOT EXISTS type TEXT;
+      ALTER TABLE memory_revisions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+      ALTER TABLE memory_revisions ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;
+    `,
+  },
+  {
+    version: 11,
+    name: 'phase3_scope_registry_primary_scope_held',
+    sql: `
+      -- Phase 3: scope_registry, operator_config.primary_scope, discovery_runs 'held' status.
+      CREATE TABLE IF NOT EXISTS scope_registry (
+        scope TEXT PRIMARY KEY,
+        slug TEXT,
+        claimant_raw TEXT NOT NULL,
+        origin_cwd TEXT,
+        status TEXT NOT NULL DEFAULT 'provisional'
+          CHECK (status IN ('provisional', 'confirmed', 'quarantined')),
+        reserved BOOLEAN NOT NULL DEFAULT FALSE,
+        first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ruled_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS idx_scope_registry_slug ON scope_registry(slug);
+      ALTER TABLE operator_config ADD COLUMN IF NOT EXISTS primary_scope TEXT;
+      -- discovery_runs_status_check is Postgres's default name for the inline
+      -- column CHECK from v3; the swap admits 'held'.
+      ALTER TABLE discovery_runs DROP CONSTRAINT IF EXISTS discovery_runs_status_check;
+      ALTER TABLE discovery_runs ADD CONSTRAINT discovery_runs_status_check
+        CHECK (status IN ('running', 'completing', 'completed', 'failed', 'held'));
+    `,
+  },
 ];
 
 export async function runPgMigrations(pool: pg.Pool): Promise<void> {

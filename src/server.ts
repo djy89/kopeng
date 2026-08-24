@@ -1,5 +1,8 @@
 import Fastify from 'fastify';
+import type { FastifyInstance } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import config from './config/config.js';
 import logger from './utils/logger.js';
 import { getDatabase, closeDatabase, getDatabaseStats, backupDatabase } from './database/database.js';
@@ -36,13 +39,33 @@ import type { ReasonerLivenessStatus } from './dreaming/reasoner/liveness.js';
 import { ConsolidationLockManager, heldLockPassthrough, uniqueHolder, type IConsolidationLock } from './dreaming/lock.js';
 import { createNightlyConsolidation } from './dreaming/nightly.js';
 import { ObservationBus } from './services/observation-bus.js';
+import { ScopeAliasService } from './services/scope-alias.js';
+import { ScopeRegistryService, resolveWriteThroughAliases } from './services/scope-registry.js';
+import { buildHoldPredicate } from './discovery/hold.js';
+import { ScopeRegistryQueries } from './database/scope-registry-queries.js';
+import { PgScopeRegistryQueries } from './database/pg-scope-registry-queries.js';
+import { UNROUTED_SCOPE } from './scopes/minting.js';
+import { slugifyScope } from './scopes/resolver.js';
+import { runFirstRunPreflight } from './config/first-run.js';
 import type { AppContext } from './types/app-context.js';
 import type pg from 'pg';
 import type Database from 'better-sqlite3';
 
-async function main() {
-  logger.info(`Starting KOPENG REST server v${config.mcp.version}`);
+export interface ComposedServer {
+  app: FastifyInstance;
+  ctx: AppContext;
+  /** Stops schedulers, closes the app, optional services, and the DB. Never calls process.exit. */
+  shutdown: (signal?: string) => Promise<void>;
+  /** Starts the discovery/dream schedulers — main() calls this once the embedder settles; composeServer never does. */
+  startSchedulers: () => void;
+}
 
+/**
+ * Build every store/service/closure and register routes — but do NOT listen,
+ * do NOT start schedulers, do NOT call initEmbedder. The construction seam the
+ * server-wiring tests drive; main() (entry-guarded below) adds the runtime.
+ */
+export async function composeServer(): Promise<ComposedServer> {
   let queries: IMemoryStore;
   let embeddingIndex: IVectorSearch;
   let dbLifecycle: IDatabaseLifecycle;
@@ -85,6 +108,30 @@ async function main() {
     };
     shutdownDb = () => { closeDatabase(); };
   }
+
+  // T46: operator-curated scope-alias resolution — write-time canonicalization
+  // + recall-time expansion. Lives on the same store as operator_config, so
+  // it's available whenever dreamStore is (both backends construct it above).
+  const scopeAliases = dreamStore ? new ScopeAliasService(dreamStore) : undefined;
+
+  // Phase 3: scope registry — write-time minting/quarantine/reroute + the
+  // primary-scope triage for scopeless writes (operator_config.primary_scope
+  // over the PRIMARY_SCOPE env default).
+  const scopeRegistryStore = pgPool ? new PgScopeRegistryQueries(pgPool) : new ScopeRegistryQueries(sqliteDb!);
+  const scopeRegistry = new ScopeRegistryService({
+    registry: scopeRegistryStore,
+    configStore: dreamStore,
+    envPrimaryScope: config.scopes.primaryScope || undefined,
+    // Round-2 CO1: the primary scope is alias-canonicalized where it is LOADED,
+    // so the scopeless branch and decideMint's malformed reroute agree.
+    canonicalize: scopeAliases ? (s: string) => scopeAliases.canonicalize(s) : undefined,
+  });
+  // Seed the reserved triage scope (idempotent — register is ON CONFLICT DO
+  // NOTHING; R-D: a mint can never claim a reserved scope).
+  await scopeRegistryStore.register({
+    scope: UNROUTED_SCOPE, slug: slugifyScope(UNROUTED_SCOPE),
+    claimant_raw: UNROUTED_SCOPE, origin_cwd: null, status: 'confirmed', reserved: true,
+  });
 
   logger.info('Database initialized');
 
@@ -180,7 +227,19 @@ async function main() {
       embeddingIndex,
       config.discovery,
       dreamStore ? new ConsolidationLockManager({ store: dreamStore, holder: 'discovery' }) : undefined,
-      reasoner
+      reasoner,
+      scopeAliases ? (s: string) => scopeAliases.canonicalize(s) : undefined,
+      // Phase 3 (Task 8): registry-aware resolution BEFORE detection grouping,
+      // so alias-cased raw scopes pool their evidence; raw stays lineage.
+      // Round-2 A3: the SHARED alias-first composition — never hand-rolled
+      // (the hand-rolled registry-only version here was the final-review
+      // Critical).
+      async (raw: string, origin: string | null) =>
+        (await resolveWriteThroughAliases(scopeAliases, scopeRegistry, raw, origin)).scope,
+      // Round-2 CO5: held iff ephemeral-shaped AND not alias-mapped — a ruled
+      // ephemeral scope's observations resolve to the target instead of being
+      // held forever.
+      buildHoldPredicate(scopeAliases ? (s: string) => scopeAliases.canonicalize(s) : undefined)
     );
   }
 
@@ -196,7 +255,7 @@ async function main() {
     // The optional lock override lets the nightly supervisor chain run the dream
     // step under ITS hold (heldLockPassthrough); manual triggers omit it and the
     // engine acquires for itself (R5).
-    const runDreamWithLock = (opts: RunDreamOptions, lockOverride?: IConsolidationLock) => {
+    const runDreamWithLock = async (opts: RunDreamOptions, lockOverride?: IConsolidationLock) => {
       // T6: the manual whole-corpus activation path (T17) swaps the rotating
       // window for the WholeCorpusMemorySource — every active id, with the
       // id-segment reasoner gate. Default stays the nightly rotating window.
@@ -206,6 +265,10 @@ async function main() {
       // trigger AND (T6.3) the scheduler's monthly cadence — which ships 'off',
       // so no scheduled sweep fires until the operator flips the review-tab toggle.
       const wholeCorpus = opts.mode === 'whole_corpus';
+      // Phase 2: alias-aware pass — one resolution snapshot per pass, sync
+      // closures downstream. No service / snapshot failure ⇒ identity (fail-open).
+      const resolution = scopeAliases ? await scopeAliases.snapshot().catch(() => null) : null;
+      const canonicalize = resolution ? (s: string) => resolution.forward.get(s) ?? s : undefined;
       return runDreamPass({
       dreamStore: dreamStoreRef,
       configStore: dreamStoreRef,
@@ -221,11 +284,11 @@ async function main() {
             new RotatingWindowMemorySource(queries, dreamStoreRef, { limit: 500 }),
             queries,
           ),
-      selector: new DuplicateCandidateSelector(),
+      selector: new DuplicateCandidateSelector({ canonicalize }),
       // D2.1/D2.2: the shared local reasoner (classify + extract-condition;
       // invariant #3 — the deterministic engine owns every write).
       reasoner,
-      diffGen: new DeterministicDiffGenerator(),
+      diffGen: new DeterministicDiffGenerator({ aliasVersion: resolution?.version ?? null, canonicalize }),
       // R9: unique per-acquisition holder — concurrent manual triggers must not
       // co-acquire via same-holder re-entry (the loser would release the
       // winner's hold mid-write).
@@ -238,7 +301,12 @@ async function main() {
       // operator_config auto_accept_* flags are ON (they ship OFF; GATE 1
       // governs the flip). Everything else queues as pending. embedText (D2.2)
       // only ever runs on operator-accepted conditional encodings.
-      apply: { memoryStore: queries, vectorIndex: embeddingIndex, embedText: embedWithModel },
+      apply: {
+        memoryStore: queries, vectorIndex: embeddingIndex, embedText: embedWithModel,
+        // Team-review #22 r2 NEW-1: the canonical-survivor preference must run on
+        // the auto-apply path too, not only on operator resolve (routes.ts).
+        canonicalizeScope: scopeAliases ? (s: string) => scopeAliases.canonicalize(s) : undefined,
+      },
     }, opts);
     };
     dreamRunner = (opts: RunDreamOptions) => runDreamWithLock(opts);
@@ -390,10 +458,66 @@ async function main() {
       activityTracker,
       dreamRunner,
       reasonerStatus,
+      scopeAliases,
+      scopeRegistry,
     },
     lifecycle: dbLifecycle,
   };
   registerRoutes(app, ctx);
+
+  // Graceful shutdown minus process.exit — main() wraps it with the exit.
+  const shutdown = async (signal?: string) => {
+    logger.info(`Received ${signal ?? 'shutdown'}, shutting down...`);
+    if (discoveryScheduler) discoveryScheduler.stop();
+    if (dreamScheduler) dreamScheduler.stop();
+    await app.close();
+    if (config.neo4j.enabled) await closeNeo4j();
+    if (config.redis.enabled) await closeRedis();
+    if (config.discovery.ingestionEnabled) closeObservationsDatabase();
+    await shutdownDb();
+  };
+
+  const startSchedulers = () => {
+    if (discoveryScheduler) {
+      discoveryScheduler.start();
+    }
+    if (dreamScheduler) {
+      dreamScheduler.start();
+    }
+  };
+
+  return { app, ctx, shutdown, startSchedulers };
+}
+
+async function main() {
+  logger.info(`Starting KOPENG REST server v${config.mcp.version}`);
+
+  // First-run preflight (S1/S2): resolve-or-generate the admin key and refuse a
+  // keyless non-loopback bind BEFORE composition. config is post-dotenv, so its
+  // values are the launch-env channel first-run.ts expects (it never reads
+  // process.env for resolution). server.ts sits in src/ (or dist/), so '..' is
+  // the repo root in both layouts — same .env config.ts loads.
+  const envPath = path.join(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'), '.env');
+  const firstRunEnv = {
+    host: config.server.host,
+    adminApiKey: config.server.adminApiKey,
+    observationApiKey: config.discovery.apiKey,
+  };
+  runFirstRunPreflight(envPath, firstRunEnv);
+  config.server.adminApiKey = firstRunEnv.adminApiKey;
+
+  const { app, ctx, shutdown, startSchedulers } = await composeServer();
+
+  // S7: access-log retention — boot trim BEFORE listen (team-review fix): the
+  // SQLite DELETE is synchronous on the event loop (~100ms at live scale on a
+  // first catch-up trim), so it must finish before requests can queue behind
+  // it. Failure is never fatal.
+  try {
+    const trimmed = await ctx.stores.queries.trimAccessLog(config.retention.accessLogDays);
+    if (trimmed > 0) logger.info(`access-log retention: trimmed ${trimmed} rows older than ${config.retention.accessLogDays}d`);
+  } catch (err) {
+    logger.warn('access-log retention failed (non-fatal):', err);
+  }
 
   // Start server
   await app.listen({ port: config.server.port, host: config.server.host });
@@ -403,48 +527,36 @@ async function main() {
   initEmbedder().then(() => {
     logger.info('Embedding model ready — hybrid search enabled');
     // Start schedulers after embedding model is ready
-    if (discoveryScheduler) {
-      discoveryScheduler.start();
-    }
-    if (dreamScheduler) {
-      dreamScheduler.start();
-    }
+    startSchedulers();
   }).catch((err) => {
     logger.error('Failed to load embedding model:', err);
     logger.warn('Continuing with keyword-only search');
     // Start schedulers anyway — they handle missing embeddings gracefully
-    if (discoveryScheduler) {
-      discoveryScheduler.start();
-    }
-    if (dreamScheduler) {
-      dreamScheduler.start();
-    }
+    startSchedulers();
   });
 
   // Log startup diagnostics
-  const stats = await queries.getCount();
-  const ftsCount = await queries.getFtsCount();
-  logger.info(`Startup diagnostics: ${stats} memories, ${ftsCount} FTS entries, ${embeddingIndex.size} embeddings`);
+  const stats = await ctx.stores.queries.getCount();
+  const ftsCount = await ctx.stores.queries.getFtsCount();
+  logger.info(`Startup diagnostics: ${stats} memories, ${ftsCount} FTS entries, ${ctx.services.embeddingIndex.size} embeddings`);
 
-  // Graceful shutdown
-  const shutdown = async (signal: string) => {
-    logger.info(`Received ${signal}, shutting down...`);
-    if (discoveryScheduler) discoveryScheduler.stop();
-    if (dreamScheduler) dreamScheduler.stop();
-    await app.close();
-    if (config.neo4j.enabled) await closeNeo4j();
-    if (config.redis.enabled) await closeRedis();
-    if (config.discovery.ingestionEnabled) closeObservationsDatabase();
-    await shutdownDb();
+  const stop = async (signal: string) => {
+    await shutdown(signal);
     process.exit(0);
   };
 
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => stop('SIGTERM'));
+  process.on('SIGINT', () => stop('SIGINT'));
 }
 
-main().catch((error) => {
-  logger.error('Fatal startup error:', error);
-  process.stderr.write(`kopeng server failed: ${error.message || error}\n`);
-  process.exit(1);
-});
+// Boot only when server.ts is the process entry (node dist/server.js) — the
+// viz-server.js pattern, so tests can import composeServer without booting.
+const isMain = process.argv[1] != null &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  main().catch((error) => {
+    logger.error('Fatal startup error:', error);
+    process.stderr.write(`kopeng server failed: ${error.message || error}\n`);
+    process.exit(1);
+  });
+}

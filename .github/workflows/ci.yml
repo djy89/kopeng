@@ -6,6 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only token everywhere — no job here writes to the repo, so nothing
+# should hold more than checkout needs. (Service containers never receive the
+# token at all; this scopes the JOBS' token, which previously inherited the
+# repo default.)
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -32,3 +39,82 @@ jobs:
 
       - name: Dreaming replay harness (zero-LLM regression net)
         run: npm run dream:replay
+
+      # Phase 5: the harnesses that can fail, in CI. The drill's --no-llm mode is
+      # the NoOpReasoner structural smoke (CI-safe by design — Phase-1 flagged
+      # fallbacks are the expected outcomes); the effectiveness harness now gates
+      # on its own headline booleans (retrieval held / corpus shrank / dups
+      # dropped) instead of only failing on a crash.
+      - name: Dirty-corpus drill, structural smoke (no LLM)
+        run: npm run dream:drill -- --no-llm
+
+      - name: Dream-effectiveness harness (synthetic corpus, gated)
+        run: npm run dream:effectiveness -- --quiet
+
+      # --quiet keeps the JSON out of the log, so on a gate failure the numbers
+      # behind the failed gate would die with the runner — upload the report
+      # instead (if: always() so a red run still ships its evidence).
+      - name: Upload dream-effectiveness report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dream-effectiveness-${{ matrix.os }}
+          path: scratch/dream-effectiveness.json
+          if-no-files-found: ignore
+
+      # Answers "is this branch still publishable?" at push time instead of at
+      # publish time. Build/tests/replay are all happy with content that cannot
+      # ship — a forbidden token, or a file importing something the cut excludes
+      # — so without this a branch goes green and only fails much later, when
+      # unwinding it is expensive.
+      #
+      # The hashFiles guard matters: this workflow SHIPS, but the export tool
+      # does not (it carries the forbidden-token map). hashFiles returns empty
+      # when nothing matches, so the step runs on the dev repo and skips on the
+      # public one. An unconditional step would redden public CI on a missing
+      # script — the exact failure this gate exists to prevent.
+      - name: Public-export gate (dev repo only — this tool is not in the public cut)
+        if: hashFiles('scripts/ops/export-public.mjs') != ''
+        run: node scripts/ops/export-public.mjs --check
+
+  # Phase 5: executed-SQL tests against REAL Postgres. Production and the
+  # revision migrations are PG-backed, but the matrix job above is SQLite-only —
+  # the Phase-2 round-2 review caught a PG-only projection bug that SQLite tests
+  # structurally could not. The suite self-skips without KOPENG_PG_TEST_URL, so
+  # only this job (with the pgvector service container) actually runs it.
+  pg-executed-sql:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Digest-pinned like the action SHAs above — a repushed community tag
+        # must not silently change what executes in CI. (pg16 tag at pin time.)
+        image: pgvector/pgvector:pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kopeng_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kopeng_test -h 127.0.0.1 -p 5432"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Executed-SQL tests (real Postgres + pgvector)
+        env:
+          KOPENG_PG_TEST_URL: postgresql://postgres:postgres@localhost:5432/kopeng_test
+          # Turns a missing/renamed URL var into a FAILED job — without this,
+          # describe.skipIf green-skips the whole suite and the job proves nothing.
+          KOPENG_PG_REQUIRED: '1'
+        run: npx vitest run tests/integration/pg-executed-sql.test.ts

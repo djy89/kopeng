@@ -1,6 +1,6 @@
 {
   "name": "kopeng",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Persistent memory system with semantic search, accessible via MCP and REST API",
   "type": "module",
   "main": "dist/index.js",
@@ -42,7 +42,15 @@
     "triage:anchors": "tsx scripts/triage-anchors.ts",
     "triage:anchors:live": "tsx scripts/triage-anchors-live.ts",
     "analyze:type-decay": "tsx scripts/analyze-type-decay.ts",
-    "snapshot:corpus-health": "tsx scripts/ops/corpus-health-snapshot.ts"
+    "snapshot:corpus-health": "tsx scripts/ops/corpus-health-snapshot.ts",
+    "propose:scope-aliases": "tsx scripts/ops/propose-scope-aliases.ts",
+    "migrate:scope-aliases": "tsx scripts/ops/migrate-scope-aliases.ts",
+    "reconcile:archived": "tsx scripts/ops/reconcile-archived-columns.ts",
+    "canary": "tsx scripts/ops/recall-canary.ts",
+    "heartbeats": "tsx scripts/ops/heartbeats-report.ts",
+    "backup": "tsx scripts/ops/backup-local.ts",
+    "clean:client": "node scripts/ops/clean-client.mjs",
+    "restore:verify": "tsx scripts/ops/backup-local.ts --verify"
   },
   "author": "djy89 (https://github.com/djy89)",
   "license": "BUSL-1.1",

@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { KOPENG_VERSION } from '../version.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,6 +23,12 @@ function getEnvInt(name: string, defaultValue: number): number {
   const parsed = parseInt(value, 10);
   if (isNaN(parsed)) throw new Error(`Environment variable ${name} must be an integer`);
   return parsed;
+}
+
+function getEnvIntMin(name: string, defaultValue: number, min: number): number {
+  const v = getEnvInt(name, defaultValue);
+  if (v < min) throw new Error(`Environment variable ${name} must be >= ${min} (got ${v})`);
+  return v;
 }
 
 export const config = {
@@ -76,7 +83,7 @@ export const config = {
   },
   mcp: {
     name: getEnvVar('MCP_SERVER_NAME', 'kopeng'),
-    version: getEnvVar('MCP_SERVER_VERSION', '1.0.0'),
+    version: KOPENG_VERSION,
     apiUrl: getEnvVar('MEMORY_API_URL', 'http://localhost:3200'),
   },
   reranker: {
@@ -93,6 +100,15 @@ export const config = {
   rateLimit: {
     max: getEnvInt('RATE_LIMIT_MAX', 100),
     timeWindow: '1 minute',
+  },
+  retention: {
+    accessLogDays: getEnvIntMin('ACCESS_LOG_RETENTION_DAYS', 90, 0), // 0 = keep forever
+  },
+  scopes: {
+    // Phase 3: where scopeless and malformed-scope writes land. Empty = unset
+    // (they route to the reserved triage scope project:_unrouted, never global).
+    // The operator_config.primary_scope column overrides this at runtime.
+    primaryScope: getEnvVar('PRIMARY_SCOPE', ''),
   },
   discovery: {
     ingestionEnabled: getEnvVar('OBSERVATION_INGESTION_ENABLED', 'false') === 'true',

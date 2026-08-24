@@ -1,9 +1,10 @@
 import Database from 'better-sqlite3';
 import crypto from 'crypto';
-import type { Memory, MemoryType, PromotionRun, ConfidenceTierCount, TopDecayingMemory, CorpusHealthStats, CorpusHealthSampleRow } from '../types/types.js';
+import type { Memory, MemoryType, PromotionRun, ConfidenceTierCount, TopDecayingMemory, CorpusHealthStats, CorpusHealthSampleRow, ScopeAggregateRow } from '../types/types.js';
 import type { IMemoryStore } from './interfaces.js';
 import { computeDecayScores } from '../promotion/decay.js';
 import { CONTRADICTION_FLAG_TAG } from '../dreaming/contradiction.js';
+import { ARCHIVED_SQL_PREDICATE } from '../utils/archived.js';
 
 export function computeContentHash(content: string): string {
   return crypto.createHash('sha256').update(content.trim()).digest('hex');
@@ -210,6 +211,14 @@ export class MemoryQueries implements IMemoryStore {
 
     this.logAccess.run(id);
 
+    const tags = (this.getTagsForMemory.all(id) as { tag: string }[]).map(t => t.tag);
+    return { ...memory, tags };
+  }
+
+  // Non-reinforcing read — see IMemoryStore.peek.
+  async peek(id: number): Promise<(Memory & { tags: string[] }) | null> {
+    const memory = this.getById.get(id) as Memory | undefined;
+    if (!memory) return null;
     const tags = (this.getTagsForMemory.all(id) as { tag: string }[]).map(t => t.tag);
     return { ...memory, tags };
   }
@@ -452,6 +461,16 @@ export class MemoryQueries implements IMemoryStore {
     this.updateConfidenceStmt.run(confidence, id);
   }
 
+  async trimAccessLog(days: number): Promise<number> {
+    if (days <= 0) return 0; // 0 = keep forever — never run the DELETE
+    // Backend-native cutoff (CX-7): SQLite stores 'YYYY-MM-DD HH:MM:SS' text,
+    // against which a JS ISO string's 'T' separator sorts wrong.
+    const info = this.db.prepare(
+      "DELETE FROM memory_access_log WHERE accessed_at < datetime('now', ?)"
+    ).run(`-${days} days`);
+    return info.changes;
+  }
+
   async reinforceOnAccess(ids: number[]): Promise<void> {
     if (ids.length === 0) return;
     const reinforceAll = this.db.transaction((memoryIds: number[]) => {
@@ -606,11 +625,70 @@ export class MemoryQueries implements IMemoryStore {
 
   async getCorpusHealthSample(limit: number): Promise<CorpusHealthSampleRow[]> {
     const rows = this.db.prepare(
-      `SELECT id, confidence, observation_count, last_seen, updated_at, embedding, scope, is_locked, metadata
-       FROM memories WHERE is_archived = 0 ORDER BY id ASC LIMIT ?`
-    ).all(limit) as (Omit<CorpusHealthSampleRow, 'is_locked'> & { is_locked: 0 | 1 })[];
-    return rows.map(r => ({ ...r, is_locked: !!r.is_locked }));
+      `SELECT m.id, m.confidence, m.observation_count, m.last_seen, m.updated_at, m.embedding, m.scope, m.is_locked, m.metadata, m.type,
+              (SELECT GROUP_CONCAT(tag) FROM memory_tags t WHERE t.memory_id = m.id) AS tags
+       FROM memories m WHERE m.is_archived = 0 ORDER BY m.id ASC LIMIT ?`
+    ).all(limit) as (Omit<CorpusHealthSampleRow, 'is_locked' | 'tags'> & { is_locked: 0 | 1; tags: string | null })[];
+    return rows.map(r => ({ ...r, is_locked: !!r.is_locked, tags: r.tags ? r.tags.split(',') : [] }));
   }
+
+  async getScopeAggregates(): Promise<ScopeAggregateRow[]> {
+    // GROUP BY scope, type then fold in JS: one pass, no content scanning.
+    // `CASE WHEN is_archived THEN` (not `= 0`) so the identical SQL is valid on
+    // SQLite's 0/1 and Postgres's boolean.
+    const rows = this.db.prepare(
+      `SELECT scope, type,
+              COUNT(*) AS n,
+              SUM(CASE WHEN is_archived THEN 0 ELSE 1 END) AS active,
+              MIN(created_at) AS first_write,
+              MAX(created_at) AS last_write
+       FROM memories
+       GROUP BY scope, type`
+    ).all() as { scope: string; type: string; n: number; active: number; first_write: string | null; last_write: string | null }[];
+    return foldScopeAggregates(rows);
+  }
+
+  async countActiveByScope(scope: string): Promise<number> {
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS count FROM memories WHERE scope = ? AND ${ARCHIVED_SQL_PREDICATE} = 0`
+    ).get(scope) as { count: number };
+    return row.count;
+  }
+
+  async countActiveWithMetadataKey(key: string): Promise<number> {
+    // LIKE '%"key"%' also matches the string inside values — acceptable per the
+    // Task 10 brief: this backs a rarely-polled ops endpoint and is advisory.
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS count FROM memories WHERE ${ARCHIVED_SQL_PREDICATE} = 0 AND metadata LIKE ?`
+    ).get(`%"${key}"%`) as { count: number };
+    return row.count;
+  }
+}
+
+/**
+ * Folds (scope, type) group rows into one row per scope. Shared by both
+ * backends so the SQLite and Postgres shapes cannot diverge. Exported for tests.
+ */
+export function foldScopeAggregates(
+  rows: { scope: string; type: string; n: number; active: number; first_write: string | null; last_write: string | null }[],
+): ScopeAggregateRow[] {
+  const byScope = new Map<string, ScopeAggregateRow>();
+  for (const r of rows) {
+    let agg = byScope.get(r.scope);
+    if (!agg) {
+      agg = { scope: r.scope, total: 0, active: 0, archived: 0, by_type: {}, first_write: null, last_write: null };
+      byScope.set(r.scope, agg);
+    }
+    const n = Number(r.n);
+    const active = Number(r.active);
+    agg.total += n;
+    agg.active += active;
+    agg.archived += n - active;
+    agg.by_type[r.type] = (agg.by_type[r.type] ?? 0) + n;
+    if (r.first_write && (agg.first_write === null || r.first_write < agg.first_write)) agg.first_write = r.first_write;
+    if (r.last_write && (agg.last_write === null || r.last_write > agg.last_write)) agg.last_write = r.last_write;
+  }
+  return [...byScope.values()].sort((a, b) => b.total - a.total || a.scope.localeCompare(b.scope));
 }
 
 function rowToPromotionRun(row: Record<string, unknown>): PromotionRun {

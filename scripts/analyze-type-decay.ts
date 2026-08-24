@@ -18,7 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import { durabilityFactor } from '../src/discovery/confidence.js';
+import { durabilityFactor, DECAY_ARCHIVE_THRESHOLD } from '../src/discovery/confidence.js';
 import { parseTs } from './lib/anchor-triage.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -27,7 +27,7 @@ const projectRoot = path.resolve(__dirname, '..');
 
 const PAGE_LIMIT = 1000;
 const CURRENT_HL = 60; // today's global DECAY_HALF_LIFE_DAYS
-const ARCHIVE = 0.2; // shouldArchive threshold
+const ARCHIVE = DECAY_ARCHIVE_THRESHOLD; // the shared archive line
 const FLOOR = 0.4; // proposed reference/structural floor
 const ANCHOR = 1.0;
 const DAY = 86_400_000;

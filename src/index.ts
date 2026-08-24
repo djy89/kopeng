@@ -30,6 +30,7 @@ import { listPendingDreamsTool } from './tools/list-pending-dreams.js';
 import { getDreamDiffTool } from './tools/get-dream-diff.js';
 import { resolveDreamTool } from './tools/resolve-dream.js';
 import { getOperatorConfigTool, setOperatorConfigTool } from './tools/get-set-operator-config.js';
+import { KOPENG_VERSION } from './version.js';
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -81,7 +82,7 @@ async function main() {
   ];
 
   const server = new Server(
-    { name: 'kopeng', version: '1.0.0' },
+    { name: 'kopeng', version: KOPENG_VERSION },
     { capabilities: { tools: {} } }
   );
 

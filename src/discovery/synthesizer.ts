@@ -230,26 +230,134 @@ const CATEGORY_SYNTHESIZERS: Record<ToolCategory, (group: SynthesisGroup) => { c
   },
 };
 
+// ── Sequence chaining (thin Skills layer) ───────────────────────────────────
+
+interface SequenceEdge {
+  candidate: PatternCandidate;
+  from: string;
+  to: string;
+}
+
+/** Build a single multi-step workflow candidate from a chain of bigrams. */
+function buildChainCandidate(
+  scope: string,
+  path: string[],
+  members: PatternCandidate[],
+): PatternCandidate {
+  const chainStr = path.join(' → ');
+  // A chain is only as evidenced as its weakest link.
+  const sessions = Math.min(...members.map(m => m.distinct_sessions ?? 0));
+  return {
+    pattern_type: 'sequence',
+    description: `Workflow: ${chainStr} (${sessions} sessions)`,
+    evidence_count: Math.min(...members.map(m => m.evidence_count)),
+    observation_span_days: Math.max(...members.map(m => m.observation_span_days)),
+    project_scope: scope,
+    confidence: 0, // recomputed by the discovery engine for sequences
+    content: `Multi-step workflow detected: ${chainStr}. This ordered sequence of steps recurs across sessions and represents a repeatable procedure.`,
+    evidence_snapshot: members.flatMap(m => m.evidence_snapshot).slice(0, 20),
+    // The 'skill' tag is applied at storage (discovery-engine) once keyability is
+    // confirmed; here we only mark the workflow synthesis.
+    synthesized_tags: ['workflow'],
+    distinct_sessions: sessions,
+    steps: [...path],
+  };
+}
+
 /**
- * Synthesize raw repeated_tool patterns into aggregated, actionable insights.
+ * Chain overlapping bigrams (A→B, B→C) into multi-step workflow candidates.
+ * Only edges within the same project scope chain. Each bigram is consumed by at
+ * most one chain (≥3 nodes); un-chained bigrams are returned as `leftover` and
+ * pass through unchanged.
+ */
+function chainSequences(
+  sequences: PatternCandidate[],
+): { chained: PatternCandidate[]; leftover: PatternCandidate[] } {
+  if (sequences.length < 2) return { chained: [], leftover: sequences };
+
+  const byScope = new Map<string, SequenceEdge[]>();
+  for (const candidate of sequences) {
+    const steps = candidate.steps;
+    if (!steps || steps.length < 2) continue; // only well-formed bigrams chain
+    const list = byScope.get(candidate.project_scope) ?? [];
+    list.push({ candidate, from: steps[0], to: steps[1] });
+    byScope.set(candidate.project_scope, list);
+  }
+
+  const chained: PatternCandidate[] = [];
+  const consumed = new Set<PatternCandidate>();
+
+  for (const [scope, edges] of byScope) {
+    if (edges.length < 2) continue;
+
+    const out = new Map<string, SequenceEdge[]>();
+    for (const edge of edges) {
+      const list = out.get(edge.from) ?? [];
+      list.push(edge);
+      out.set(edge.from, list);
+    }
+
+    // Prefer real chain starts: a 'from' that is never a 'to'. Fall back to all
+    // 'from' nodes if every node has an in-edge (pure cycle).
+    const froms = [...new Set(edges.map(e => e.from))];
+    const tos = new Set(edges.map(e => e.to));
+    const starts = froms.filter(f => !tos.has(f));
+    const startNodes = starts.length > 0 ? starts : froms;
+
+    for (const start of startNodes) {
+      const path = [start];
+      const members: PatternCandidate[] = [];
+      const visited = new Set([start]);
+      let cur = start;
+      while (path.length < 6) {
+        const next = (out.get(cur) ?? []).find(
+          e => !consumed.has(e.candidate) && !visited.has(e.to),
+        );
+        if (!next) break;
+        path.push(next.to);
+        members.push(next.candidate);
+        visited.add(next.to);
+        cur = next.to;
+      }
+      if (path.length >= 3) {
+        members.forEach(m => consumed.add(m));
+        chained.push(buildChainCandidate(scope, path, members));
+      }
+    }
+  }
+
+  const leftover = sequences.filter(c => !consumed.has(c));
+  return { chained, leftover };
+}
+
+/**
+ * Synthesize raw repeated_tool patterns into aggregated, actionable insights,
+ * and chain overlapping sequence bigrams into multi-step workflows.
  *
- * Groups candidates by project_scope + tool category, merges them into
- * single synthesized PatternCandidates with actionable content.
- *
- * Non-repeated_tool patterns (error_fix, hot_file, workflow, recurring_error)
- * pass through unchanged — they already have meaningful content.
+ * Groups repeated_tool candidates by project_scope + tool category, merges them
+ * into single synthesized PatternCandidates with actionable content. Sequence
+ * candidates are chained (A→B, B→C → A→B→C) into procedural "skill" workflows;
+ * un-chained bigrams pass through. Other patterns (error_fix, hot_file,
+ * recurring_error) pass through unchanged — they already have meaningful content.
  */
 export function synthesizePatterns(candidates: PatternCandidate[]): PatternCandidate[] {
   const passThrough: PatternCandidate[] = [];
   const repeatedToolCandidates: PatternCandidate[] = [];
+  const sequenceCandidates: PatternCandidate[] = [];
 
   for (const c of candidates) {
     if (c.pattern_type === 'repeated_tool') {
       repeatedToolCandidates.push(c);
+    } else if (c.pattern_type === 'sequence') {
+      sequenceCandidates.push(c);
     } else {
       passThrough.push(c);
     }
   }
+
+  // Chain multi-step workflows; chained + leftover bigrams flow through as-is.
+  const { chained, leftover } = chainSequences(sequenceCandidates);
+  passThrough.push(...leftover, ...chained);
 
   if (repeatedToolCandidates.length === 0) return passThrough;
 

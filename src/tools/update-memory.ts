@@ -19,6 +19,13 @@ export const updateMemoryTool = {
           description: 'New tags (replaces existing)',
         },
         metadata: { type: 'object', description: 'New metadata (replaces existing)' },
+        confidence: {
+          type: 'number',
+          minimum: 0,
+          maximum: 1,
+          description:
+            'New confidence 0-1. Set 1.0 to confirm an auto-discovered memory as a Hard Anchor.',
+        },
       },
       required: ['id'],
     },
@@ -31,6 +38,7 @@ export const updateMemoryTool = {
     if (args.scope !== undefined) body.scope = args.scope;
     if (args.tags !== undefined) body.tags = args.tags;
     if (args.metadata !== undefined) body.metadata = args.metadata;
+    if (args.confidence !== undefined) body.confidence = args.confidence;
 
     const response = await fetch(`${apiUrl}/api/memories/${args.id}`, {
       method: 'PUT',

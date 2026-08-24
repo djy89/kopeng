@@ -146,8 +146,18 @@ export const INJECTION_FLAG_VERDICT: PairVerdict = {
 //                   `getSequenceKey` in src/discovery/heuristics.ts when the
 //                   memory was synthesized — parsed here from content, so no
 //                   discovery→dreaming import is needed).
-//   repeated_tool — "… the operator frequently uses <tool> with: <payload>";
-//                   referent is tool + normalized payload.
+//   repeated_tool — "… the operator frequently uses <tool> with: <payload>"
+//                   (detectRepeatedToolInput) AND "The operator frequently
+//                   runs this command in the project: <command>"
+//                   (detectRepeatedCommands, round-22 addition) share this ONE
+//                   family — the second producer has no explicit tool name,
+//                   so it canonicalizes to 'bash' (see parseDiscoveryTemplate).
+//                   Folding both into one family means a command reported by
+//                   both detectors is a same-referent pair (falls through to
+//                   the reasoner, confirmed genuine duplicate), while two
+//                   DIFFERENT commands under either template resolve
+//                   deterministically to `unrelated`. Referent is tool +
+//                   normalized payload.
 //   referent_list — the synthesizer list templates ("Key reference files …",
 //                   "Infrastructure commands …"); referent sets via the R13
 //                   `extractTemplateReferents`/`isDifferentReferent` machinery
@@ -185,6 +195,9 @@ const SEQUENCE_TEMPLATE_RE =
 /** "When working in this project, the operator frequently uses <tool> with: <payload>" (detectRepeatedToolInput). */
 const REPEATED_TOOL_TEMPLATE_RE =
   /^when working in this project, the operator frequently uses\s+(\S+)\s+with:\s*([\s\S]+)$/i;
+/** "The operator frequently runs this command in the project: <command>" (detectRepeatedCommands, heuristics.ts:376 — the round-22 gap: this template was never parsed at all, so any pair involving it skipped the guard entirely and reached the reasoner). */
+const REPEATED_COMMAND_TEMPLATE_RE =
+  /^the operator frequently runs this command in the project:\s*([\s\S]+)$/i;
 
 /** Whitespace/case normalization for referent identity comparison. */
 function normText(s: string): string {
@@ -222,6 +235,26 @@ export function parseDiscoveryTemplate(content: string): ParsedTemplate | null {
   const rt = content.match(REPEATED_TOOL_TEMPLATE_RE);
   if (rt) {
     return { family: 'repeated_tool', referent: `${rt[1].toLowerCase()}::${normText(rt[2])}` };
+  }
+  const rc = content.match(REPEATED_COMMAND_TEMPLATE_RE);
+  if (rc) {
+    // detectRepeatedCommands (heuristics.ts) only groups Bash-family tool_names
+    // (Bash/bash/shell/terminal) and never records which one produced a given
+    // command, so the referent can't recover the exact tool_name the way
+    // REPEATED_TOOL_TEMPLATE_RE does. Canonicalize to 'bash' — matching the
+    // literal Claude Code tool name ("Bash") that the repeated_tool branch
+    // above lowercases to in the overwhelmingly common case — and fold into
+    // the SAME `repeated_tool` family (deliberate, round-22): a command
+    // reported by BOTH detectors (one via detectRepeatedToolInput, one via
+    // detectRepeatedCommands) then shares one referent, so the cross-family
+    // pair is treated as a same-referent claim and falls through to the
+    // reasoner exactly like any other same-referent pair — proven a genuine
+    // duplicate by hand on 2026-08-20, so THAT is correct; it is a
+    // different-referent pair (a different command under either template)
+    // that must resolve deterministically to `unrelated`, which sharing the
+    // family now gives it. Known residual gap: 'shell'/'terminal'-named bash
+    // tools won't cross-match (unrecoverable from this content alone).
+    return { family: 'repeated_tool', referent: `bash::${normText(rc[1])}` };
   }
   if (extractTemplateReferents(content)) {
     return { family: 'referent_list', referent: null };

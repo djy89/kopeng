@@ -16,10 +16,10 @@ import { DreamQueries } from '../../src/database/dream-queries.js';
 import { EmbeddingIndex } from '../../src/embeddings/index.js';
 import { ConsolidationLockManager } from '../../src/dreaming/lock.js';
 import { runDreamPass, DbWindowMemorySource, type DreamEngineDeps } from '../../src/dreaming/dream-engine.js';
-import { DuplicateCandidateSelector, DeterministicDiffGenerator } from '../../src/dreaming/pipeline.js';
+import { DuplicateCandidateSelector, DeterministicDiffGenerator, StaticMemorySource } from '../../src/dreaming/pipeline.js';
 import { NoOpReasoner } from '../../src/dreaming/reasoner/noop-reasoner.js';
 import {
-  applyEntry, resolveDream, rollbackMemory, computeAcceptance, isAutoApplicable,
+  applyEntry, auditedArchiveMemory, resolveDream, rollbackMemory, computeAcceptance, isAutoApplicable,
   type ApplyDeps,
 } from '../../src/dreaming/apply.js';
 import { registerRoutes } from '../../src/api/routes.js';
@@ -70,6 +70,7 @@ describe('dream apply path (D1.3)', () => {
     tags?: string[];
     lastSeen?: string;
     locked?: boolean;
+    metadata?: string;
   }): Promise<number> {
     const { id } = await queries.store({
       content: opts.content,
@@ -77,7 +78,7 @@ describe('dream apply path (D1.3)', () => {
       scope: opts.scope ?? 'project:x',
       source: 'auto-discovery',
       source_path: null,
-      metadata: '{}',
+      metadata: opts.metadata ?? '{}',
       embedding: opts.vec ? toBuffer(opts.vec) : null,
       embedding_model: 'test',
       created_by: null,
@@ -409,6 +410,25 @@ describe('dream apply path (D1.3)', () => {
     expect(await store.listAuditForDream(dream.id)).toHaveLength(0);
   });
 
+  it('auditedArchiveMemory refuses an ancient sub-1.0 PINNED memory (CR-1)', async () => {
+    // confidence 0.5, unlocked, pinned via metadata, last_seen 300 days before
+    // NOW — decayed far past the 0.2 archive line, so only the pin protects it.
+    const pinnedId = await storeMem({
+      content: 'pinned but ancient',
+      confidence: 0.5,
+      metadata: '{"pinned":true}',
+      lastSeen: '2025-08-19T00:00:00Z',
+    });
+    const dream = await store.createDream({ operator_id: 'default', window_key: 'w-pinned' });
+
+    const result = await auditedArchiveMemory(applyDeps(), dream.id, pinnedId, 'decay');
+    expect(result.outcome).toBe('refused_anchored');
+    // and the row is still active:
+    expect((await queries.peek(pinnedId))!.is_archived).toBe(0);
+    expect(await store.listRevisions(pinnedId)).toHaveLength(0);
+    expect(await store.listAuditForDream(dream.id)).toHaveLength(0);
+  });
+
   it('promote_global is never applied — diff-only signal for the maintenance path', async () => {
     const a = await storeMem({ content: 'shared convention', scope: 'project:x' });
     const dream = await store.createDream({ operator_id: 'default', window_key: 'w-promote' });
@@ -474,11 +494,96 @@ describe('dream apply path (D1.3)', () => {
     expect(computeAcceptance([e('accepted'), e('auto_applied')])).toBe('accepted');
   });
 
+  // ── Phase 2 apply-time revalidation (stale-diff defense) ──
+
+  describe('Phase 2 apply-time revalidation', () => {
+    it('G3: a merge whose keep-target was archived in the interim is refused, archiving nothing', async () => {
+      const { keep: a, dup: b } = await exactDupPair();
+      const dream = await store.createDream({ operator_id: 'default', window_key: 'w-g3' });
+      const entry: DreamDiffEntry = {
+        change_class: 'exact_dup', tier: 'deterministic-safe', memory_ids: [a, b],
+        rationale: 'stale keep target',
+        after: { keep_id: a, archive_ids: [b] },
+      };
+      await queries.archive(a); // the interim archive
+
+      const result = await applyEntry(applyDeps(), dream.id, 0, entry, false);
+      expect(result.outcome).toBe('not_actionable');
+      expect(result.detail).toMatch(/stale diff: keep target/);
+      expect(isArchived(b)).toBe(false); // B untouched
+    });
+
+    it("refuses when a member's content changed since the proposal (provenance hash mismatch)", async () => {
+      const { keep: a, dup: b } = await exactDupPair();
+      const aHash = (await queries.get(a))!.content_hash;
+      const bHash = (await queries.get(b))!.content_hash;
+      const dream = await store.createDream({ operator_id: 'default', window_key: 'w-hash' });
+      const entry: DreamDiffEntry = {
+        change_class: 'exact_dup', tier: 'deterministic-safe', memory_ids: [a, b],
+        rationale: 'hash revalidation',
+        after: { keep_id: a, archive_ids: [b] },
+        provenance: {
+          alias_table_version: null,
+          members: [
+            { id: a, content_hash: aHash, scope: 'project:x', effective_scope: 'project:x' },
+            { id: b, content_hash: bHash, scope: 'project:x', effective_scope: 'project:x' },
+          ],
+        },
+      };
+
+      await queries.update(b, { content: 'edited since the proposal', type: 'discovery', scope: 'project:x', metadata: '{}', tags: [] });
+
+      const result = await applyEntry(applyDeps(), dream.id, 0, entry, false);
+      expect(result.outcome).toBe('not_actionable');
+      expect(result.detail).toMatch(/content changed/);
+      expect(isArchived(b)).toBe(false);
+    });
+
+    it('prefers an already-canonical survivor on exact_dup (swaps keep and archive)', async () => {
+      // A REAL exact_dup pair via the normal store path: case/whitespace
+      // variants (different content_hash — the unique index makes an exact
+      // hash match unreachable between two live rows; the swap is gated on
+      // normalizeContent, the selector's own predicate, not the hash).
+      const a = await storeMem({ content: 'npm test runs the suite', confidence: 0.8, scope: 'client:Acme-Foods' });
+      const b = await storeMem({ content: 'NPM  test runs the suite', confidence: 0.6, scope: 'client:acme-foods' });
+      const dream = await store.createDream({ operator_id: 'default', window_key: 'w-canon' });
+      const entry: DreamDiffEntry = {
+        change_class: 'exact_dup', tier: 'deterministic-safe', memory_ids: [a, b],
+        rationale: 'exact dup across an alias/canonical scope pair',
+        after: { keep_id: a, archive_ids: [b] },
+      };
+      const depsWithCanonicalize: ApplyDeps = {
+        ...applyDeps(),
+        canonicalizeScope: async (s: string) => (s === 'client:Acme-Foods' ? 'client:acme-foods' : s),
+      };
+
+      const result = await applyEntry(depsWithCanonicalize, dream.id, 0, entry, false);
+      expect(result.outcome).toBe('applied');
+      expect(isArchived(b)).toBe(false); // canonical row survived
+      expect(isArchived(a)).toBe(true);  // alias row archived
+    });
+
+    it('legacy entries (no provenance) still apply with only the keep-target check', async () => {
+      const { keep, dup } = await exactDupPair();
+      const dream = await store.createDream({ operator_id: 'default', window_key: 'w-legacy' });
+      const entry: DreamDiffEntry = {
+        change_class: 'exact_dup', tier: 'deterministic-safe', memory_ids: [keep, dup],
+        rationale: 'legacy diff, no provenance',
+        after: { keep_id: keep, archive_ids: [dup] },
+      };
+
+      const result = await applyEntry(applyDeps(), dream.id, 0, entry, false);
+      expect(result.outcome).toBe('applied');
+      expect(isArchived(dup)).toBe(true);
+      expect(isArchived(keep)).toBe(false);
+    });
+  });
+
   it('isAutoApplicable maps each class to its flag and never covers merges or promotes', () => {
     const cfg = (exact: boolean, decay: boolean): OperatorConfig => ({
       operator_id: 'default', timezone: null, quiet_hours_start: null, quiet_hours_end: null,
       idle_minutes: 15, dream_cadence: null, auto_accept_exact_dup: exact, auto_accept_decay: decay,
-      reasoner_provider: null, config: '{}', created_at: NOW_ISO, updated_at: NOW_ISO,
+      reasoner_provider: null, primary_scope: null, config: '{}', created_at: NOW_ISO, updated_at: NOW_ISO,
     });
     const entry = (change_class: DreamDiffEntry['change_class'], tier: DreamDiffEntry['tier']): DreamDiffEntry =>
       ({ change_class, tier, memory_ids: [1], rationale: 'x' });
@@ -615,7 +720,7 @@ describe('dream review REST surface (D1.3)', () => {
     const { dreamId, dup } = await seedPendingDream();
     await app.inject({ method: 'POST', url: `/api/dreams/${dreamId}/resolve`, headers: adminHeaders(), payload: { action: 'accept' } });
 
-    const res = await app.inject({ method: 'GET', url: `/api/memories/${dup}/revisions` });
+    const res = await app.inject({ method: 'GET', headers: adminHeaders(), url: `/api/memories/${dup}/revisions` });
     expect(res.statusCode).toBe(200);
     expect(res.json().data).toHaveLength(1);
     expect(res.json().data[0].created_by_dream_id).toBe(dreamId);
@@ -664,5 +769,123 @@ describe('dream review REST surface (D1.3)', () => {
     } finally {
       config.server.adminApiKey = prev;
     }
+  });
+
+  // Team-review #22 S1: the revision surface is admin-gated (revisions serve
+  // PRE-EDIT content, so a public read defeats redaction) and purgeable (the
+  // deliberate excision path for a secret that landed in history).
+  it('revision GET is admin-gated; DELETE purges one revision or the whole history', async () => {
+    const prev = config.server.adminApiKey;
+    config.server.adminApiKey = 'test-admin-key';
+    try {
+      const { dup } = await seedPendingDream();
+      await store.snapshotRevision(dup);
+      await store.snapshotRevision(dup);
+
+      // Reads of revision history 401 without the key (unlike core reads).
+      const noKey = await app.inject({ method: 'GET', url: `/api/memories/${dup}/revisions` });
+      expect(noKey.statusCode).toBe(401);
+      const withKey = await app.inject({ method: 'GET', headers: { 'x-api-key': 'test-admin-key' }, url: `/api/memories/${dup}/revisions` });
+      expect(withKey.statusCode).toBe(200);
+      expect(withKey.json().data).toHaveLength(2);
+
+      // Purge one revision.
+      const delNoKey = await app.inject({ method: 'DELETE', url: `/api/memories/${dup}/revisions/1` });
+      expect(delNoKey.statusCode).toBe(401);
+      const delOne = await app.inject({ method: 'DELETE', headers: { 'x-api-key': 'test-admin-key' }, url: `/api/memories/${dup}/revisions/1` });
+      expect(delOne.statusCode).toBe(200);
+      const delGone = await app.inject({ method: 'DELETE', headers: { 'x-api-key': 'test-admin-key' }, url: `/api/memories/${dup}/revisions/1` });
+      expect(delGone.statusCode).toBe(404);
+
+      // Purge the rest.
+      const delAll = await app.inject({ method: 'DELETE', headers: { 'x-api-key': 'test-admin-key' }, url: `/api/memories/${dup}/revisions` });
+      expect(delAll.statusCode).toBe(200);
+      expect(delAll.json().data.deleted).toBe(1);
+      expect((await store.listRevisions(dup))).toHaveLength(0);
+    } finally {
+      config.server.adminApiKey = prev;
+    }
+  });
+});
+
+// ── team-review #22 A1: the canonical-survivor swap must be PERSISTED even when
+// the entry ends pending (anchored member refused after the swap ran). The old
+// `autoApplied > 0` persistence gate discarded the in-place entry mutation, so
+// the stored diff named the archived row as survivor — the "lying diff".
+describe('swap persistence under anchored refusal (team-review #22 A1)', () => {
+  it('stored diff names the TRUE survivor when a swap applied partially', async () => {
+    const t = createTestDatabase();
+    const q = t.queries;
+    const dStore = new DreamQueries(t.db);
+    const idx = new EmbeddingIndex();
+    await idx.loadFromDatabase([]);
+    await dStore.updateConfig('default', { auto_accept_exact_dup: true });
+
+    const canonicalize = (s: string) => (s === 'client:Acme-Foods' ? 'client:acme-foods' : s);
+
+    async function seed(content: string, scope: string, confidence: number): Promise<number> {
+      const { id } = await q.store({
+        content, type: 'discovery', scope, source: 'auto-discovery', source_path: null,
+        metadata: '{}', embedding: toBuffer(basis(0)), embedding_model: 'test',
+        created_by: null, tags: [], confidence,
+      });
+      await idx.add(id, basis(0));
+      return id;
+    }
+    // Same normalized content, three rows: proposed keep on the ALIAS scope,
+    // the canonical-scope twin (swap target), and a third member we anchor
+    // AFTER selection sees it (stale-view trick below).
+    const keep = await seed('shared fact', 'client:Acme-Foods', 0.9);
+    const dup = await seed('Shared  Fact', 'client:acme-foods', 0.6);
+    const anchored = await seed('SHARED FACT', 'client:Acme-Foods', 0.7);
+
+    // The source presents the PRE-ANCHOR view (selection-time state); the DB
+    // then anchors #3, so applyEntry's re-check refuses it mid-entry.
+    const staleView = [keep, dup, anchored].map((id, i) => ({
+      id,
+      content: ['shared fact', 'Shared  Fact', 'SHARED FACT'][i],
+      content_hash: null, summary: null, tags: [],
+      scope: ['client:Acme-Foods', 'client:acme-foods', 'client:Acme-Foods'][i],
+      confidence: [0.9, 0.6, 0.7][i],
+      is_locked: false,
+      created_at: '2026-06-01T00:00:00Z', updated_at: '2026-06-01T00:00:00Z',
+      embedding: basis(0), metadata: null, last_seen: NOW_ISO, observation_count: 1,
+    }));
+    t.db.prepare(`UPDATE memories SET confidence = 1.0 WHERE id = ?`).run(anchored);
+
+    const run = await runDreamPass({
+      dreamStore: dStore,
+      configStore: dStore,
+      source: new StaticMemorySource(staleView),
+      selector: new DuplicateCandidateSelector({ now: () => new Date(NOW), canonicalize }),
+      reasoner: new NoOpReasoner(),
+      diffGen: new DeterministicDiffGenerator({ canonicalize }),
+      lock: new ConsolidationLockManager({ store: dStore, holder: 'dream-engine-swap-test' }),
+      tz: 'UTC',
+      now: () => NOW,
+      apply: { memoryStore: q, vectorIndex: idx, canonicalizeScope: async (s) => canonicalize(s) },
+    }, { trigger: 'manual' });
+    expect(run.status).toBe('completed');
+
+    // The anchored member kept the entry pending, so nothing "auto-applied"...
+    const dream = await dStore.getDream(run.dream_id!);
+    expect(dream?.changes_auto_applied).toBe(0);
+
+    // ...but the swap ran: the alias-scoped proposed keep was archived, the
+    // canonical twin survived...
+    expect((await q.get(keep))?.is_archived).toBe(1);
+    expect((await q.get(dup))?.is_archived).toBe(0);
+    expect((await q.get(anchored))?.is_archived).toBe(0);
+
+    // ...and the STORED diff reflects that truthfully (the fix): keep_id is the
+    // canonical survivor, archive_ids carry the original keep, and the
+    // rationale carries the swap marker exactly once.
+    const diff = JSON.parse(dream!.output_diff!) as DreamDiff;
+    const entry = diff.entries.find(e => e.change_class === 'exact_dup')!;
+    const after = entry.after as { keep_id: number; archive_ids: number[] };
+    expect(after.keep_id).toBe(dup);
+    expect(after.archive_ids).toContain(keep);
+    expect(after.archive_ids).not.toContain(dup);
+    expect(entry.rationale.split('[apply-time: canonical-survivor swap').length).toBe(2);
   });
 });

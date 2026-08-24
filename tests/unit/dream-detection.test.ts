@@ -73,13 +73,13 @@ const selector = new DuplicateCandidateSelector({ now: () => NOW });
 const diffGen = new DeterministicDiffGenerator();
 const ctx: ReasonerContext = { timeoutMs: 1000 };
 
-function generate(memories: CandidateMemory[]) {
-  const groups = selector.select(memories);
+async function generate(memories: CandidateMemory[]) {
+  const groups = await selector.select(memories);
   return { groups, diff: diffGen.generate(groups.map(group => ({ group, verdict: null }))) };
 }
 
 describe('cosineSimilarity', () => {
-  it('computes exact cosines for the blend fixtures', () => {
+  it('computes exact cosines for the blend fixtures', async () => {
     expect(cosineSimilarity(basis(0), basis(0))).toBeCloseTo(1, 6);
     expect(cosineSimilarity(basis(0), basis(1))).toBeCloseTo(0, 6);
     expect(cosineSimilarity(basis(0), blend(0, 1, 0.9))).toBeCloseTo(0.9, 6);
@@ -87,8 +87,8 @@ describe('cosineSimilarity', () => {
 });
 
 describe('DuplicateCandidateSelector (D1.2)', () => {
-  it('groups exact normalized dups without embeddings', () => {
-    const { groups } = generate([
+  it('groups exact normalized dups without embeddings', async () => {
+    const { groups } = await generate([
       mem({ id: 1, content: 'Same Fact' }),
       mem({ id: 2, content: 'same   fact' }),
       mem({ id: 3, content: 'different fact' }),
@@ -98,8 +98,8 @@ describe('DuplicateCandidateSelector (D1.2)', () => {
     expect(groups[0].members.map(m => m.id).sort()).toEqual([1, 2]);
   });
 
-  it('collapse tier: cosine >= 0.95 groups as semantic_duplicate', () => {
-    const { groups } = generate([
+  it('collapse tier: cosine >= 0.95 groups as semantic_duplicate', async () => {
+    const { groups } = await generate([
       mem({ id: 1, content: 'fact worded one way', embedding: basis(0) }),
       mem({ id: 2, content: 'fact worded differently', embedding: blend(0, 1, 0.96) }),
     ]);
@@ -108,8 +108,8 @@ describe('DuplicateCandidateSelector (D1.2)', () => {
     expect(groups[0].similarity).toBeCloseTo(0.96, 5);
   });
 
-  it('band tier: 0.85 <= cosine < 0.95 is near_duplicate, never merged transitively', () => {
-    const { groups } = generate([
+  it('band tier: 0.85 <= cosine < 0.95 is near_duplicate, never merged transitively', async () => {
+    const { groups } = await generate([
       mem({ id: 1, content: 'deploy on fridays', embedding: basis(0) }),
       mem({ id: 2, content: 'never deploy on fridays', embedding: blend(0, 1, 0.90) }),
     ]);
@@ -117,16 +117,16 @@ describe('DuplicateCandidateSelector (D1.2)', () => {
     expect(groups[0].signal).toBe('near_duplicate');
   });
 
-  it('sub-band similarity (cosine < 0.85) produces no group', () => {
-    const { groups } = generate([
+  it('sub-band similarity (cosine < 0.85) produces no group', async () => {
+    const { groups } = await generate([
       mem({ id: 1, content: 'redis stores context', embedding: basis(0) }),
       mem({ id: 2, content: 'redis is optional', embedding: blend(0, 1, 0.7) }),
     ]);
     expect(groups).toHaveLength(0);
   });
 
-  it('Hard Anchor: locked and confidence=1.0 memories never enter any tier', () => {
-    const { groups } = generate([
+  it('Hard Anchor: locked and confidence=1.0 memories never enter any tier', async () => {
+    const { groups } = await generate([
       mem({ id: 1, content: 'anchored truth', confidence: 1.0, embedding: basis(0) }),
       mem({ id: 2, content: 'anchored truth', is_locked: true, embedding: basis(0) }),
       mem({ id: 3, content: 'anchored truth', embedding: basis(0) }), // journal twin, now alone
@@ -136,8 +136,8 @@ describe('DuplicateCandidateSelector (D1.2)', () => {
     expect(groups).toHaveLength(0);
   });
 
-  it('R6: same content across scopes is a cross_scope_duplicate, not a same-scope group', () => {
-    const { groups } = generate([
+  it('R6: same content across scopes is a cross_scope_duplicate, not a same-scope group', async () => {
+    const { groups } = await generate([
       mem({ id: 1, content: 'absolute paths on windows', scope: 'project:a' }),
       mem({ id: 2, content: 'absolute paths on windows', scope: 'global' }),
     ]);
@@ -145,8 +145,8 @@ describe('DuplicateCandidateSelector (D1.2)', () => {
     expect(groups[0].signal).toBe('cross_scope_duplicate');
   });
 
-  it('decay tier: stale low-confidence memory yields a single decayed group; fresh does not', () => {
-    const { groups } = generate([
+  it('decay tier: stale low-confidence memory yields a single decayed group; fresh does not', async () => {
+    const { groups } = await generate([
       mem({ id: 1, content: 'stale workaround', confidence: 0.45, last_seen: '2026-01-05T00:00:00Z' }),
       mem({ id: 2, content: 'fresh note', confidence: 0.7, last_seen: '2026-06-10T00:00:00Z' }),
     ]);
@@ -156,8 +156,8 @@ describe('DuplicateCandidateSelector (D1.2)', () => {
     expect(groups[0].members[0].id).toBe(1);
   });
 
-  it('durability rescues a stale memory from the decay tier (D1.1 integration)', () => {
-    const { groups } = generate([
+  it('durability rescues a stale memory from the decay tier (D1.1 integration)', async () => {
+    const { groups } = await generate([
       mem({ id: 1, content: 'stale but heavily evidenced', confidence: 0.45, last_seen: '2026-01-05T00:00:00Z', observation_count: 40 }),
     ]);
     expect(groups).toHaveLength(0); // durability 4.7 → effective days ~34 → strength ~0.3
@@ -165,18 +165,18 @@ describe('DuplicateCandidateSelector (D1.2)', () => {
 });
 
 describe('evidence gates (D1.2)', () => {
-  it('rejects single-session burst evidence with reasons', () => {
+  it('rejects single-session burst evidence with reasons', async () => {
     const result = evidenceGate([mem({ id: 1, content: 'x', metadata: burstMetadata() })]);
     expect(result.pass).toBe(false);
     expect(result.reasons.length).toBeGreaterThanOrEqual(2); // sessions + span (+ inputs)
     expect(result.reasons.join(' ')).toContain(`${MIN_DISTINCT_SESSIONS}`);
   });
 
-  it('passes diverse cross-session evidence', () => {
+  it('passes diverse cross-session evidence', async () => {
     expect(evidenceGate([mem({ id: 1, content: 'x', metadata: diverseMetadata() })]).pass).toBe(true);
   });
 
-  it('passes trivially when no member carries evidence (operator-written memories)', () => {
+  it('passes trivially when no member carries evidence (operator-written memories)', async () => {
     const result = evidenceGate([mem({ id: 1, content: 'x' }), mem({ id: 2, content: 'y' })]);
     expect(result.pass).toBe(true);
     expect(result.evidence_count).toBe(0);
@@ -184,8 +184,8 @@ describe('evidence gates (D1.2)', () => {
 });
 
 describe('DeterministicDiffGenerator (D1.2)', () => {
-  it('exact dups → exact_dup, deterministic-safe, keep the highest-confidence copy', () => {
-    const { diff } = generate([
+  it('exact dups → exact_dup, deterministic-safe, keep the highest-confidence copy', async () => {
+    const { diff } = await generate([
       mem({ id: 1, content: 'same fact', confidence: 0.6 }),
       mem({ id: 2, content: 'Same Fact', confidence: 0.8 }),
     ]);
@@ -197,25 +197,25 @@ describe('DeterministicDiffGenerator (D1.2)', () => {
     expect((e.after as { archive_ids: number[] }).archive_ids).toEqual([1]);
   });
 
-  it('semantic dup with diverse evidence stays deterministic-safe; burst evidence demotes it', () => {
-    const safe = generate([
+  it('semantic dup with diverse evidence stays deterministic-safe; burst evidence demotes it', async () => {
+    const safe = (await generate([
       mem({ id: 1, content: 'fact A', embedding: basis(0), metadata: diverseMetadata() }),
       mem({ id: 2, content: 'fact A reworded', embedding: blend(0, 1, 0.97), metadata: diverseMetadata() }),
-    ]).diff.entries[0];
+    ])).diff.entries[0];
     expect(safe.change_class).toBe('merge');
     expect(safe.tier).toBe('deterministic-safe');
 
-    const demoted = generate([
+    const demoted = (await generate([
       mem({ id: 1, content: 'fact B', embedding: basis(0), metadata: burstMetadata() }),
       mem({ id: 2, content: 'fact B reworded', embedding: blend(0, 1, 0.97), metadata: burstMetadata() }),
-    ]).diff.entries[0];
+    ])).diff.entries[0];
     expect(demoted.change_class).toBe('merge');
     expect(demoted.tier).toBe('reasoner-driven'); // gates reject burst/low-diversity
     expect(demoted.rationale).toContain('gates failed');
   });
 
-  it('band pairs → merge, reasoner-driven, no apply proposal', () => {
-    const { diff } = generate([
+  it('band pairs → merge, reasoner-driven, no apply proposal', async () => {
+    const { diff } = await generate([
       mem({ id: 1, content: 'deploy fridays', embedding: basis(0) }),
       mem({ id: 2, content: 'never deploy fridays', embedding: blend(0, 1, 0.9) }),
     ]);
@@ -223,8 +223,8 @@ describe('DeterministicDiffGenerator (D1.2)', () => {
     expect(diff.entries[0].after).toBeUndefined();
   });
 
-  it('cross-scope dup → promote_global with source ids, never a collapse', () => {
-    const { diff } = generate([
+  it('cross-scope dup → promote_global with source ids, never a collapse', async () => {
+    const { diff } = await generate([
       mem({ id: 1, content: 'shared fact', scope: 'project:a' }),
       mem({ id: 2, content: 'shared fact', scope: 'project:b' }),
     ]);
@@ -233,14 +233,14 @@ describe('DeterministicDiffGenerator (D1.2)', () => {
     expect((diff.entries[0].after as { promote_scope: string }).promote_scope).toBe('global');
   });
 
-  it('thresholds are what the plan says they are', () => {
+  it('thresholds are what the plan says they are', async () => {
     expect(COSINE_DUPLICATE_THRESHOLD).toBe(0.95);
     expect(NEAR_DUP_BAND_MIN).toBe(0.85);
   });
 });
 
 describe('pickKeepTarget', () => {
-  it('prefers confidence, then recency, then lowest id', () => {
+  it('prefers confidence, then recency, then lowest id', async () => {
     expect(pickKeepTarget([
       mem({ id: 1, content: 'x', confidence: 0.6 }),
       mem({ id: 2, content: 'x', confidence: 0.8 }),

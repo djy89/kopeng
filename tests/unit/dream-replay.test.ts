@@ -69,7 +69,7 @@ describe('dream replay harness (D0.7)', () => {
     expect(d.precision).toBe(1);
     expect(d.false_positive_rate).toBe(0);
 
-    expect(d.by_class.duplicate).toEqual({ total: 3, detected: 2 }); // paraphrase waits for 1.2
+    expect(d.by_class.duplicate).toEqual({ total: 6, detected: 2 }); // paraphrase + the 3 straddle pairs wait for 1.2
     expect(d.by_class.cross_scope_duplicate).toEqual({ total: 1, detected: 1 });
     expect(d.by_class.contradiction).toEqual({ total: 1, detected: 0 }); // waits for phase 2
     expect(d.by_class.preference_change).toEqual({ total: 1, detected: 0 }); // waits for phase 2

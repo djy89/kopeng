@@ -558,8 +558,10 @@ function listPendingFlushFiles() {
 /**
  * T18 failure visibility: any flush trouble writes this hint; the recall hook
  * surfaces it in the next prompt's systemMessage; the next fully-drained
- * invocation clears it. A silent multi-week capture outage becomes
- * structurally impossible — failure is in-band within a prompt or two.
+ * invocation clears it. A silent multi-week FLUSH outage becomes structurally
+ * impossible while the hooks themselves run — failure is in-band within a
+ * prompt or two. (A hook that never executes — uninstall, missing node — stays
+ * the residual silent class, and this writer is itself try/catch-swallowed.)
  */
 function writeFlushErrorHint(info) {
   try {
@@ -608,10 +610,17 @@ function quarantinePoisonChunk(entries) {
 }
 
 /**
- * Per-chunk stall bookkeeping, keyed by "<queue file>#<offset within it>" — the
- * identity of "the chunk at the head of the queue". Fail-soft: an unreadable or
- * unwritable state file simply means no chunk ever crosses the stall threshold,
- * which is the pre-existing (retry-forever) behavior.
+ * Per-chunk stall bookkeeping, keyed by "<queue file>#<first entry's
+ * idempotency_key>" — content identity, NOT a byte/item offset. A byte offset
+ * looked like a stable identity but isn't: commitRemainder rewrites a queue
+ * file to its unsent TAIL after every partial success, so a later invocation
+ * that re-reads the file starts counting from offset 0 again for whatever
+ * chunk now happens to sit at the head — genuinely different data inheriting
+ * a stale attempt count (and stale baseline) left by an unrelated earlier
+ * chunk. idempotency_key is generated once per real captured event and never
+ * repeats, so this key can't collide across a rewrite. Fail-soft: an
+ * unreadable or unwritable state file simply means no chunk ever crosses the
+ * stall threshold, which is the pre-existing (retry-forever) behavior.
  */
 function readStallState() {
   try {
@@ -625,16 +634,46 @@ function readStallState() {
 function writeStallState(state) {
   try {
     // Drop keys for queue files that no longer exist so the file can't grow
-    // without bound as the queue churns.
+    // without bound as the queue churns. Meta keys (leading underscore — e.g.
+    // the cross-invocation success counter below) aren't tied to a queue file
+    // and are always kept.
     const live = new Set(listPendingFlushFiles().map(f => basename(f)));
     const pruned = {};
     for (const [k, v] of Object.entries(state)) {
-      if (live.has(k.split('#')[0])) pruned[k] = v;
+      if (k.startsWith('_') || live.has(k.split('#')[0])) pruned[k] = v;
     }
     writeFileSync(FLUSH_STALL_STATE_FILE, JSON.stringify(pruned), { mode: 0o600 });
   } catch {
     // Best-effort — see readStallState.
   }
+}
+
+/**
+ * Bumps the persisted cross-invocation counter of successfully-posted chunks
+ * — the ONLY evidence the stall-escalation check (below, in
+ * drainPendingFlushes) has that the server is CURRENTLY storing data, the
+ * signal that tells "this one chunk is unstorable" (other chunks keep
+ * succeeding) apart from "the database is down" (nothing succeeds, ever).
+ *
+ * Also clears the JUST-SUCCEEDED chunk's own stall entry, if it had one from
+ * earlier failed attempts on THIS invocation or a prior one: a stall record
+ * must only ever describe a chunk that is CURRENTLY failing. Content-keying
+ * (see readStallState) makes a stale entry harmless for content-identified
+ * chunks — it can never be looked up again by different data. But the
+ * fallback identity used for keyless entries (`?? consumed`, see the stallKey
+ * comment above) IS an on-disk offset, which a stale entry CAN collide on
+ * once commitRemainder rewrites the file and a different chunk lands at that
+ * same offset. THIS delete-on-success is what keeps that fallback branch safe
+ * too: both transitions that shift on-disk offsets — this success path and
+ * poison-quarantine, above — clear their own key before returning, so no
+ * stale offset-keyed entry survives to be inherited by whatever unrelated
+ * chunk comes next.
+ */
+function recordFlushSuccess(stallKey) {
+  const state = readStallState();
+  state._success_count = (state._success_count ?? 0) + 1;
+  if (stallKey && stallKey in state) delete state[stallKey];
+  writeStallState(state);
 }
 
 /**
@@ -803,6 +842,17 @@ async function drainPendingFlushes(opts = {}) {
       const remainingMs = budgetMs - (Date.now() - started);
       if (sentChunks >= maxChunks || remainingMs < 300) break;
       const res = await postBatch(chunk, Math.min(FLUSH_TIMEOUT_MS, remainingMs));
+      // Content-keyed, not offset-keyed — see the readStallState doc comment.
+      // Computed once here so both the failure branch and the success path
+      // (recordFlushSuccess) agree on this POST's identity. Residual: the
+      // `?? consumed` fallback only applies to entries with no
+      // idempotency_key. This hook always generates one (see below), but
+      // JSONL recovered out-of-band (importer, hand-repaired overflow files)
+      // need not — two keyless chunks that both land at consumed === 0 would
+      // share the same `file#0` key and inherit each other's attempts/
+      // baseline (the bug commit 006c7d9 removed, narrowed to keyless
+      // entries).
+      const stallKey = `${basename(file)}#${chunk[0]?.idempotency_key ?? consumed}`;
       if (!res.ok) {
         // Statuses where the server deems the PAYLOAD invalid — retrying is
         // pointless and one poison chunk must not block the queue: park it and
@@ -812,17 +862,52 @@ async function drainPendingFlushes(opts = {}) {
         // — exactly how a fixable misconfig becomes data loss. 408/429/5xx/network: transient.
         let isPoison = res.status === 400 || res.status === 413 || res.status === 422;
 
-        // A 5xx that keeps recurring on the SAME chunk is a payload the server
-        // cannot store, not a transient blip — promote it to poison rather than
-        // let it head-of-line block the queue forever. status 0 (unreachable)
-        // and 408/429 are excluded: those are the genuinely-retryable classes.
-        const stallKey = `${basename(file)}#${consumed}`;
+        // A 5xx that keeps recurring on the SAME chunk MIGHT be a payload the
+        // server can never store (e.g. a NUL byte from UTF-16LE tool output,
+        // which Postgres rejects outright) rather than a transient blip — but
+        // a database outage behind a live Fastify ALSO 500s every chunk, and
+        // promoting on attempt count ALONE rolled the whole backlog into
+        // poison during such an outage (P5b). The two are distinguishable IN
+        // PRINCIPLE: an unstorable payload fails while OTHER chunks keep
+        // succeeding; an outage fails everything. So escalation requires BOTH
+        // the attempt threshold AND at least one other chunk having posted
+        // successfully (recordFlushSuccess, below) since THIS stall key first
+        // started failing.
+        //
+        // CURRENTLY UNREACHABLE IN PRODUCTION: the non-poison failure branch
+        // just below does `commitRemainder(...); return false`, which exits
+        // the WHOLE drain, not just this chunk. So once a chunk stalls at the
+        // head of the oldest queue file, no chunk behind it is ever attempted,
+        // the success counter can never advance past this key's frozen
+        // baseline, and `attempts >= FLUSH_MAX_STALL_ATTEMPTS && successCount
+        // > baseline` is unsatisfiable as written. (Queue files are named
+        // flush-<stamp>.jsonl and drained via a plain `.sort()`, so a newer
+        // file always sorts AFTER a stalled older one — it can't jump the
+        // queue to supply that evidence either.)
+        //
+        // What actually happens to an unstorable chunk today: every drain
+        // fails at it, the T18 alarm (flush_error hint) fires on every
+        // prompt, and capture stays wedged until pending bytes exceed
+        // PENDING_TOTAL_MAX_BYTES, at which point rotation moves that file to
+        // overflow-*.jsonl for out-of-band recovery — no data loss, but a
+        // wedge. status 0 (unreachable) and 408/429 are excluded from this
+        // branch regardless: those are the genuinely-retryable classes.
+        //
+        // Kept, not deleted: if the drain is ever changed to skip past a
+        // failing chunk instead of returning, this branch becomes correct
+        // again — deleting it now would silently discard the NUL-byte
+        // head-of-line protection that motivated it.
         if (!isPoison && res.status >= 500) {
           const state = readStallState();
-          const attempts = (state[stallKey] ?? 0) + 1;
-          state[stallKey] = attempts;
+          const successCount = state._success_count ?? 0;
+          const prior = state[stallKey];
+          // baseline = the success count as of this key's FIRST failure —
+          // fixed once set, so later evidence must arrive AFTER the stall began.
+          const baseline = prior ? prior.baseline : successCount;
+          const attempts = (prior ? prior.attempts : 0) + 1;
+          state[stallKey] = { attempts, baseline };
           writeStallState(state);
-          if (attempts >= FLUSH_MAX_STALL_ATTEMPTS) isPoison = true;
+          if (attempts >= FLUSH_MAX_STALL_ATTEMPTS && successCount > baseline) isPoison = true;
         }
 
         if (isPoison && quarantinePoisonChunk(entries.slice(consumed, consumed + chunk.length))) {
@@ -842,6 +927,9 @@ async function drainPendingFlushes(opts = {}) {
         commitRemainder(file, entries, consumed);
         return false;
       }
+      // Evidence the server IS storing data right now — also clears this
+      // chunk's own stall entry, if any. See recordFlushSuccess.
+      recordFlushSuccess(stallKey);
       sentChunks++;
       consumed += chunk.length;
       commitRemainder(file, entries, consumed);

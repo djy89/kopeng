@@ -66,6 +66,13 @@ export interface DreamEngineDeps {
     memoryStore: IMemoryStore;
     vectorIndex: IVectorSearch;
     embedText?: (text: string) => Promise<{ vector: Float32Array; model: string }>;
+    /**
+     * Team-review #22 r2 NEW-1: without this, the canonical-survivor preference
+     * (ApplyDeps.canonicalizeScope) never ran on the AUTO-APPLY path — the one
+     * unattended path where exact_dup can apply. Same wiring expression as the
+     * operator-resolve path in routes.ts.
+     */
+    canonicalizeScope?: (scope: string) => Promise<string>;
   };
 }
 
@@ -204,12 +211,15 @@ export async function runDreamPass(deps: DreamEngineDeps, opts: RunDreamOptions)
       const r = await runPipeline(deps.source, deps.selector, deps.reasoner, deps.diffGen, ctx, limits);
       await deps.dreamStore.setDreamDiff(dream.id, r.diff);
 
-      // D2.2: ingestion flags this pass examined are consumed now (inside the
+      // D2.2: ingestion flags this pass CLASSIFIED are consumed now (inside the
       // lock, after the diff is stored) — the queued entry carries the pair from
-      // here; without consumption every later pass would re-queue it. Apply-less
-      // deployments (replay, tests) have no memoryStore and skip this.
+      // here; without consumption every later pass would re-queue it. Consumption
+      // reads classifiedCandidates, NOT candidates (pre-T17 fix): a flagged pair
+      // the T6 reasonerGate dropped produced no entry, so its flag must survive
+      // for the pass whose segment classifies it. Apply-less deployments
+      // (replay, tests) have no memoryStore and skip this.
       if (deps.apply) {
-        const consumed = await consumeContradictionFlags(deps.apply.memoryStore, r.candidates);
+        const consumed = await consumeContradictionFlags(deps.apply.memoryStore, r.classifiedCandidates);
         if (consumed > 0) logger.info(`Dream ${dream.id}: consumed ${consumed} contradiction flag(s)`);
       }
 
@@ -226,7 +236,13 @@ export async function runDreamPass(deps: DreamEngineDeps, opts: RunDreamOptions)
           dream.id, entries, cfg, new Date(now()).toISOString(),
         );
         autoApplied = applyResult.applied;
-        if (autoApplied > 0) await deps.dreamStore.setDreamDiff(dream.id, { entries });
+        // Persist UNCONDITIONALLY after an apply attempt (team-review #22 A1):
+        // applyEntry mutates entries in place even when nothing fully applies —
+        // a canonical-survivor swap followed by an anchored refusal leaves
+        // autoApplied at 0 with the entry's keep/archive already swapped. Gating
+        // on autoApplied > 0 discarded that mutation, so the stored diff named
+        // the archived row as survivor (the "lying diff").
+        await deps.dreamStore.setDreamDiff(dream.id, { entries });
         acceptance = computeAcceptance(entries);
       }
 
@@ -477,8 +493,10 @@ export const WHOLE_CORPUS_SHARD_THRESHOLD = 10_000;
 /**
  * T6 whole-corpus source. `fetch()` pages `listByIdRange` over the FULL id space
  * (active only, scope-filtered) and returns everything — so a planted dup pair
- * Δ≈2000 ids apart (permanently invisible to the rotating window) is co-windowed
- * here and surfaces. The deterministic selector tiers then run over the whole set.
+ * Δ≈2000 ids apart (invisible to the rotating window's contiguous mid-corpus
+ * windows; only a wrap-seam-straddling pair could ever co-window there) is
+ * co-windowed here and surfaces. The deterministic selector tiers then run over
+ * the whole set.
  *
  * The persisted cursor (`dream_whole_corpus_cursor[scope]`) and segment dial
  * (`dream_whole_corpus_segment`, default 60) bound only the REASONER tier:

@@ -34,6 +34,11 @@ function createLifecycleStub(db: Database.Database): IDatabaseLifecycle {
  * snapshot-first (memory_revisions) and therefore reversible via the rollback
  * API — the anchor-triage safety property. The dream store must be wired for the
  * revision/rollback routes to mount.
+ *
+ * Phase 2 Task 3 extends this: EVERY effective PUT mutation (content/type/
+ * scope/metadata/tags/confidence) is snapshot-first, not only confidence. A
+ * byte-identical PUT leaves no revision. Shares this describe block's app/DB
+ * bootstrap and `createMemory` helper — single test-infra to maintain.
  */
 describe('PUT /api/memories/:id confidence (T22 anchor triage)', () => {
   let app: FastifyInstance;
@@ -75,17 +80,23 @@ describe('PUT /api/memories/:id confidence (T22 anchor triage)', () => {
     db.close();
   });
 
-  async function createMemory(confidence: number): Promise<number> {
+  async function createMemory(overrides: Partial<{ content: string; type: string; scope: string; tags: string[]; confidence: number }> = {}): Promise<number> {
     const res = await app.inject({
       method: 'POST', headers: adminHeaders(), url: '/api/memories',
-      payload: { content: `anchor-triage subject ${confidence} ${Math.random()}`, type: 'reference', scope: 'global', tags: [], confidence },
+      payload: {
+        content: overrides.content ?? `anchor-triage subject ${overrides.confidence ?? 0.9} ${Math.random()}`,
+        type: overrides.type ?? 'reference',
+        scope: overrides.scope ?? 'global',
+        tags: overrides.tags ?? [],
+        confidence: overrides.confidence ?? 0.9,
+      },
     });
     expect(res.statusCode).toBe(201);
     return JSON.parse(res.payload).data.id as number;
   }
 
   it('accepts a confidence field on PUT and applies the change', async () => {
-    const id = await createMemory(1.0);
+    const id = await createMemory({ confidence: 1.0 });
 
     const res = await app.inject({ method: 'PUT', headers: adminHeaders(), url: `/api/memories/${id}`, payload: { confidence: 0.9 } });
     expect(res.statusCode).toBe(200);
@@ -95,15 +106,15 @@ describe('PUT /api/memories/:id confidence (T22 anchor triage)', () => {
   });
 
   it('snapshots the pre-change confidence into a revision (audited)', async () => {
-    const id = await createMemory(1.0);
+    const id = await createMemory({ confidence: 1.0 });
 
     // No revisions before the change.
-    const before = await app.inject({ method: 'GET', url: `/api/memories/${id}/revisions` });
+    const before = await app.inject({ method: 'GET', headers: adminHeaders(), url: `/api/memories/${id}/revisions` });
     expect(JSON.parse(before.payload).data.length).toBe(0);
 
     await app.inject({ method: 'PUT', headers: adminHeaders(), url: `/api/memories/${id}`, payload: { confidence: 0.9 } });
 
-    const after = await app.inject({ method: 'GET', url: `/api/memories/${id}/revisions` });
+    const after = await app.inject({ method: 'GET', headers: adminHeaders(), url: `/api/memories/${id}/revisions` });
     const revs = JSON.parse(after.payload).data as Array<{ revision: number; confidence: number }>;
     expect(revs.length).toBe(1);
     // The snapshot captured the OLD confidence (pre-change).
@@ -111,47 +122,110 @@ describe('PUT /api/memories/:id confidence (T22 anchor triage)', () => {
   });
 
   it('rollback restores the pre-change confidence', async () => {
-    const id = await createMemory(1.0);
+    const id = await createMemory({ confidence: 1.0 });
     await app.inject({ method: 'PUT', headers: adminHeaders(), url: `/api/memories/${id}`, payload: { confidence: 0.4 } });
 
     // Sanity: it was actually demoted.
     let cur = await app.inject({ method: 'GET', url: `/api/memories/${id}` });
     expect(JSON.parse(cur.payload).data.confidence).toBe(0.4);
 
-    const rb = await app.inject({ method: 'POST', headers: adminHeaders(), url: `/api/memories/${id}/rollback`, headers: adminHeaders(), payload: {} });
+    const rb = await app.inject({ method: 'POST', headers: adminHeaders(), url: `/api/memories/${id}/rollback`, payload: {} });
     expect(rb.statusCode).toBe(200);
 
     cur = await app.inject({ method: 'GET', url: `/api/memories/${id}` });
     expect(JSON.parse(cur.payload).data.confidence).toBe(1.0);
   });
 
-  it('does NOT snapshot when confidence is unchanged / absent', async () => {
-    const id = await createMemory(0.9);
+  it('does NOT snapshot on an empty PUT (no fields supplied)', async () => {
+    const id = await createMemory({ confidence: 0.9 });
 
-    // Content-only update, no confidence field.
-    const res = await app.inject({ method: 'PUT', headers: adminHeaders(), url: `/api/memories/${id}`, payload: { content: 'reworded anchor-triage subject' } });
+    // No fields supplied at all, so nothing is effectively mutated (Phase 2
+    // Task 3 broadened snapshotting to any effective PUT change — a genuine
+    // content change is covered separately, below).
+    const res = await app.inject({ method: 'PUT', headers: adminHeaders(), url: `/api/memories/${id}`, payload: {} });
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.payload).meta.confidence_changed).toBe(false);
 
-    const revs = await app.inject({ method: 'GET', url: `/api/memories/${id}/revisions` });
+    const revs = await app.inject({ method: 'GET', headers: adminHeaders(), url: `/api/memories/${id}/revisions` });
     expect(JSON.parse(revs.payload).data.length).toBe(0);
   });
 
   it('does NOT snapshot when the same confidence is re-sent (no-op change)', async () => {
-    const id = await createMemory(0.9);
+    const id = await createMemory({ confidence: 0.9 });
     const res = await app.inject({ method: 'PUT', headers: adminHeaders(), url: `/api/memories/${id}`, payload: { confidence: 0.9 } });
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.payload).meta.confidence_changed).toBe(false);
 
-    const revs = await app.inject({ method: 'GET', url: `/api/memories/${id}/revisions` });
+    const revs = await app.inject({ method: 'GET', headers: adminHeaders(), url: `/api/memories/${id}/revisions` });
     expect(JSON.parse(revs.payload).data.length).toBe(0);
   });
 
   it('rejects an out-of-bounds confidence (400)', async () => {
-    const id = await createMemory(0.9);
+    const id = await createMemory({ confidence: 0.9 });
     const high = await app.inject({ method: 'PUT', headers: adminHeaders(), url: `/api/memories/${id}`, payload: { confidence: 1.5 } });
     expect(high.statusCode).toBe(400);
     const low = await app.inject({ method: 'PUT', headers: adminHeaders(), url: `/api/memories/${id}`, payload: { confidence: -0.1 } });
     expect(low.statusCode).toBe(400);
+  });
+
+  it('PUT that changes scope snapshots first, and rollback restores the prior scope', async () => {
+    const id = await createMemory({ scope: 'global' });
+    const before = await dreamStore.listRevisions(id);
+
+    const res = await app.inject({
+      method: 'PUT', url: `/api/memories/${id}`, headers: adminHeaders(),
+      payload: { scope: 'client:acme-foods' },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const after = await dreamStore.listRevisions(id);
+    expect(after.length).toBe(before.length + 1);
+
+    const rb = await app.inject({ method: 'POST', url: `/api/memories/${id}/rollback`, headers: adminHeaders(), payload: {} });
+    expect(rb.statusCode).toBe(200);
+    const mem = await queries.get(id);
+    expect(mem?.scope).toBe('global'); // the pre-PUT scope
+  });
+
+  it('PUT that changes content snapshots first', async () => {
+    const id = await createMemory({ content: 'original phase2-t3 content' });
+    const before = await dreamStore.listRevisions(id);
+
+    const res = await app.inject({
+      method: 'PUT', url: `/api/memories/${id}`, headers: adminHeaders(),
+      payload: { content: 'changed phase2-t3 content' },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const after = await dreamStore.listRevisions(id);
+    expect(after.length).toBe(before.length + 1);
+  });
+
+  it('PUT that changes only tags snapshots first', async () => {
+    const id = await createMemory({ tags: ['old-tag'] });
+    const before = await dreamStore.listRevisions(id);
+
+    const res = await app.inject({
+      method: 'PUT', url: `/api/memories/${id}`, headers: adminHeaders(),
+      payload: { tags: ['new-tag'] },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const after = await dreamStore.listRevisions(id);
+    expect(after.length).toBe(before.length + 1);
+  });
+
+  it('a byte-identical PUT does not snapshot', async () => {
+    const id = await createMemory({ content: 'stable phase2-t3 content', type: 'reference', scope: 'global', tags: ['stable-tag'] });
+    const before = await dreamStore.listRevisions(id);
+
+    const res = await app.inject({
+      method: 'PUT', url: `/api/memories/${id}`, headers: adminHeaders(),
+      payload: { content: 'stable phase2-t3 content', type: 'reference', scope: 'global', tags: ['stable-tag'] },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const after = await dreamStore.listRevisions(id);
+    expect(after.length).toBe(before.length);
   });
 });

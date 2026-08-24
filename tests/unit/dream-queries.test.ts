@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import type Database from 'better-sqlite3';
 import { createTestDatabase, createTestMemory } from '../fixtures/test-helpers.js';
 import { DreamQueries } from '../../src/database/dream-queries.js';
+import { REVISION_KEEP_PER_MEMORY } from '../../src/types/types.js';
 import { MemoryQueries } from '../../src/database/queries.js';
 
 /**
@@ -152,6 +153,44 @@ describe('DreamQueries (D0.2, SQLite)', () => {
       const id = await newMemory('x');
       expect(await dreams.restoreRevision(id, 99)).toBe(false);
     });
+
+    it('snapshots scope, type, updated_at and last_seen (Phase 2)', async () => {
+      const { id } = await queries.store(createTestMemory({
+        content: 'phase-2 snapshot fields', scope: 'client:acme-foods', type: 'project',
+      }));
+      db.prepare(`UPDATE memories SET last_seen = '2026-01-01 00:00:00', updated_at = '2026-01-02 00:00:00' WHERE id = ?`).run(id);
+      const snap = await dreams.snapshotRevision(id);
+      const rev = await dreams.getRevision(id, snap.revision);
+      expect(rev?.scope).toBe('client:acme-foods');
+      expect(rev?.type).toBe('project');
+      expect(rev?.last_seen).toBe('2026-01-01 00:00:00');
+      expect(rev?.updated_at).toBe('2026-01-02 00:00:00');
+    });
+
+    it('restore returns a scope/type change to the snapshotted values', async () => {
+      const { id } = await queries.store(createTestMemory({
+        content: 'scope round trip', scope: 'project:web', type: 'discovery',
+      }));
+      const snap = await dreams.snapshotRevision(id);
+      await queries.update(id, { content: 'scope round trip', type: 'reference', scope: 'client:acme-foods', metadata: '{}', tags: [] });
+      expect(await dreams.restoreRevision(id, snap.revision)).toBe(true);
+      const mem = await queries.get(id);
+      expect(mem?.scope).toBe('project:web');
+      expect(mem?.type).toBe('discovery');
+    });
+
+    it('a legacy (pre-v8, NULL-column) revision restores without clobbering live scope/type/last_seen', async () => {
+      const { id } = await queries.store(createTestMemory({
+        content: 'legacy revision', scope: 'client:acme-foods', type: 'project',
+      }));
+      const snap = await dreams.snapshotRevision(id);
+      db.prepare(`UPDATE memory_revisions SET scope = NULL, type = NULL, updated_at = NULL, last_seen = NULL WHERE memory_id = ?`).run(id);
+      await dreams.restoreRevision(id, snap.revision);
+      const mem = await queries.get(id);
+      expect(mem?.scope).toBe('client:acme-foods');
+      expect(mem?.type).toBe('project');
+      expect(mem?.last_seen).not.toBeNull();
+    });
   });
 
   describe('audit', () => {
@@ -204,5 +243,63 @@ describe('DreamQueries (D0.2, SQLite)', () => {
       expect(updated.idle_minutes).toBe(30);
       expect(updated.dream_cadence).toBe('daily');
     });
+  });
+});
+
+// Team-review #22 S1/P2: revision retention + purge + the non-reinforcing read.
+describe('revision retention, purge, and peek (team-review #22)', () => {
+  let db: Database.Database;
+  let queries: MemoryQueries;
+  let dreams: DreamQueries;
+
+  beforeEach(() => {
+    const t = createTestDatabase();
+    db = t.db;
+    queries = t.queries;
+    dreams = new DreamQueries(db);
+  });
+
+  it('snapshotRevision trims operator-edit (NULL-dream) revisions to the newest REVISION_KEEP_PER_MEMORY, never dream-linked ones', async () => {
+    const { id } = await queries.store(createTestMemory({ content: 'retention target' }));
+    const dream = await dreams.createDream({});
+    // Two dream-linked snapshots first — these must survive any trim.
+    await dreams.snapshotRevision(id, dream.id);
+    await dreams.snapshotRevision(id, dream.id);
+    // Then far more operator-edit snapshots than the retention bound.
+    for (let i = 0; i < REVISION_KEEP_PER_MEMORY + 7; i++) {
+      await dreams.snapshotRevision(id);
+    }
+    const revs = await dreams.listRevisions(id);
+    const nullLinked = revs.filter(r => r.created_by_dream_id === null);
+    const dreamLinked = revs.filter(r => r.created_by_dream_id === dream.id);
+    expect(nullLinked).toHaveLength(REVISION_KEEP_PER_MEMORY);
+    expect(dreamLinked).toHaveLength(2);
+    // The SURVIVING null-linked revisions are the newest ones.
+    const nullRevNums = nullLinked.map(r => r.revision).sort((a, b) => a - b);
+    expect(nullRevNums[0]).toBe(2 + 7 + 1); // oldest survivor = total(2+27) - 20 + 1
+  });
+
+  it('deleteRevision removes exactly one revision; deleteRevisions purges the memory\'s history', async () => {
+    const { id } = await queries.store(createTestMemory({ content: 'purge target' }));
+    await dreams.snapshotRevision(id);
+    await dreams.snapshotRevision(id);
+    expect(await dreams.deleteRevision(id, 1)).toBe(true);
+    expect(await dreams.deleteRevision(id, 1)).toBe(false); // already gone
+    expect(await dreams.listRevisions(id)).toHaveLength(1);
+    expect(await dreams.deleteRevisions(id)).toBe(1);
+    expect(await dreams.listRevisions(id)).toHaveLength(0);
+  });
+
+  it('peek reads a memory WITHOUT writing an access-log row (get does)', async () => {
+    const { id } = await queries.store(createTestMemory({ content: 'quiet read', tags: ['t1'] }));
+    const logCount = () =>
+      (db.prepare(`SELECT COUNT(*) AS c FROM memory_access_log WHERE memory_id = ?`).get(id) as { c: number }).c;
+    const base = logCount();
+    const peeked = await queries.peek(id);
+    expect(peeked?.content).toBe('quiet read');
+    expect(peeked?.tags).toContain('t1');
+    expect(logCount()).toBe(base);
+    await queries.get(id);
+    expect(logCount()).toBe(base + 1);
   });
 });

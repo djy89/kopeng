@@ -47,6 +47,14 @@ export interface SeedMemory {
   embedding: Float32Array;
   last_seen?: string;
   updated_at?: string;
+  /**
+   * Memory type the row is stored as. Defaults to 'reference'. The decayed
+   * fixtures MUST override this: `reference` carries the T30 structural decay
+   * floor (0.4), which keeps effective strength above the 0.2 archive line
+   * forever — a `reference`-typed decay fixture makes the decay lane inert
+   * and the harness unable to fail on a decay regression.
+   */
+  type?: 'reference' | 'project';
   /** Documentation only — which planted role this row plays. */
   role: 'anchor' | 'exact_dup' | 'paraphrase' | 'decayed' | 'distractor';
 }
@@ -68,7 +76,7 @@ function mem(
   content: string,
   embedding: Float32Array,
   role: SeedMemory['role'],
-  opts: Partial<Pick<SeedMemory, 'scope' | 'confidence' | 'last_seen' | 'updated_at'>> = {},
+  opts: Partial<Pick<SeedMemory, 'scope' | 'confidence' | 'last_seen' | 'updated_at' | 'type'>> = {},
 ): SeedMemory {
   return {
     key,
@@ -79,8 +87,20 @@ function mem(
     confidence: opts.confidence ?? 0.7,
     last_seen: opts.last_seen,
     updated_at: opts.updated_at,
+    type: opts.type,
   };
 }
+
+/**
+ * Deterministic keep-target clocks. `pickKeepTarget` breaks a confidence tie
+ * on `last_seen ?? updated_at` and only then falls to lowest-id; without
+ * explicit stamps every row gets `datetime('now')` at seed time, so a seeding
+ * loop that crosses a SECOND boundary hands the win to a dup copy — archiving
+ * the gold anchor and flipping `retrieval held` on wall-clock luck. Anchors
+ * are stamped strictly newer than their dup copies so the anchor always wins.
+ */
+const ANCHOR_STAMP = '2026-06-10T12:00:00Z';
+const DUP_STAMP = '2026-06-01T12:00:00Z';
 
 /**
  * The corpus. Topics 0–5 are answerable; each has an anchor and (for some) exact
@@ -88,13 +108,25 @@ function mem(
  */
 export const EFFECTIVENESS_CORPUS: SeedMemory[] = [
   // Topic 0 — deploy command. Anchor + 2 exact dups (case/whitespace variants).
-  mem('deploy', 'Deploy the service with `npm run deploy` from the repo root.', basis(0), 'anchor'),
-  mem('deploy-dup1', 'Deploy the service with `npm run deploy`  from the repo root.', basis(0), 'exact_dup'),
-  mem('deploy-dup2', 'DEPLOY THE SERVICE WITH `NPM RUN DEPLOY` FROM THE REPO ROOT.', basis(0), 'exact_dup'),
+  // A dup is deliberately seeded BEFORE its anchor: pickKeepTarget's final
+  // tiebreak is lowest-id, so anchors-first would let the id tiebreak alone
+  // keep the anchor and silently mask a lost ANCHOR_STAMP — the stamps must be
+  // the load-bearing reason the anchor survives.
+  mem('deploy-dup1', 'Deploy the service with `npm run deploy`  from the repo root.', basis(0), 'exact_dup',
+    { updated_at: DUP_STAMP, last_seen: DUP_STAMP }),
+  mem('deploy', 'Deploy the service with `npm run deploy` from the repo root.', basis(0), 'anchor',
+    { updated_at: ANCHOR_STAMP, last_seen: ANCHOR_STAMP }),
+  mem('deploy-dup2', 'DEPLOY THE SERVICE WITH `NPM RUN DEPLOY` FROM THE REPO ROOT.', basis(0), 'exact_dup',
+    { updated_at: DUP_STAMP, last_seen: DUP_STAMP }),
 
-  // Topic 1 — test timeout. Anchor + 1 exact dup.
-  mem('timeout', 'The test suite timeout is 30 seconds to allow for model loading.', basis(1), 'anchor'),
-  mem('timeout-dup1', 'The test suite timeout is 30 seconds to allow for model loading. ', basis(1), 'exact_dup'),
+  // Topic 1 — test timeout. Dup seeded before the anchor (same reason). The dup
+  // varies INTERNALLY (interior double space): store() hashes content.trim(), so
+  // a trailing-space variant would dedup into the anchor at seed time and plant
+  // nothing.
+  mem('timeout-dup1', 'The test suite  timeout is 30 seconds to allow for model loading.', basis(1), 'exact_dup',
+    { updated_at: DUP_STAMP, last_seen: DUP_STAMP }),
+  mem('timeout', 'The test suite timeout is 30 seconds to allow for model loading.', basis(1), 'anchor',
+    { updated_at: ANCHOR_STAMP, last_seen: ANCHOR_STAMP }),
 
   // Topic 2 — embedding model. Anchor + a paraphrase at cosine 0.98 (semantic dup).
   mem('embed', 'Embeddings use all-MiniLM-L6-v2, a 384-dimensional model.', basis(2), 'anchor'),
@@ -117,10 +149,12 @@ export const EFFECTIVENESS_CORPUS: SeedMemory[] = [
 
   // Decayed — confidence 0.45, unseen ~5 months → effective strength < 0.2.
   // Off-topic for every gold query, so dreaming archiving them is pure cleanup.
+  // Type 'project' (NOT the default 'reference') — see the SeedMemory.type note:
+  // the reference structural floor would keep these above the archive line forever.
   mem('stale1', 'Workaround for the legacy importer crash: rerun with --skip-validation.', basis(20),
-    'decayed', { confidence: 0.45, last_seen: '2026-01-05T12:00:00Z', updated_at: '2026-01-05T12:00:00Z' }),
+    'decayed', { confidence: 0.45, last_seen: '2026-01-05T12:00:00Z', updated_at: '2026-01-05T12:00:00Z', type: 'project' }),
   mem('stale2', 'Old build flag --legacy-bundler is no longer needed after the toolchain upgrade.', basis(21),
-    'decayed', { confidence: 0.4, last_seen: '2026-01-02T12:00:00Z', updated_at: '2026-01-02T12:00:00Z' }),
+    'decayed', { confidence: 0.4, last_seen: '2026-01-02T12:00:00Z', updated_at: '2026-01-02T12:00:00Z', type: 'project' }),
 ];
 
 /**

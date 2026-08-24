@@ -25,24 +25,72 @@ npm run build
 
 ---
 
-## 2. Configure
+## 2. Configure & First Run
 
-Create `.env` in repo root:
+The fresh path is: clone → `npm install` → `npm run build` (§1) → optionally
+set `PRIMARY_SCOPE` → start → `npm run canary`. Continuing from §1, you may
+first create a plain UTF-8 `.env` in the repo root containing the one
+recommended day-one value: `PRIMARY_SCOPE=project:my-project`.
+
+**Terminal 1 — start the server and leave this terminal running:**
+
+```bash
+npm start          # or install as a service first (§3 / §3b)
+```
+
+**Terminal 2 — open a second terminal in the same repo directory:**
+
+```bash
+npm run canary     # first-run proof: store → embed → semantic recall
+```
+
+There is no required `.env` editing step: the server boots with working defaults
+(loopback bind, SQLite at `./data/memory.db`), and `npm run canary` (see
+[Verification](#verification)) tells you in plain language whether the install works.
+The full variable reference is `.env.example` — its quick-start half is the part
+that matters; its advanced half is not part of the preview path.
+
+**Admin key — auto-generated, don't set it by hand.** On first run the server
+generates `ADMIN_API_KEY` and writes it into this repo's `.env` (a log line
+announces the generation; the key value itself is not printed to the log). If
+`.env` isn't writable, the server
+refuses to boot with instructions rather than running keyless. Precedence: a
+non-empty launch-environment value wins, else a non-empty `.env` value, else
+one is generated. The key gates every **operator-mutating** endpoint: memory
+create/update/archive and batch, slots, Redis context, MinIO artifacts, graph
+writes, operator-config PATCH, dream trigger/resolve, memory rollback, and
+admin promote/reindex/backup/discover/discovery-maintain. Reads stay public —
+including the POST-shaped ones (`/api/memories/recall`, `/search`, `/surface`,
+`/traverse`) that the recall hooks call on every prompt.
+
+Clients need no per-client plumbing: the MCP server and the repo's ops scripts
+read `ADMIN_API_KEY` from this repo's `.env` (or the environment) and send it
+themselves, so the MCP write tools (`store_memory`, `update_memory`,
+`archive_memory`, `set_context`, `store_artifact`, `trigger_discovery`) just
+work. The viz proxy injects it server-side, so the browser never holds it.
+
+**`PRIMARY_SCOPE`** names your primary working scope (`project:<name>` or `client:<name>`). A write
+that arrives with no scope — and any write whose scope string is malformed — lands there instead of
+silently defaulting to `global` (global only ever holds what you *explicitly* put in it). Leave it
+unset and those writes land in the reserved triage scope `project:_unrouted` instead — never lost,
+never `global`, visible via `GET /api/ops/scope-registry`, and routable later by operator ruling.
+Either way the write response's `meta` announces the routing, and a malformed scope's raw string is
+preserved in `metadata.raw_scope`. Hot-editable later without a restart via the
+`operator_config.primary_scope` column (`PATCH /api/operator-config {"primary_scope": ...}`, `null`
+clears), which takes precedence over the env value.
+
+### Advanced: passive learning
+
+The auto-discovery pipeline (KOPENG learning from your tool use) is OFF by
+default and not part of the preview path. The observation hooks in §4 are
+inert without these two flags in the server `.env`:
 
 ```
-PORT=3200
-HOST=127.0.0.1
-DATABASE_PATH=./data/memory.db
-EMBEDDING_MODEL=Xenova/all-MiniLM-L6-v2
-LOG_LEVEL=info
-MEMORY_API_URL=http://localhost:3200
-
-# Passive learning (the observation hooks in §4 are inert without these):
 OBSERVATION_INGESTION_ENABLED=true     # accept + store tool-use observations
 DISCOVERY_DETECTION_ENABLED=true       # turn stored observations into discovered memories
 ```
 
-**Optional — observation write auth.** If other machines can reach the server, generate a shared secret:
+**Observation write auth.** If other machines can reach the server, generate a shared secret:
 
 ```powershell
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
@@ -54,16 +102,22 @@ The same value goes in two places under two names:
 
 > **Naming note:** everything here uses the `kopeng` names — `KOPENG_*` env vars, the `kopeng-observe.js` hook script, the `~/.kopeng/` client-side data directory.
 
-If you skip this, observation writes are open — acceptable only when the server is loopback-only (the default `HOST=127.0.0.1`).
+If you skip this, observation writes are open — acceptable only when the server is loopback-only (the default `HOST=127.0.0.1`). This key is deliberately **separate** from `ADMIN_API_KEY`: it is distributed to hook clients on other machines and must not carry admin power.
 
-**Optional — admin endpoint auth.** Every **operator-mutating** endpoint honors a **separate** admin key: memory create/update/archive and batch, slots, Redis context, MinIO artifacts, graph writes, operator-config PATCH, dream trigger/resolve, memory rollback, and admin promote/reindex/backup/discover/discovery-maintain. The observation **ingestion** writes (`POST /api/observations`, `/batch`, completion PATCH) are protected by `OBSERVATION_API_KEY` above, not by the admin key — set **both** before widening the bind address.
+### Remote access
 
-- Server side: `ADMIN_API_KEY=<value>` in this repo's `.env`. When set, those endpoints require `X-API-Key: <value>`. Reads stay public — including the POST-shaped ones (`/api/memories/recall`, `/search`, `/surface`, `/traverse`) that the recall hooks call on every prompt. Unset = open (dev mode). Keep it distinct from `OBSERVATION_API_KEY` — that key is distributed to hook clients on other machines and must not carry admin power.
-- Client side: the MCP server and the repo's ops scripts read `ADMIN_API_KEY` from this repo's `.env` (or the environment) and send it themselves, so the MCP write tools (`store_memory`, `update_memory`, `archive_memory`, `set_context`, `store_artifact`, `trigger_discovery`) need no per-client plumbing. The viz proxy injects it server-side, so the browser never holds it.
+**Remote deployment is unsupported for the 0.x preview.** `HOST=127.0.0.1`
+(default) binds loopback only, and the server **refuses to boot** on a
+non-loopback `HOST` unless BOTH `ADMIN_API_KEY` and `OBSERVATION_API_KEY` are
+set — the refusal message names the missing key(s) and points at
+[SECURITY.md](SECURITY.md). ("Loopback" = `localhost`, `::1`, or a real IPv4
+`127.*` address — a hostname like `127.evil.test` does not qualify.)
 
-**Remote access.** `HOST=127.0.0.1` (default) binds loopback only. To reach the server from other machines — e.g. over a private VPN — set `HOST=0.0.0.0` and set **both** keys above first.
-
-> Setting the keys is necessary but **not sufficient**. Every gate is optional and defaults to open, ops/read endpoints are public by design, and the scrubber is defense-in-depth rather than a boundary. Treat a non-loopback bind as requiring an outer boundary — a VPN or an authenticating reverse proxy. See [SECURITY.md](SECURITY.md) for the full threat model.
+If you widen the bind anyway (e.g. over a private VPN), understand that the
+keys are necessary but **not sufficient**: ops/read endpoints are public by
+design, and the scrubber is defense-in-depth rather than a boundary. Treat a
+non-loopback bind as requiring an outer boundary — a VPN or an authenticating
+reverse proxy. See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ---
 
@@ -214,7 +268,11 @@ Nothing to copy: every hook runs straight from `scripts/hooks/` in the repo. Jus
 
 **Why Node and not bash:** the recall hooks were originally bash scripts that shelled out to `jq` and `curl`. On 2026-06-02 `jq` vanished from the PATH and every recall hook silently bailed at its first line — memory recall went **completely OFF with no error**, while writes kept working (so nothing looked broken). The Node rewrite removes all external CLI dependencies: JSON via `JSON.parse`/`JSON.stringify`, HTTP via global `fetch`, git via `child_process` (its absence only drops git context, never disables a hook). Node is the same runtime that already runs the server and the observe hook — there is nothing ambient left to go missing.
 
-### 4e. Verify the hooks work
+### 4e. Verify the hooks work (client-wiring check)
+
+This is the **client-wiring check** — `npm run canary` (see
+[Verification](#verification)) proves the server-side path but does **not**
+test your `~/.claude/settings.json` wiring; this section does.
 
 From the repo root, simulate what Claude Code pipes to each hook on stdin:
 
@@ -286,13 +344,12 @@ sudo ufw allow in on wg0 to any port 3200 proto tcp
 
 ## 6b. Reserve Docker Ports from WinNAT (Windows — required if you run any Docker-backed optional service)
 
-On every reboot, Windows' NAT driver (winnat, used by Hyper-V/WSL2) reserves a fresh set of *random* port ranges. If a range lands on a port one of the KOPENG Docker containers publishes, that container comes up "healthy" but its host port silently never binds — the service degrades with no error anywhere except an `ECONNREFUSED` in KOPENG's own logs. This is not theoretical: a reboot can land a reserved range on 6379 and silently kill the Redis cache layer. If it lands on the Postgres port, **KOPENG is fully down** (the server now waits in a connection-retry loop until the port is freed, but it will wait forever).
+On every reboot, Windows' NAT driver (winnat, used by Hyper-V/WSL2) reserves a fresh set of *random* port ranges. If a range lands on a port one of the KOPENG Docker containers publishes, that container comes up "healthy" but its host port silently never binds — the service degrades with no error anywhere except an `ECONNREFUSED` in KOPENG's own logs. This is not theoretical: a reboot can land a reserved range on 6379 and silently kill the Redis cache layer. (Maintainer-only Postgres backend: the same failure mode takes KOPENG fully down — its port-reservation row lives in [docs/postgres-maintainer.md](./docs/postgres-maintainer.md).)
 
 Fix: permanently reserve every published port as an "administered exclusion" so winnat can never grab it. One-time, survives reboots. Run as admin (reservations can only be added while winnat is stopped):
 
 ```powershell
 net stop winnat
-netsh int ipv4 add excludedportrange protocol=tcp startport=5432 numberofports=1   # Postgres (POSTGRES_HOST_PORT)
 netsh int ipv4 add excludedportrange protocol=tcp startport=6379 numberofports=1   # Redis
 netsh int ipv4 add excludedportrange protocol=tcp startport=7474 numberofports=1   # Neo4j browser
 netsh int ipv4 add excludedportrange protocol=tcp startport=7687 numberofports=1   # Neo4j bolt
@@ -300,7 +357,7 @@ netsh int ipv4 add excludedportrange protocol=tcp startport=9000 numberofports=2
 net start winnat
 ```
 
-Adjust the Postgres line if `POSTGRES_HOST_PORT` differs (default 5432, matching `.env.example` and the Compose file). Reserve the ports for the services you run; reserving the full set costs nothing and saves the port if a service is added later. SQLite-only installs with no Docker services can skip this section entirely.
+Reserve the ports for the services you run; reserving the full set costs nothing and saves the port if a service is added later. SQLite-only installs with no Docker services can skip this section entirely.
 
 **Ordering matters:** run this BEFORE starting the Docker containers. A reservation fails with `The process cannot access the file because it is being used by another process` if anything is currently bound to the port — on an already-running install, `docker stop` the containers first, add the reservations, then `docker start` them and restart the kopeng service.
 
@@ -326,27 +383,11 @@ KOPENG supports three optional services, each behind a feature flag in `.env`. A
 
 Each standup doc contains the full operator sequence: generate credentials, update `.env`, start the Docker container, create any required resources, restart KOPENG, and verify.
 
-Docker Compose files for each service are in the repo root (`docker-compose.neo4j.yml`, `docker-compose.minio.yml`, `docker-compose.redis.yml`, `docker-compose.postgres.yml`). All bind to `127.0.0.1` on the host — not exposed over the network.
+Docker Compose files for each service are in the repo root (`docker-compose.neo4j.yml`, `docker-compose.minio.yml`, `docker-compose.redis.yml`). All bind to `127.0.0.1` on the host — not exposed over the network.
 
-### PostgreSQL (alternative backend, not an add-on layer)
+### PostgreSQL
 
-Postgres replaces SQLite rather than adding a layer, so it has no `*_ENABLED` flag and no standup doc — it's selected with `DATABASE_TYPE=postgres`. Compose reads two variables that the other services don't:
-
-```bash
-# .env
-DATABASE_TYPE=postgres
-POSTGRES_PASSWORD=<choose one>            # REQUIRED — Compose fails fast if unset (the container will not initialize without it)
-POSTGRES_HOST_PORT=5432                   # optional; host side only, override if 5432 is taken by a native install
-POSTGRES_URL=postgresql://kopeng:<same password>@localhost:5432/kopeng
-```
-
-```bash
-docker compose -f docker-compose.postgres.yml up -d
-npm start                                  # migrations run on boot
-curl http://localhost:3200/api/stats       # confirm it came up on the new backend
-```
-
-The container, database, user, and volume are named `kopeng*`. To migrate an existing SQLite corpus across, see `npm run migrate:postgres`.
+The alternative Postgres backend is supported for the maintainer only and is not part of the 0.x preview path — see [docs/postgres-maintainer.md](./docs/postgres-maintainer.md).
 
 ---
 
@@ -403,7 +444,11 @@ curl -X PUT http://localhost:3200/api/memories/<id> -H "Content-Type: applicatio
 
 ### Verification after adding a staple
 
-Run a diluted prompt containing the trigger term through the recall hook and check the output:
+The staple-injection mechanism itself is covered by an automated test
+(`tests/unit/staple-injection.test.ts`), so this recipe is a verification aid
+for *your* staple — its trigger terms and metadata — not the only coverage of
+the path. Run a diluted prompt containing the trigger term through the recall
+hook and check the output:
 ```bash
 echo '{"user_prompt":"web gui based on acme UI for the vst project","cwd":"'$PWD'"}' \
   | node scripts/hooks/memory-prompt-search.mjs
@@ -423,12 +468,65 @@ The staple memory must appear with `score: 0.99`.
 
 ## Verification
 
+**`npm run canary`** is the one-command install proof. It stores a canary
+memory carrying a fresh random token, then spawns the **real** recall hook
+(`scripts/hooks/memory-prompt-search.mjs`) and asserts the token comes back —
+so a pass exercises store → embed → **semantic** recall end to end. The canary
+prompt deliberately shares no content words with the stored memory, so a
+keyword (FTS) match cannot rescue a dead vector path. On failure it prints a
+plain-language diagnosis and splits the fault: a direct REST probe that
+returns the token means the semantic path is fine and the problem is hook-side
+(node on PATH, paths in your config); an empty probe points at the
+embedder/index. The canary archives its own rows on every run, pass or fail —
+a few archived `canary`-tagged rows accumulating over time are expected
+residue. One rare honest limit: on a large, mature corpus the canary row can
+be crowded out of the probe's top-5 results by higher-scoring memories, so a
+failure there can misreport a healthy install — re-run, or verify via the
+§4e REST check.
+
+What the canary does **not** test: your Claude Code client wiring — the
+`~/.claude/settings.json` hook paths and MCP registration. That's [§4e](#4e-verify-the-hooks-work-client-wiring-check).
+
+Quick liveness checks, any time:
+
 ```bash
-curl http://localhost:3200/api/health        # service up
+curl http://localhost:3200/api/health        # service up (+ embedding-index status)
 curl http://localhost:3200/api/stats         # DB initialized
 ```
 
 In Claude Code: confirm `mcp__kopeng__*` tools appear in the toolset and recall fires on session start (visible in conversation context).
+
+---
+
+## Backup & Restore
+
+**`npm run backup`** snapshots the SQLite databases — `memory.db` and, when
+present, `observations.db` — into `BACKUP_PATH` (default `./data/backups`).
+Each output file is written to a `.tmp` sibling, integrity-checked, then
+renamed into place, and every backup writes a `backup-<stamp>.manifest.json`
+recording each backup DB's SHA-256 plus active/archived row counts, max id,
+newest-row content hash, and the `PRAGMA integrity_check` result. The two
+databases are snapshotted
+**sequentially**, not in one transaction — run the backup with the server
+stopped to get a mutually-consistent pair.
+
+**Restore procedure:**
+
+1. Stop the service (`nssm stop kopeng` / `sudo systemctl stop kopeng`).
+2. Move aside the destination `.db` **and its `-wal`/`-shm` siblings as a
+   unit** — a stale WAL pair left beside a restored database file belongs to
+   the old database and must not be replayed into the new one.
+3. Copy the backup files into place under the live names.
+4. While the service is still stopped, run
+   `npm run restore:verify -- --manifest <path>` — checks that each restored DB's
+   SHA-256 exactly matches the backed-up snapshot, then checks its corpus stats
+   and integrity. A running service may legitimately change SQLite bytes and
+   invalidate this exact proof.
+5. Start the service.
+6. `npm run canary` — end-to-end recall proof over the restored corpus.
+
+Maintainer-only Postgres backend: `npm run backup` exits with an error under
+`DATABASE_TYPE=postgres` — see [docs/postgres-maintainer.md](./docs/postgres-maintainer.md).
 
 ---
 
@@ -444,7 +542,7 @@ First stop: `curl http://localhost:3200/api/health` — it reports embedding-ind
 
 **MCP tools don't appear in Claude Code.** Almost always the stdio registration path: `args` must be an **absolute path** to `dist/index.js` (forward slashes on Windows), and `dist/` must exist (`npm run build`). Restart Claude Code after editing `~/.claude.json`. Test the server directly: `curl http://localhost:3200/api/health` — the MCP process is a thin client; if the REST API is down, every tool call fails.
 
-**Hooks are silent (no recall, no observations).** Work through [§4e](#4e-verify-the-hooks-work): pipe a fake prompt into the hook script directly. If the script works standalone but not in Claude Code, check that `node` is on the PATH Claude Code spawns hooks with and that the `<REPO>` absolute paths in `settings.json` are correct. Hooks are deliberately fail-open — they exit 0 and print nothing rather than break your session, so a misconfigured path *looks* like silence, not an error.
+**Hooks are silent (no recall, no observations).** Work through [§4e](#4e-verify-the-hooks-work-client-wiring-check): pipe a fake prompt into the hook script directly. If the script works standalone but not in Claude Code, check that `node` is on the PATH Claude Code spawns hooks with and that the `<REPO>` absolute paths in `settings.json` are correct. Hooks are deliberately fail-open — they exit 0 and print nothing rather than break your session, so a misconfigured path *looks* like silence, not an error.
 
 **Observation POSTs return 401/403.** `OBSERVATION_API_KEY` (server `.env`) and `KOPENG_API_KEY` (hook env in `~/.claude/settings.json`) must hold the same value — see §2. The hook buffers failed batches locally and retries, so nothing is lost while you fix the key.
 
@@ -452,7 +550,19 @@ First stop: `curl http://localhost:3200/api/health` — it reports embedding-ind
 
 **Docker optional services "up" but unreachable (Windows).** If a container shows `Up` but its port never binds (`docker port <name>` prints nothing, recreate fails with "socket access forbidden"), Windows' NAT driver reserved the port — see [§6b](#6b-reserve-docker-ports-from-winnat-windows--required).
 
-**Search returns nothing on a fresh install.** Not a bug — the store is empty until the hooks capture something (requires `OBSERVATION_INGESTION_ENABLED=true` + `DISCOVERY_DETECTION_ENABLED=true` in the server `.env`, see §2) or you store a memory. Quick self-test:
+**Stale client-side hint/cache files.** `npm run clean:client` removes expired hint and cache files under `~/.kopeng` (allowlisted paths only).
+
+**Scheduled tasks silently stopped running.** The sync-indexes / corpus-health
+installers (`scripts/ops/install-*-task.ps1`) maintain a durable expected-task
+registry under `~/.kopeng/metrics/`. `npm run heartbeats` reads that registry
+plus the per-run heartbeat log and exits non-zero when an installed task is
+missing, stale, or failing. An installed task is MISSING even before its first
+run, so deleting or disabling it cannot look like a fresh install. Explicit
+`-Uninstall` removes its registry entry; a machine where no task was installed
+has no expectations and reads clean. `--expect <task>:<hours>` bypasses the
+registry for one-off checks.
+
+**Search returns nothing on a fresh install.** Not a bug — the store is empty until you store a memory, or until the hooks capture something (requires `OBSERVATION_INGESTION_ENABLED=true` + `DISCOVERY_DETECTION_ENABLED=true` in the server `.env` — see §2 "Advanced: passive learning"). Quick self-test:
 
 ```bash
 curl -s -X POST http://localhost:3200/api/memories -H "Content-Type: application/json" \

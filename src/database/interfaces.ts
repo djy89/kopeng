@@ -1,5 +1,8 @@
-import type { Memory, MemoryType, Observation, ObservationInput, ObservationComplete, DiscoveryRun, ObservationStats, PromotionRun, ConfidenceTierCount, TopDecayingMemory, CorpusHealthStats, CorpusHealthSampleRow, SessionSummary, Dream, DreamDiff, MemoryRevision, DreamAuditEntry, OperatorConfig, DreamMode, DreamTrigger, ConsolidationLock } from '../types/types.js';
+import type { Memory, MemoryType, Observation, ObservationInput, ObservationComplete, DiscoveryRun, ObservationStats, PromotionRun, ConfidenceTierCount, TopDecayingMemory, CorpusHealthStats, CorpusHealthSampleRow, ScopeAggregateRow, SessionSummary, Dream, DreamDiff, MemoryRevision, DreamAuditEntry, OperatorConfig, DreamMode, DreamTrigger, ConsolidationLock } from '../types/types.js';
 import type { VectorSearchResult } from '../embeddings/index.js';
+import type { ScopeRegistryRow, RegisterRequest, ScopeRegistryStatus } from '../scopes/minting.js';
+
+export type { ScopeRegistryRow } from '../scopes/minting.js';
 
 /**
  * Abstract interface for memory storage operations.
@@ -40,6 +43,15 @@ export interface IMemoryStore {
   }[]): Promise<{ ids: number[]; duplicates: number }>;
 
   get(id: number): Promise<(Memory & { tags: string[] }) | null>;
+
+  /**
+   * Read WITHOUT touching the access log (team-review #22 P2). `get()` is a
+   * surfacing point — it reinforces the decay clock's frequency term. Apply-time
+   * revalidation and audit internals inspect members without the operator ever
+   * seeing them, so they must use this instead ("member reads are deliberately
+   * not reinforcement points", diff-review doctrine).
+   */
+  peek(id: number): Promise<(Memory & { tags: string[] }) | null>;
 
   update(id: number, input: {
     content: string;
@@ -108,6 +120,14 @@ export interface IMemoryStore {
   reinforceOnAccess(ids: number[]): Promise<void>;
 
   /**
+   * S7 retention: delete memory_access_log rows older than `days` (backend-native
+   * cutoff — never a JS ISO string, CX-7). Returns rows deleted; `days <= 0`
+   * means keep forever (no DELETE executed). Reporting-only blast radius: the
+   * archive line (`isDecayedAtRisk`) reads no access-log rows (CX-14).
+   */
+  trimAccessLog(days: number): Promise<number>;
+
+  /**
    * D2.2 temporal supersession markers. Sets only the keys present (null clears).
    * Deliberately does NOT touch updated_at/last_seen — marking a memory
    * deprecated must not reset its decay clock.
@@ -147,6 +167,25 @@ export interface IMemoryStore {
    * signals (decay strength + duplicate-pair scan). Ordered by id ASC, capped at `limit`.
    */
   getCorpusHealthSample(limit: number): Promise<CorpusHealthSampleRow[]>;
+
+  /**
+   * Per-scope aggregates for the T43 scope-drift detector: one row per scope
+   * with active/archived split, per-type counts, and first/last write. SQL-only
+   * (GROUP BY scope, type) — no content scanning, so it stays cheap enough for
+   * an ops poll. Covers ALL rows, archived included: a migration's residual
+   * check counts active rows only, so archived rows stranded on an alias scope
+   * are exactly the residue nothing else surfaces.
+   */
+  getScopeAggregates(): Promise<ScopeAggregateRow[]>;
+
+  /** Active-row count for one exact scope (Phase 3 ops: the `project:_unrouted` triage backlog). */
+  countActiveByScope(scope: string): Promise<number>;
+
+  /**
+   * Active rows whose metadata JSON contains the given top-level key (LIKE '%"raw_scope"%' is
+   * acceptable — this endpoint is polled rarely and the count is advisory).
+   */
+  countActiveWithMetadataKey(key: string): Promise<number>;
 }
 
 /**
@@ -166,6 +205,28 @@ export interface IVectorSearch {
 
   get size(): number;
 }
+
+/**
+ * Watermark predicates (Phase 3 scope minting, spec §6 — shared vocabulary).
+ *
+ * The two cursors deliberately diverge on `held` rows. A `held` discovery run
+ * records an ephemeral scope (workflow-run, subagent, date-stamped, bare-number
+ * — see `ephemeralReason` in src/scopes/drift.ts) whose observations were
+ * OBSERVED but never minted from:
+ *
+ * - The GLOBAL cursor must advance over held rows — otherwise every discovery
+ *   pass re-fetches the same held observations forever and real scopes starve
+ *   behind the ephemeral ones (the held row IS the record that the batch was
+ *   consumed).
+ * - The PER-SCOPE cursor must NOT advance — that scope's observations are by
+ *   definition unprocessed, so a future re-drive (the scope later ruled real
+ *   by the operator) starts from 0 and sees everything.
+ *
+ * These constants are the single source for both watermark predicates; the
+ * observation stores build their SQL from them — no literal status strings.
+ */
+export const GLOBAL_WATERMARK_STATUSES = ['completed', 'held'] as const;
+export const SCOPE_WATERMARK_STATUSES = ['completed'] as const;
 
 /**
  * Abstract interface for observation storage operations.
@@ -193,8 +254,8 @@ export interface IObservationStore {
   /** Aggregate counts by project and tool. */
   getObservationStats(projectScope?: string): Promise<ObservationStats>;
 
-  /** Windowed DELETE of observations older than N days. Returns count deleted. */
-  purgeOlderThan(olderThanDays: number, batchSize?: number): Promise<number>;
+  /** Windowed DELETE of observations older than N days. Rows on `exemptScopes` (held/ephemeral scopes whose per-scope watermark never advanced — see `ephemeralReason`) are never deleted. Returns count deleted. */
+  purgeOlderThan(olderThanDays: number, batchSize?: number, exemptScopes?: string[]): Promise<number>;
 
   /** Count observations after the given watermark. */
   getUnprocessedCount(lastWatermark: number, projectScope?: string): Promise<number>;
@@ -222,6 +283,18 @@ export interface IObservationStore {
 
   /** List recent discovery runs, optionally filtered by project scope. */
   listDiscoveryRuns(projectScope?: string, limit?: number): Promise<DiscoveryRun[]>;
+
+  /**
+   * GROUP BY project_scope over status='held' runs — the PENDING backlog, not
+   * an ever-held ledger (round-2 fix CO6): `observations_pending` counts only
+   * held rows whose observation_end_id is ABOVE the scope's completed
+   * per-scope watermark (SCOPE_WATERMARK_STATUSES — a completed re-drive run
+   * covers everything at or below it); `observations_total` is the all-time
+   * held count for context. A fully re-driven scope reads pending 0 and DROPS
+   * OUT of the summary (its held history stays visible in the raw
+   * /api/discoveries/runs listing).
+   */
+  getHeldRunSummary(): Promise<{ scope: string; observations_pending: number; observations_total: number; last_end_id: number }[]>;
 
   /** Close database connection / release resources. */
   close(): void;
@@ -284,6 +357,12 @@ export interface IDreamStore {
   /** Restore a revision over the live row (snapshots current first, so restore is itself reversible). Does NOT touch the in-memory vector index — caller syncs that. */
   restoreRevision(memoryId: number, revision: number): Promise<boolean>;
 
+  /** Permanently delete ONE revision (admin redaction path — may delete dream-linked revisions; the operator is choosing to excise history). Returns whether a row was deleted. */
+  deleteRevision(memoryId: number, revision: number): Promise<boolean>;
+
+  /** Permanently delete ALL revisions for a memory (admin redaction path). Returns the count deleted. */
+  deleteRevisions(memoryId: number): Promise<number>;
+
   // ── audit ──
   appendAudit(entry: {
     dream_id: number;
@@ -335,7 +414,21 @@ export interface IOperatorConfigStore {
   updateConfig(operatorId: string, patch: Partial<Pick<OperatorConfig,
     'timezone' | 'quiet_hours_start' | 'quiet_hours_end' | 'idle_minutes' |
     'dream_cadence' | 'auto_accept_exact_dup' | 'auto_accept_decay' |
-    'reasoner_provider' | 'config'>>): Promise<OperatorConfig>;
+    'reasoner_provider' | 'primary_scope' | 'config'>>): Promise<OperatorConfig>;
+}
+
+/**
+ * Abstract interface for the Phase 3 scope registry (scope_registry table).
+ * Row/request shapes live in src/scopes/minting.ts — the shared vocabulary
+ * every minting consumer imports.
+ */
+export interface IScopeRegistryStore {
+  listAll(): Promise<ScopeRegistryRow[]>;
+  /** Idempotent: ON CONFLICT (scope) DO NOTHING. Returns true when a row was inserted. */
+  register(req: RegisterRequest): Promise<boolean>;
+  updateStatus(scope: string, status: ScopeRegistryStatus, ruledAt?: string): Promise<void>;
+  /** Ruling 'rename': re-key a row. Throws if newScope already exists. */
+  rename(oldScope: string, newScope: string, newSlug: string | null): Promise<void>;
 }
 
 /**

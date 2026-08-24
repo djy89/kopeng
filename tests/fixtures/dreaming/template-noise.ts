@@ -17,6 +17,11 @@ export function repeatedToolContent(tool: string, payload: string): string {
   return `When working in this project, the operator frequently uses ${tool} with: ${payload}`;
 }
 
+/** "The operator frequently runs this command in the project: <command>" — detectRepeatedCommands (heuristics.ts:376), the round-22 unparsed template. */
+export function repeatedCommandContent(command: string): string {
+  return `The operator frequently runs this command in the project: ${command}`;
+}
+
 /** The synthesizer "Key reference files" list template (referent_list family). */
 export function keyFilesContent(project: string, files: string[]): string {
   const list = files.map(f => `  - ${f}`).join('\n');

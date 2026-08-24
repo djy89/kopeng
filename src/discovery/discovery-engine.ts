@@ -5,7 +5,8 @@
  * and memory creation for auto-discovered patterns.
  *
  * Key design:
- * - Watermark cursor: each run starts from id > last completed run's end_id
+ * - Watermark cursor: each run starts from id > the global watermark (MAX end_id
+ *   over completed AND held runs — see GLOBAL_WATERMARK_STATUSES in interfaces.ts)
  * - Optimistic locking: checks for active runs, recovers stale (>10min) ones
  * - Three-tier semantic dedup: >=0.95 reinforce, 0.85-0.95 reinforce+log, <0.85 create
  * - Content security denylist: rejects dangerous patterns
@@ -15,14 +16,17 @@
 
 import type { IObservationStore, IMemoryStore, IVectorSearch } from '../database/interfaces.js';
 import type { DiscoveryResult, PatternCandidate, DiscoveryConfig } from '../types/types.js';
+import { SKILL_TAG } from '../types/types.js';
 import { detectPatterns } from './heuristics.js';
 import { synthesizePatterns } from './synthesizer.js';
-import { computeConfidence, computeErrorPatternConfidence, reinforceConfidence, AUTO_CONFIDENCE_CEILING } from './confidence.js';
+import { assignCandidateConfidence, reinforcedConfidenceFor, AUTO_CONFIDENCE_CEILING } from './confidence.js';
 import { embed, embeddingToBuffer } from '../embeddings/embedder.js';
 import type { ConsolidationReasoner, CandidateMemory } from '../dreaming/reasoner/reasoner.js';
 import {
   classifyForIngestion, buildContradictionFlag, CONTRADICTION_FLAG_TAG, CONTRADICTION_FLAG_KEY,
 } from '../dreaming/contradiction.js';
+import { ephemeralReason } from '../scopes/drift.js';
+import { buildHoldPredicate, type HoldPredicate } from './hold.js';
 import logger from '../utils/logger.js';
 
 /** Stale run threshold in milliseconds (10 minutes). */
@@ -78,6 +82,39 @@ export interface DiscoveryEngineOptions {
    * `classifyForIngestion` in src/dreaming/contradiction.ts.
    */
   reasoner?: ConsolidationReasoner;
+  /**
+   * T46 write-time scope canonicalization — discovery mints `project:<basename>`
+   * scopes from observations, which is exactly the drift the alias table exists
+   * to stop. Absent ⇒ identity.
+   */
+  canonicalizeScope?: (scope: string) => Promise<string>;
+  /**
+   * Phase 3 registry-aware resolution applied BEFORE grouping; absent ⇒ raw
+   * grouping, byte-identical to pre-Phase-3.
+   */
+  resolveScope?: (raw: string, origin: string | null) => Promise<string>;
+  /**
+   * Round-2 fix CO5: the SHARED hold predicate (buildHoldPredicate in
+   * ./hold.ts) — held iff ephemeral-shaped AND not alias-mapped, so a RULED
+   * ephemeral scope's observations resolve to the target instead of being
+   * held forever. Absent ⇒ shape-only (`ephemeralReason`), the pre-round-2
+   * behavior unit stubs rely on.
+   */
+  isHeld?: HoldPredicate;
+}
+
+/**
+ * The mint-origin hint for registry-aware resolution (Task 8): the observing
+ * session's cwd when the hook recorded one in metadata. Fail-open — an
+ * unparseable or cwd-less metadata blob yields null.
+ */
+function originOf(obs: { metadata?: string | null }): string | null {
+  try {
+    const metadata = JSON.parse(obs.metadata || '{}');
+    return typeof metadata.cwd === 'string' ? metadata.cwd : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -91,7 +128,9 @@ export async function runDiscovery(
   options: DiscoveryEngineOptions
 ): Promise<DiscoveryResult> {
   const startTime = Date.now();
-  const { config, maxObservationsPerRun = 1000, reasoner } = options;
+  const { config, maxObservationsPerRun = 1000, reasoner, canonicalizeScope, resolveScope } = options;
+  // Shape-only fallback = buildHoldPredicate without an alias closure (CO5).
+  const isHeld = options.isHeld ?? buildHoldPredicate();
 
   // ── Concurrency guard (optimistic locking) ──
   const activeRun = await observationStore.getActiveRun();
@@ -135,29 +174,95 @@ export async function runDiscovery(
     };
   }
 
-  const endId = observations[observations.length - 1].id;
-  const startId = observations[0].id;
-
-  // Group observations by project scope for per-project detection
-  const byProject = new Map<string, typeof observations>();
+  // ── Two-layer grouping (Task 8) ──
+  // raw → observations (lineage layer: run rows, watermarks — Task 6 logic keys
+  // on THIS; observation rows themselves are never rewritten).
+  const byRawScope = new Map<string, typeof observations>();
   for (const obs of observations) {
-    const existing = byProject.get(obs.project_scope) ?? [];
+    const existing = byRawScope.get(obs.project_scope) ?? [];
     existing.push(obs);
-    byProject.set(obs.project_scope, existing);
+    byRawScope.set(obs.project_scope, existing);
+  }
+
+  // raw → resolved (detection layer: which raws pool their evidence), resolved
+  // once per raw. HELD raws (the shared predicate: ephemeral-shaped AND not
+  // alias-mapped, CO5) are never resolved — they map to themselves and take
+  // the Task-6 held short-circuit before any detection. A RULED ephemeral
+  // (alias-mapped) is NOT held: it resolves through the normal alias-first
+  // path to its target scope and pools evidence there.
+  const heldRaws = new Set<string>();
+  const resolvedOf = new Map<string, string>();
+  for (const raw of byRawScope.keys()) {
+    if (await isHeld(raw)) { heldRaws.add(raw); resolvedOf.set(raw, raw); continue; }
+    const origin = originOf(byRawScope.get(raw)![0]);
+    resolvedOf.set(raw, resolveScope ? await resolveScope(raw, origin) : raw);
+  }
+
+  // resolved → member raws, insertion-ordered. No resolveScope ⇒ every raw is
+  // its own group ⇒ byte-identical to the pre-Phase-3 per-raw processing.
+  const byResolvedScope = new Map<string, string[]>();
+  for (const [raw, resolved] of resolvedOf) {
+    const members = byResolvedScope.get(resolved) ?? [];
+    members.push(raw);
+    byResolvedScope.set(resolved, members);
   }
 
   let totalPatternsFound = 0;
   let totalMemoriesCreated = 0;
   let totalMemoriesReinforced = 0;
 
-  // Process each project scope independently
-  for (const [projectScope, projectObs] of byProject) {
-    // Create discovery run record
-    const run = await observationStore.createDiscoveryRun(projectScope, startId);
+  // Process each resolved group independently: detection/synthesis/store see
+  // the pooled member observations, while run rows stay one-per-RAW-scope.
+  for (const [resolvedScope, memberRaws] of byResolvedScope) {
+    // ── Lineage layer: one run row per member raw (Task 6 preserved) ──
+    // Per-scope watermark honesty (Phase 3): observations arrive id-ASC and the
+    // grouping preserves order, so first/last are each raw's own id range —
+    // run rows record what THAT raw consumed, not the whole batch's end id.
+    const memberRuns: { raw: string; runId: number; endId: number; count: number }[] = [];
+    for (const raw of memberRaws) {
+      const rawObs = byRawScope.get(raw)!;
+      const scopeStartId = rawObs[0].id;
+      const scopeEndId = rawObs[rawObs.length - 1].id;
+
+      // Phase 3 hold (Ruling 2 / R-B): held scopes are observed but never
+      // minted. The held row IS the record — it advances the global cursor
+      // (starvation fix) while leaving the per-scope watermark at 0 for a
+      // future re-drive (see GLOBAL_WATERMARK_STATUSES in interfaces.ts).
+      // Membership was decided ONCE above via the shared predicate (CO5);
+      // ephemeralReason here only names the shape for the log line.
+      if (heldRaws.has(raw)) {
+        const holdReason = ephemeralReason(raw) ?? 'held';
+        const heldRun = await observationStore.createDiscoveryRun(raw, scopeStartId);
+        await observationStore.updateDiscoveryRun(heldRun.id, {
+          status: 'held',
+          observation_end_id: scopeEndId,
+          observations_analyzed: rawObs.length,
+          completed_at: new Date().toISOString(),
+        });
+        logger.info(`Discovery held for ${raw} (${holdReason}): ${rawObs.length} observations recorded, nothing minted`);
+        continue;
+      }
+
+      const run = await observationStore.createDiscoveryRun(raw, scopeStartId);
+      memberRuns.push({ raw, runId: run.id, endId: scopeEndId, count: rawObs.length });
+    }
+    if (memberRuns.length === 0) continue; // held-only group — nothing to detect
+
+    // ── Detection layer: pooled member observations, id-ASC ──
+    const groupObs = memberRuns
+      .flatMap(m => byRawScope.get(m.raw)!)
+      .sort((a, b) => a.id - b.id);
+
+    // Per-group counters (reset each iteration) — the run rows must record
+    // THIS group's own created/reinforced counts, not the cycle-running
+    // totals below (which legitimately summarise the whole pass for the log
+    // line and the returned DiscoveryResult).
+    let scopeMemoriesCreated = 0;
+    let scopeMemoriesReinforced = 0;
 
     try {
       // ── Pattern detection ──
-      const rawCandidates = detectPatterns(projectObs, config);
+      const rawCandidates = detectPatterns(groupObs, config);
 
       // ── Synthesis: aggregate related patterns into actionable insights ──
       const candidates = synthesizePatterns(rawCandidates);
@@ -165,26 +270,9 @@ export async function runDiscovery(
         logger.info(`Synthesizer: ${rawCandidates.length} raw patterns → ${candidates.length} synthesized insights`);
       }
 
-      // Compute confidence for each candidate (error/sequence patterns get enhanced scoring)
-      for (const candidate of candidates) {
-        if (candidate.pattern_type === 'recurring_error' || candidate.pattern_type === 'error_fix') {
-          const hasFix = candidate.has_fix === true;
-          const distinctSessions = candidate.distinct_sessions
-            ?? new Set(candidate.evidence_snapshot.map(e => e.session_id)).size;
-          candidate.confidence = computeErrorPatternConfidence(
-            candidate.evidence_count, distinctSessions, hasFix, candidate.observation_span_days
-          );
-        } else if (candidate.pattern_type === 'sequence') {
-          // Sequences use session count as primary signal (cross-session bonus)
-          const distinctSessions = candidate.distinct_sessions
-            ?? new Set(candidate.evidence_snapshot.map(e => e.session_id)).size;
-          candidate.confidence = computeErrorPatternConfidence(
-            candidate.evidence_count, distinctSessions, false, candidate.observation_span_days
-          );
-        } else {
-          candidate.confidence = computeConfidence(candidate.evidence_count, candidate.observation_span_days);
-        }
-      }
+      // Compute confidence for each candidate — the SHARED per-pattern-type
+      // assignment (A4; the re-drive uses the same one).
+      for (const candidate of candidates) assignCandidateConfidence(candidate);
 
       // ── Content security denylist ──
       const safeCandidates = candidates.filter(c => {
@@ -197,40 +285,59 @@ export async function runDiscovery(
 
       totalPatternsFound += safeCandidates.length;
 
+      // Candidate scope = the RESOLVED scope (Task 8). The store-time T46
+      // canonicalization stays as belt-and-braces on top of it; group-constant,
+      // so resolved once per group. candidate.project_scope itself (and
+      // discovery_runs rows) keep raw values — observation lineage is untouched.
+      const storeScope = canonicalizeScope
+        ? await canonicalizeScope(resolvedScope)
+        : resolvedScope;
+
       // ── Semantic dedup + memory creation ──
       for (const candidate of safeCandidates) {
         await yieldToEventLoop();
 
         const result = await deduplicateAndStore(
           candidate,
+          storeScope,
           memoryStore,
           embeddingIndex,
-          run.id,
+          memberRuns[0].runId,
           reasoner
         );
 
-        if (result === 'created') totalMemoriesCreated++;
-        else if (result === 'reinforced') totalMemoriesReinforced++;
+        if (result === 'created') { totalMemoriesCreated++; scopeMemoriesCreated++; }
+        else if (result === 'reinforced') { totalMemoriesReinforced++; scopeMemoriesReinforced++; }
       }
 
-      // ── Mark run as completed ──
-      await observationStore.updateDiscoveryRun(run.id, {
-        status: 'completed',
-        observation_end_id: endId,
-        observations_analyzed: projectObs.length,
-        patterns_found: safeCandidates.length,
-        memories_created: totalMemoriesCreated,
-        memories_reinforced: totalMemoriesReinforced,
-        completed_at: new Date().toISOString(),
-      });
+      // ── Mark member runs as completed ──
+      // Each raw's row keeps its OWN end id / analyzed count (Task 6). The
+      // group-level detection counts land on the FIRST member only, so run-row
+      // aggregates (ops cache-stats dedup ratio) still sum to the pass totals
+      // instead of double-counting per member.
+      for (const [i, m] of memberRuns.entries()) {
+        await observationStore.updateDiscoveryRun(m.runId, {
+          status: 'completed',
+          observation_end_id: m.endId,
+          observations_analyzed: m.count,
+          patterns_found: i === 0 ? safeCandidates.length : 0,
+          memories_created: i === 0 ? scopeMemoriesCreated : 0,
+          memories_reinforced: i === 0 ? scopeMemoriesReinforced : 0,
+          completed_at: new Date().toISOString(),
+        });
+      }
     } catch (err) {
-      logger.error(`Discovery run #${run.id} failed:`, err);
-      await observationStore.updateDiscoveryRun(run.id, {
-        status: 'failed',
-        error: err instanceof Error ? err.message : String(err),
-        observation_end_id: endId,
-        completed_at: new Date().toISOString(),
-      });
+      // Group failure marks EVERY member raw's run row failed, each with its
+      // own per-raw end id — no member silently claims completion.
+      logger.error(`Discovery group for ${resolvedScope} failed:`, err);
+      for (const m of memberRuns) {
+        await observationStore.updateDiscoveryRun(m.runId, {
+          status: 'failed',
+          error: err instanceof Error ? err.message : String(err),
+          observation_end_id: m.endId,
+          completed_at: new Date().toISOString(),
+        });
+      }
     }
   }
 
@@ -239,7 +346,7 @@ export async function runDiscovery(
 
   return {
     run_id: 0, // Multiple runs may have been created (one per project)
-    project_scope: byProject.size === 1 ? [...byProject.keys()][0] : 'multiple',
+    project_scope: byRawScope.size === 1 ? [...byRawScope.keys()][0] : 'multiple',
     observations_analyzed: observations.length,
     patterns_found: totalPatternsFound,
     memories_created: totalMemoriesCreated,
@@ -274,14 +381,14 @@ function memoryToCandidate(m: NonNullable<Awaited<ReturnType<IMemoryStore['get']
 }
 
 /** Render a not-yet-stored pattern candidate as a reasoner CandidateMemory. */
-function patternToCandidate(candidate: PatternCandidate, nowIso: string): CandidateMemory {
+function patternToCandidate(candidate: PatternCandidate, nowIso: string, scope: string): CandidateMemory {
   return {
     id: -1,
     content: candidate.content,
     content_hash: null,
     summary: null,
     tags: ['auto-discovered', candidate.pattern_type],
-    scope: candidate.project_scope,
+    scope,
     type: 'discovery', // what createDiscoveryMemory will store it as (T31 guard rail)
     confidence: candidate.confidence,
     is_locked: false,
@@ -302,9 +409,13 @@ function patternToCandidate(candidate: PatternCandidate, nowIso: string): Candid
  * - Similarity < 0.85: create new memory
  *
  * Returns 'created', 'reinforced', or 'skipped'.
+ *
+ * Exported (Task 9): the time-preserving re-drive (redrive.ts) stores its
+ * candidates through the SAME dedup/store path as a live discovery pass.
  */
-async function deduplicateAndStore(
+export async function deduplicateAndStore(
   candidate: PatternCandidate,
+  scope: string,
   memoryStore: IMemoryStore,
   embeddingIndex: IVectorSearch,
   discoveryRunId: number,
@@ -312,7 +423,7 @@ async function deduplicateAndStore(
 ): Promise<'created' | 'reinforced' | 'skipped'> {
   // Skip if embedding index isn't ready (fall back to always-create)
   if (!embeddingIndex.isReady && embeddingIndex.size === 0) {
-    return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, null);
+    return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, null, { scope });
   }
 
   let queryEmbedding: Float32Array;
@@ -320,23 +431,23 @@ async function deduplicateAndStore(
     queryEmbedding = await embed(candidate.content);
   } catch {
     // Embedder not initialized — create without dedup
-    return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, null);
+    return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, null, { scope });
   }
 
-  // Search for existing similar memories in the same project scope
+  // Search for existing similar memories in the same (canonical) scope
   const candidateIds = await memoryStore.getFilteredIds({
-    scope: candidate.project_scope,
+    scope,
     include_archived: false,
   });
 
   if (candidateIds.length === 0) {
-    return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, queryEmbedding);
+    return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, queryEmbedding, { scope });
   }
 
   const searchResults = await embeddingIndex.search(queryEmbedding, candidateIds, 1);
 
   if (searchResults.length === 0) {
-    return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, queryEmbedding);
+    return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, queryEmbedding, { scope });
   }
 
   const topMatch = searchResults[0];
@@ -345,11 +456,14 @@ async function deduplicateAndStore(
   if (topMatch.score >= 0.95) {
     const existing = await memoryStore.get(topMatch.id);
     if (existing) {
-      const newConfidence = reinforceConfidence(existing.confidence);
-      await memoryStore.updateConfidence(topMatch.id, Math.min(AUTO_CONFIDENCE_CEILING, newConfidence));
-      // True re-observation: bump durability + reset the decay clock (D1.1)
+      const next = reinforcedConfidenceFor(existing.confidence);
+      if (next !== null) {
+        await memoryStore.updateConfidence(topMatch.id, next);
+      }
+      // True re-observation: bump durability + reset the decay clock (D1.1).
+      // Runs even when the confidence write is suppressed — the memory WAS re-observed.
       await memoryStore.reinforceOnAccess([topMatch.id]);
-      logger.debug(`Reinforced memory #${topMatch.id} (${existing.confidence.toFixed(3)} ��� ${newConfidence.toFixed(3)}, similarity: ${topMatch.score.toFixed(3)})`);
+      logger.debug(`Reinforced memory #${topMatch.id} (${existing.confidence.toFixed(3)} ��� ${next?.toFixed(3) ?? existing.confidence.toFixed(3)}, similarity: ${topMatch.score.toFixed(3)})`);
       return 'reinforced';
     }
   }
@@ -365,7 +479,7 @@ async function deduplicateAndStore(
         ? await classifyForIngestion(
             reasoner,
             memoryToCandidate(existing),
-            patternToCandidate(candidate, nowIso),
+            patternToCandidate(candidate, nowIso, scope),
             { timeoutMs: INGESTION_CLASSIFY_TIMEOUT_MS, tokenBudget: 300 },
           )
         : ({ action: 'reinforce', verdict: null } as const);
@@ -377,18 +491,21 @@ async function deduplicateAndStore(
         return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, queryEmbedding, {
           extraMetadata: { [CONTRADICTION_FLAG_KEY]: buildContradictionFlag(existing.id, route.verdict, nowIso) },
           extraTags: [CONTRADICTION_FLAG_TAG],
+          scope,
         });
       }
       if (route.action === 'create') {
         // Confident unrelated (the R13 template/different-referent class):
         // both memories stand on their own — no reinforce, no flag.
         logger.info(`Tier-2 guard: candidate vs memory #${existing.id} classified 'unrelated' — creating without reinforcement`);
-        return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, queryEmbedding);
+        return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, queryEmbedding, { scope });
       }
 
       // Phase-1 reinforce + log (confirmed duplicate, or no consumable verdict).
-      const newConfidence = reinforceConfidence(existing.confidence);
-      await memoryStore.updateConfidence(topMatch.id, Math.min(AUTO_CONFIDENCE_CEILING, newConfidence));
+      const next = reinforcedConfidenceFor(existing.confidence);
+      if (next !== null) {
+        await memoryStore.updateConfidence(topMatch.id, next);
+      }
       await memoryStore.reinforceOnAccess([topMatch.id]);
 
       // Append new evidence to existing memory's metadata
@@ -426,20 +543,39 @@ async function deduplicateAndStore(
   }
 
   // Tier 3: < 0.85 — create new memory
-  return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, queryEmbedding);
+  return await createDiscoveryMemory(candidate, memoryStore, discoveryRunId, queryEmbedding, { scope });
+}
+
+/**
+ * Derive a stable surface key + human title for a procedural sequence memory
+ * from its structured `steps` (the normalized workflow keys). The key is built
+ * verbatim from the steps — which `getSequenceKey` has already canonicalized —
+ * so the key stays 1:1 with the memory's content (no case-folding collision).
+ * Returns null when the candidate has no usable step chain.
+ */
+export function deriveSkillKeyAndName(candidate: PatternCandidate): { key: string; name: string } | null {
+  const steps = candidate.steps;
+  if (!steps || steps.length < 2) return null;
+  return {
+    key: `${SKILL_TAG}:${steps.join('>')}`,
+    name: steps.join(' → '),
+  };
 }
 
 /**
  * Create a new auto-discovered memory from a pattern candidate.
  * `opts` (D2.2): the tier-2 guard attaches the contradiction flag metadata/tag
  * so the dream layer co-windows and routes the flagged pair.
+ * `opts.scope` (T46): the write-time canonical scope to store under, resolved
+ * once by the caller — absent ⇒ falls back to `candidate.project_scope`
+ * (identity), so existing callers are unaffected.
  */
-async function createDiscoveryMemory(
+export async function createDiscoveryMemory(
   candidate: PatternCandidate,
   memoryStore: IMemoryStore,
   discoveryRunId: number,
   embedding: Float32Array | null,
-  opts: { extraMetadata?: Record<string, unknown>; extraTags?: string[] } = {}
+  opts: { extraMetadata?: Record<string, unknown>; extraTags?: string[]; scope?: string } = {}
 ): Promise<'created' | 'skipped'> {
   const metadata: Record<string, unknown> = {
     discovered: true,
@@ -459,6 +595,20 @@ async function createDiscoveryMemory(
     metadata.distinct_sessions = candidate.distinct_sessions;
   }
 
+  // Procedural "skill" legibility (thin Skills layer): sequence patterns are
+  // repeatable workflows. Derive a stable surface key + title (mirroring the
+  // catalog surface shape) so the surface skill lane can materialise them —
+  // without a dedicated MemoryType/migration. Computed once and reused for the
+  // tag below so the 'skill' tag and external_key stay coupled (only tag what we
+  // can key).
+  const skillMeta = candidate.pattern_type === 'sequence'
+    ? deriveSkillKeyAndName(candidate)
+    : null;
+  if (skillMeta) {
+    metadata.external_key = skillMeta.key;
+    metadata.name = skillMeta.name;
+  }
+
   const embeddingBuffer = embedding
     ? embeddingToBuffer(embedding)
     : null;
@@ -474,6 +624,9 @@ async function createDiscoveryMemory(
       tags.push(`error:${firstEvidence.error_category}`);
     }
   }
+  if (skillMeta && !tags.includes(SKILL_TAG)) {
+    tags.push(SKILL_TAG);
+  }
   if (candidate.synthesized_tags) {
     for (const tag of candidate.synthesized_tags) {
       if (!tags.includes(tag)) tags.push(tag);
@@ -487,7 +640,7 @@ async function createDiscoveryMemory(
     const result = await memoryStore.store({
       content: candidate.content,
       type: 'discovery',
-      scope: candidate.project_scope,
+      scope: opts.scope ?? candidate.project_scope,
       source: 'auto-discovery',
       source_path: null,
       metadata: JSON.stringify(metadata),

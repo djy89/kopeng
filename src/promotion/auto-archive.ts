@@ -1,9 +1,9 @@
 import type { IMemoryStore, IDreamStore, IVectorSearch } from '../database/interfaces.js';
-import type { DreamDiffEntry } from '../types/types.js';
+import { PROMOTION_CARRIER_REASON, type DreamDiffEntry } from '../types/types.js';
 import type { DecayScore } from './decay.js';
-import { memoryStrength } from '../dreaming/scoring.js';
-import { shouldArchive } from '../discovery/confidence.js';
+import { memoryStrength, isAnchored, isDecayedAtRisk, DECAY_ARCHIVE_THRESHOLD } from '../dreaming/scoring.js';
 import { applyEntry, type ApplyDeps } from '../dreaming/apply.js';
+import { CarrierDream } from '../dreaming/carrier.js';
 import logger from '../utils/logger.js';
 
 export interface ArchiveResult {
@@ -72,8 +72,9 @@ export interface AuditedArchiveDeps {
  * no snapshot/audit and a divergent formula. It now:
  *
  *  1. selects candidates with the SAME predicate as the dream `decay` tier —
- *     `memoryStrength(memory) < 0.2` (durability-aware effective confidence,
- *     `shouldArchive`), eliminating the old `computeDecayScores < 0.1` divergence;
+ *     `isDecayedAtRisk` (durability-aware effective confidence below
+ *     `DECAY_ARCHIVE_THRESHOLD`), eliminating the old `computeDecayScores < 0.1`
+ *     divergence;
  *  2. routes each archive through the audited dream apply path (`applyEntry` over a
  *     `decay` diff entry attached to a real `dreams` row) — snapshot to
  *     `memory_revisions` → archive → append `dream_audit_log` (compensate-unarchive
@@ -95,7 +96,7 @@ export async function autoArchiveDecayed(
   const candidates = await selectDecayCandidates(deps.memoryStore, now);
 
   if (dryRun) {
-    logger.info(`[DRY RUN] Would archive ${candidates.length} memories (memoryStrength < 0.2)`);
+    logger.info(`[DRY RUN] Would archive ${candidates.length} memories (memoryStrength < ${DECAY_ARCHIVE_THRESHOLD})`);
     return { archived: candidates.map(c => c.id), skipped: 0, threshold };
   }
 
@@ -111,13 +112,10 @@ export async function autoArchiveDecayed(
   }
 
   // One dream row holds every audited archive in this pass (rollback handle +
-  // FK target for the audit/revision rows). mode 'whole_corpus' marks it as a
-  // promotion-driven decay pass rather than a windowed dream.
-  const dream = await dreamStore.createDream({
-    mode: 'whole_corpus',
-    trigger_source: 'scheduled',
-    reason: 'promotion decay archival (R14 audited path)',
-  });
+  // FK target for the audit/revision rows) — the shared carrier lifecycle
+  // (team-review #22 A7: one definition of create → record → finalize).
+  const carrier = new CarrierDream(dreamStore, PROMOTION_CARRIER_REASON);
+  const dream = await carrier.open();
 
   const applyDeps: ApplyDeps = {
     memoryStore: deps.memoryStore,
@@ -127,7 +125,6 @@ export async function autoArchiveDecayed(
 
   const archived: number[] = [];
   let skipped = 0;
-  const entries: DreamDiffEntry[] = [];
 
   for (let i = 0; i < candidates.length; i++) {
     const c = candidates[i];
@@ -135,15 +132,15 @@ export async function autoArchiveDecayed(
       change_class: 'decay',
       tier: 'deterministic-safe',
       memory_ids: [c.id],
-      rationale: `Effective confidence ${c.strength.toFixed(3)} below the 0.2 archive threshold (durability-aware decay) — promotion decay archive (R14 audited).`,
+      rationale: `Effective confidence ${c.strength.toFixed(3)} below the ${DECAY_ARCHIVE_THRESHOLD} archive threshold (durability-aware decay) — promotion decay archive (R14 audited).`,
       after: { archive_ids: [c.id] },
     };
+    let applied = false;
     try {
       const result = await applyEntry(applyDeps, dream.id, i, entry, true);
-      if (result.outcome === 'applied' && result.archived_ids.length > 0) {
+      applied = result.outcome === 'applied' && result.archived_ids.length > 0;
+      if (applied) {
         archived.push(c.id);
-        entry.resolution = 'auto_applied';
-        entry.resolved_at = now.toISOString();
         logger.info(`Auto-archived memory ${c.id} (memoryStrength ${c.strength.toFixed(3)}) — audited under dream ${dream.id}`);
       } else {
         // anchored / vanished / already-archived — left untouched, reported skipped.
@@ -155,26 +152,18 @@ export async function autoArchiveDecayed(
       skipped++;
       logger.error(`Promotion decay archive: memory ${c.id} failed — left active:`, err);
     }
-    entries.push(entry);
+    carrier.record(entry, applied, now);
   }
 
   // Persist the diff + completion so the dream is reviewable/auditable and the
   // archives are reachable from the dream review surface and rollback path.
-  await dreamStore.setDreamDiff(dream.id, { entries });
-  await dreamStore.updateDream(dream.id, {
-    status: 'completed',
-    completed_at: now.toISOString(),
-    acceptance_status: archived.length > 0 ? 'auto_applied' : 'empty',
-    memories_examined: candidates.length,
-    changes_auto_applied: archived.length,
-    changes_queued: 0,
-  });
+  await carrier.finalize(now);
 
   logger.info(`Auto-archive complete: ${archived.length} archived, ${skipped} skipped (audited under dream ${dream.id})`);
   return { archived, skipped, threshold, dream_id: dream.id };
 }
 
-interface DecayCandidate {
+export interface DecayCandidate {
   id: number;
   strength: number;
 }
@@ -185,8 +174,12 @@ interface DecayCandidate {
  * Hard Anchor (pinned/`is_locked`/`confidence>=1.0`) is excluded here AND
  * re-checked at apply time (`applyEntry`), so a stale candidate can never archive
  * an anchored row.
+ *
+ * Exported for the Phase-4 composition suite (Task 6), which asserts this
+ * selection against the panel/§2/dream verdicts — the export is read-only
+ * selection; the archive path stays `autoArchiveDecayed`.
  */
-async function selectDecayCandidates(store: IMemoryStore, now: Date): Promise<DecayCandidate[]> {
+export async function selectDecayCandidates(store: IMemoryStore, now: Date): Promise<DecayCandidate[]> {
   const candidates: DecayCandidate[] = [];
   let cursor: number | undefined;
   // Page through all active memories. list() excludes archived rows by default.
@@ -196,33 +189,20 @@ async function selectDecayCandidates(store: IMemoryStore, now: Date): Promise<De
     for (const m of memories) {
       cursor = m.id;
       // Hard Anchor: never decay-archive pinned / locked / operator-confirmed.
-      if (m.is_locked === 1 || m.confidence >= 1.0 || isPinned(m.metadata)) continue;
-      const strength = memoryStrength(
-        {
-          confidence: m.confidence,
-          observation_count: m.observation_count ?? 1,
-          last_seen: m.last_seen ?? null,
-          updated_at: m.updated_at,
-          type: m.type,
-          tags: m.tags,
-        },
-        now,
-      );
-      if (shouldArchive(strength)) {
-        candidates.push({ id: m.id, strength });
+      if (isAnchored(m)) continue;
+      const inputs = {
+        confidence: m.confidence,
+        observation_count: m.observation_count ?? 1,
+        last_seen: m.last_seen ?? null,
+        updated_at: m.updated_at,
+        type: m.type,
+        tags: m.tags,
+      };
+      if (isDecayedAtRisk(inputs, now)) {
+        candidates.push({ id: m.id, strength: memoryStrength(inputs, now) });
       }
     }
     if (!has_more) break;
   }
   return candidates;
-}
-
-function isPinned(metadata: string | null): boolean {
-  if (!metadata) return false;
-  try {
-    const parsed = JSON.parse(metadata) as { pinned?: unknown };
-    return parsed.pinned === true;
-  } catch {
-    return false;
-  }
 }

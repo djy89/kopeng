@@ -13,14 +13,14 @@ import type {
   ConsolidationReasoner, CandidateMemory, ReasonerContext, PairVerdict, ConditionExtraction,
 } from './reasoner/reasoner.js';
 import type { DreamDiff, DreamDiffEntry } from '../types/types.js';
-import { memoryStrength } from './scoring.js';
-import { shouldArchive } from '../discovery/confidence.js';
+import { memoryStrength, isAnchored, isDecayedAtRisk, DECAY_ARCHIVE_THRESHOLD } from './scoring.js';
 import { evidenceGate, isDifferentReferent } from './gates.js';
 import {
   routeClassifiedPair, isConsumableVerdict, pickKeepTarget, readContradictionFlag, referentGuard,
   numericDivergenceGuard,
   retirementNarrationGuard,
 } from './contradiction.js';
+import { sameScope } from '../scopes/resolver.js';
 
 // pickKeepTarget moved to contradiction.ts in D2.2 (the router needs it and
 // importing it back from here would be a runtime cycle); re-exported for
@@ -53,9 +53,11 @@ export interface CandidateGroup {
   similarity?: number;
 }
 
-/** Picks candidate groups out of the window's memories. */
+/** Picks candidate groups out of the window's memories. May be async so a
+ *  large scan can yield to the event loop (team-review #22 P1) — `runPipeline`
+ *  awaits either shape, so sync implementations stay valid. */
 export interface CandidateSelector {
-  select(memories: CandidateMemory[]): CandidateGroup[];
+  select(memories: CandidateMemory[]): CandidateGroup[] | Promise<CandidateGroup[]>;
 }
 
 /** A candidate group plus the reasoner's verdict (null for non-pair groups in the scaffold). */
@@ -76,19 +78,33 @@ export interface DiffGenerator {
 export interface PipelineResult {
   memoriesExamined: number;
   candidates: CandidateGroup[];
+  /**
+   * The groups that actually entered the classify loop this pass — everything
+   * in `candidates` EXCEPT reasoner-tier pairs dropped by the T6 id-segment
+   * `reasonerGate`. Flag consumption (dream-engine) must read THIS list, not
+   * `candidates`: consuming a gated-out flagged pair's flag would drop the
+   * baton — no queued entry, and a sub-0.85-cosine pair (selected only because
+   * of its flag) would silently leave the review pipeline (pre-T17 fix).
+   * Windowed mode has no gate, so there the two lists are order-identical.
+   */
+  classifiedCandidates: CandidateGroup[];
   diff: DreamDiff;
 }
 
-/**
- * Hard-Anchor predicate (amended invariant #8): operator-confirmed truths
- * (`confidence >= 1.0` or `is_locked`) are bypassed; journal-tier (`<1.0`) is in-scope.
- */
-export function isAnchored(m: Pick<CandidateMemory, 'is_locked' | 'confidence'>): boolean {
-  return m.is_locked || m.confidence >= 1.0;
-}
+// Hard-Anchor predicate (amended invariant #8): moved to scoring.ts as the ONE
+// contract (CR-1, incl. `metadata.pinned`); re-exported so existing importers
+// (replay, dream-pipeline tests) keep working.
+export { isAnchored } from './scoring.js';
 
-/** Normalize content for cheap near-dup grouping (whitespace + case folded). */
-function normalizeContent(content: string): string {
+/**
+ * Normalize content for cheap near-dup grouping (whitespace + case folded).
+ * Exported: Phase 2's apply-time canonical-survivor swap (apply.ts) re-checks
+ * a candidate against the keep target using the SAME predicate the selector
+ * used to form the exact_dup group in the first place — content_hash equality
+ * is a stricter, near-impossible bar (a unique index forbids two live rows
+ * sharing a hash), so the swap must key on this, not the raw hash.
+ */
+export function normalizeContent(content: string): string {
   return content.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
@@ -115,7 +131,10 @@ export type DupPairMemory = Pick<CandidateMemory, 'id' | 'scope' | 'confidence' 
 /**
  * Bucket a cosine-≥0.95 pair by what the collapse tier could do with it. The ops
  * corpus-health metric (routes.ts) classifies its duplicate-pair scan through this
- * so the metric can never drift from the selector: `actionable` is the only bucket
+ * so the metric stays in step with the selector — shared predicate FUNCTIONS,
+ * precedence mirrored rather than shared (the selector never calls this; the
+ * alias-case agreement is pinned by pipeline-alias-scope.test.ts): `actionable`
+ * is the only bucket
  * dreaming proposes on; the rest are by-design exempt (Hard Anchor, R6 cross-scope
  * promote-not-collapse, condition-encoding provenance). Precedence mirrors the
  * selector: anchored members are filtered before any grouping, scope buckets come
@@ -123,9 +142,13 @@ export type DupPairMemory = Pick<CandidateMemory, 'id' | 'scope' | 'confidence' 
  */
 export type DupPairClass = 'anchored' | 'cross_scope' | 'condition_linked' | 'actionable';
 
-export function classifyDupPair(a: DupPairMemory, b: DupPairMemory): DupPairClass {
+export function classifyDupPair(
+  a: DupPairMemory,
+  b: DupPairMemory,
+  canonicalize: (s: string) => string = s => s,
+): DupPairClass {
   if (isAnchored(a) || isAnchored(b)) return 'anchored';
-  if (a.scope !== b.scope) return 'cross_scope';
+  if (!sameScope(canonicalize(a.scope), canonicalize(b.scope))) return 'cross_scope';
   if (conditionSources(a).includes(b.id) || conditionSources(b).includes(a.id)) return 'condition_linked';
   return 'actionable';
 }
@@ -220,9 +243,14 @@ class UnionFind {
  * cosine tiers skip them.
  */
 export class DuplicateCandidateSelector implements CandidateSelector {
-  constructor(private readonly opts: { now?: () => Date } = {}) {}
+  constructor(private readonly opts: { now?: () => Date; canonicalize?: (scope: string) => string } = {}) {}
 
-  select(memories: CandidateMemory[]): CandidateGroup[] {
+  /** Phase 2: the scope a member groups/compares under — canonicalized when an alias table is wired, raw otherwise. */
+  private effectiveScope(m: CandidateMemory): string {
+    return this.opts.canonicalize?.(m.scope) ?? m.scope;
+  }
+
+  async select(memories: CandidateMemory[]): Promise<CandidateGroup[]> {
     const eligible = memories.filter(m => !isAnchored(m));
     const groups: CandidateGroup[] = [];
     const grouped = new Set<number>(); // memory ids already in a flagged/collapse/band group
@@ -251,9 +279,10 @@ export class DuplicateCandidateSelector implements CandidateSelector {
     const byScope = new Map<string, CandidateMemory[]>();
     for (const m of eligible) {
       if (grouped.has(m.id)) continue; // flagged pairs are spoken for
-      const bucket = byScope.get(m.scope);
+      const key = this.effectiveScope(m);
+      const bucket = byScope.get(key);
       if (bucket) bucket.push(m);
-      else byScope.set(m.scope, [m]);
+      else byScope.set(key, [m]);
     }
 
     const bandPairs: Array<{ a: CandidateMemory; b: CandidateMemory; cos: number }> = [];
@@ -262,6 +291,11 @@ export class DuplicateCandidateSelector implements CandidateSelector {
       if (scoped.length < 2) continue;
       const uf = new UnionFind(scoped.length);
       const cosCache = new Map<string, number>();
+      // Hoisted out of the O(n^2) pair loop (team-review #22 P1): recomputing
+      // normalizeContent per PAIR was ~8x the whole scan's cost. Alias-merged
+      // buckets (Phase 2 effectiveScope) made big buckets bigger, and
+      // whole-corpus mode feeds the entire active corpus through here.
+      const norms = scoped.map(m => normalizeContent(m.content));
 
       for (let i = 0; i < scoped.length; i++) {
         for (let j = i + 1; j < scoped.length; j++) {
@@ -269,7 +303,7 @@ export class DuplicateCandidateSelector implements CandidateSelector {
           // A condition-encoded memory is similar to its sources BY CONSTRUCTION
           // (its content contains theirs) — provenance links are never dup edges.
           if (isConditionLinked(a, b, condSources)) continue;
-          const exact = normalizeContent(a.content) === normalizeContent(b.content);
+          const exact = norms[i] === norms[j];
           let cos: number | null = null;
           if (a.embedding && b.embedding) {
             cos = cosineSimilarity(a.embedding, b.embedding);
@@ -287,6 +321,10 @@ export class DuplicateCandidateSelector implements CandidateSelector {
             bandPairs.push({ a, b, cos });
           }
         }
+        // Yield between outer rows (same convention as the corpus-health dup
+        // scan): the pass runs in-process on the server, and a multi-second
+        // synchronous block would starve the recall hook's 3s budget.
+        if (i % 16 === 15) await new Promise(resolve => setImmediate(resolve));
       }
 
       const components = new Map<number, number[]>();
@@ -300,7 +338,7 @@ export class DuplicateCandidateSelector implements CandidateSelector {
       for (const indices of components.values()) {
         if (indices.length < 2) continue;
         const members = indices.map(i => scoped[i]);
-        const norms = new Set(members.map(m => normalizeContent(m.content)));
+        const componentNorms = new Set(indices.map(i => norms[i]));
         let minCos: number | undefined;
         for (let x = 0; x < indices.length; x++) {
           for (let y = x + 1; y < indices.length; y++) {
@@ -312,8 +350,8 @@ export class DuplicateCandidateSelector implements CandidateSelector {
         groups.push({
           kind: members.length === 2 ? 'pair' : 'cluster',
           members,
-          signal: norms.size === 1 ? 'exact_duplicate' : 'semantic_duplicate',
-          similarity: norms.size === 1 ? 1 : minCos,
+          signal: componentNorms.size === 1 ? 'exact_duplicate' : 'semantic_duplicate',
+          similarity: componentNorms.size === 1 ? 1 : minCos,
         });
         for (const m of members) grouped.add(m.id);
       }
@@ -337,7 +375,7 @@ export class DuplicateCandidateSelector implements CandidateSelector {
     }
     for (const members of byNorm.values()) {
       if (members.length < 2) continue;
-      if (new Set(members.map(m => m.scope)).size < 2) continue;
+      if (new Set(members.map(m => this.effectiveScope(m))).size < 2) continue;
       groups.push({
         kind: members.length === 2 ? 'pair' : 'cluster',
         members,
@@ -351,19 +389,16 @@ export class DuplicateCandidateSelector implements CandidateSelector {
     const now = this.opts.now ? this.opts.now() : new Date();
     for (const m of eligible) {
       if (grouped.has(m.id)) continue;
-      const strength = memoryStrength(
-        {
-          confidence: m.confidence,
-          observation_count: m.observation_count ?? 1,
-          last_seen: m.last_seen ?? null,
-          updated_at: m.updated_at,
-          type: m.type,
-          tags: m.tags,
-        },
-        now,
-      );
-      if (shouldArchive(strength)) {
-        groups.push({ kind: 'single', members: [m], signal: 'decayed', similarity: strength });
+      const inputs = {
+        confidence: m.confidence,
+        observation_count: m.observation_count ?? 1,
+        last_seen: m.last_seen ?? null,
+        updated_at: m.updated_at,
+        type: m.type,
+        tags: m.tags,
+      };
+      if (isDecayedAtRisk(inputs, now)) {
+        groups.push({ kind: 'single', members: [m], signal: 'decayed', similarity: memoryStrength(inputs, now) });
       }
     }
 
@@ -389,12 +424,29 @@ export class DuplicateCandidateSelector implements CandidateSelector {
  * `after` carries the machine-actionable proposal for D1.3's apply path.
  */
 export class DeterministicDiffGenerator implements DiffGenerator {
+  constructor(
+    private readonly opts: { aliasVersion?: string | null; canonicalize?: (scope: string) => string } = {},
+  ) {}
+
+  private provenanceFor(group: CandidateGroup): NonNullable<DreamDiffEntry['provenance']> {
+    return {
+      alias_table_version: this.opts.aliasVersion ?? null,
+      members: group.members.map(m => ({
+        id: m.id,
+        content_hash: m.content_hash ?? null,
+        scope: m.scope,
+        effective_scope: this.opts.canonicalize?.(m.scope) ?? m.scope,
+      })),
+    };
+  }
+
   generate(classified: ClassifiedCandidate[]): DreamDiff {
     const entries: DreamDiffEntry[] = [];
 
     for (const { group, verdict, condition } of classified) {
       const ids = group.members.map(m => m.id);
       const cos = group.similarity !== undefined ? group.similarity.toFixed(3) : 'n/a';
+      const startLen = entries.length;
 
       switch (group.signal) {
         case 'exact_duplicate': {
@@ -468,7 +520,7 @@ export class DeterministicDiffGenerator implements DiffGenerator {
             change_class: 'decay',
             tier: 'deterministic-safe',
             memory_ids: ids,
-            rationale: `Effective confidence ${cos} below the 0.2 archive threshold (durability-aware decay, D1.1) — propose archive.`,
+            rationale: `Effective confidence ${cos} below the ${DECAY_ARCHIVE_THRESHOLD} archive threshold (durability-aware decay, D1.1) — propose archive.`,
             after: { archive_ids: ids },
           });
           break;
@@ -476,6 +528,8 @@ export class DeterministicDiffGenerator implements DiffGenerator {
         default:
           break; // signal-less scaffold groups: nothing to propose
       }
+
+      for (let k = startLen; k < entries.length; k++) entries[k].provenance = this.provenanceFor(group);
     }
 
     return { entries };
@@ -550,7 +604,7 @@ export async function runPipeline(
   const deadlineAt = limits.passBudgetMs !== undefined ? now() + limits.passBudgetMs : null;
 
   const memories = await source.fetch();
-  const candidates = selector.select(memories);
+  const candidates = await selector.select(memories);
 
   /**
    * T6 id-segment reasoner gate: is this group a reasoner-tier pair? (Same
@@ -642,7 +696,12 @@ export async function runPipeline(
   }
 
   const diff = diffGen.generate(classified);
-  return { memoriesExamined: memories.length, candidates, diff };
+  return {
+    memoriesExamined: memories.length,
+    candidates,
+    classifiedCandidates: classified.map(c => c.group),
+    diff,
+  };
 }
 
 /** Trivial in-memory MemorySource — handy for the harness and tests. */

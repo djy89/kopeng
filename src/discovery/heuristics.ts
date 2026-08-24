@@ -580,6 +580,8 @@ function detectSequences(
     totalOccurrences: number;
     examples: { a: Observation; b: Observation }[];
     projectScope: string;
+    keyA: string;
+    keyB: string;
   }>();
 
   for (const [sessionId, ops] of sessions) {
@@ -619,6 +621,8 @@ function detectSequences(
             totalOccurrences: 1,
             examples: [{ a: a.obs, b: b.obs }],
             projectScope: a.obs.project_scope,
+            keyA: a.key,
+            keyB: b.key,
           });
         }
       }
@@ -659,6 +663,7 @@ function detectSequences(
         buildEvidence(ex.b, ex.b.input_summary ?? ''),
       ]),
       distinct_sessions: data.sessions.size,
+      steps: [data.keyA, data.keyB],
     });
   }
 

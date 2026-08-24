@@ -5,6 +5,8 @@ import type { ObservationBus } from '../services/observation-bus.js';
 import type { ActivityTracker } from '../dreaming/activity-tracker.js';
 import type { RunDreamOptions, DreamRunResult } from '../dreaming/dream-engine.js';
 import type { ReasonerLivenessStatus } from '../dreaming/reasoner/liveness.js';
+import type { ScopeAliasService } from '../services/scope-alias.js';
+import type { ScopeRegistryService } from '../services/scope-registry.js';
 
 /**
  * Application context container — bundles all stores, services, and lifecycle
@@ -35,6 +37,10 @@ export interface AppContext {
      * degrades to a disarmed status when absent.
      */
     reasonerStatus?: () => Promise<ReasonerLivenessStatus>;
+    /** T46 scope-alias layer: write-time canonicalization + recall expansion. */
+    scopeAliases?: ScopeAliasService;
+    /** Phase 3 scope registry: write-time minting/quarantine/reroute + primary-scope triage. */
+    scopeRegistry?: ScopeRegistryService;
   };
   lifecycle: IDatabaseLifecycle;
 }

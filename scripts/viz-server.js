@@ -2,12 +2,14 @@
 // Run with: npm run viz   →   open http://localhost:8780
 
 import http from 'node:http';
+import net from 'node:net';
 import { readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Readable } from 'node:stream';
 import { gzipSync } from 'node:zlib';
+import dotenv from 'dotenv';
 
 const PORT = parseInt(process.env.VIZ_PORT || '8780', 10);
 const API = process.env.KOPENG_API_URL || 'http://localhost:3200';
@@ -18,12 +20,13 @@ const ROOT = fileURLToPath(new URL('../viz/', import.meta.url));
 // ADMIN_API_KEY set. The proxy injects the key server-side so the browser
 // never holds it. Env wins; falls back to the repo .env so `npm run viz`
 // keeps working with zero extra setup.
-function loadAdminKey() {
+// CX-3: same parser + precedence as resolveAdminKey (src/config/first-run.ts)
+// — dotenv semantics (last assignment wins, quotes stripped), non-empty env
+// only — so the viz can never resolve a different key than the server.
+export function loadAdminKey(envPath = new URL('../.env', import.meta.url)) {
   if (process.env.ADMIN_API_KEY) return process.env.ADMIN_API_KEY;
   try {
-    const env = readFileSync(new URL('../.env', import.meta.url), 'utf8');
-    const m = env.match(/^ADMIN_API_KEY=(.*)$/m);
-    return m ? m[1].trim() : '';
+    return dotenv.parse(readFileSync(envPath, 'utf8')).ADMIN_API_KEY ?? '';
   } catch {
     return '';
   }
@@ -39,9 +42,15 @@ const HOST = process.env.VIZ_HOST || '127.0.0.1';
 // is then a SECOND, explicit opt-in (VIZ_ALLOW_REMOTE_ADMIN=1) — so binding the
 // viz for read-only viewing over a VPN does not also hand admin mutations to
 // every peer that can reach the port. Loopback binds inject admin as normal.
-/** Pure so the bind policy is unit-testable (tests/unit/viz-remote-readonly.test.ts). */
+/** Pure so the bind policy is unit-testable (tests/unit/viz-remote-readonly.test.ts).
+ * MUST agree with isLoopbackHost in src/config/first-run.ts (CX-4 semantics:
+ * localhost | ::1 | a real v4 address in 127/8) — the server and the viz
+ * deciding "loopback" differently for the same host (e.g. 127.0.0.2) would
+ * strand the viz read-only on an install the server treats as local. The
+ * agreement is pinned by tests/unit/viz-remote-readonly.test.ts. */
 export function isLoopbackHost(host) {
-  return host === '127.0.0.1' || host === '::1' || host === 'localhost';
+  if (host === 'localhost' || host === '::1') return true;
+  return net.isIP(host) === 4 && host.startsWith('127.');
 }
 
 const IS_LOOPBACK_BIND = isLoopbackHost(HOST);

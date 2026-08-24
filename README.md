@@ -4,9 +4,11 @@
 
 **Persistent, self-curating memory for coding agents — it doesn't just remember what you've done, it cleans up after itself, fully local.**
 
+KOPENG 0.x is a **local developer preview**: a self-hosted memory system for a single expert developer, on one machine, bound to loopback. Every autonomous layer ships OFF and is labeled advanced. What backs reliability is engineering rigor, not scale — a zero-LLM pinned-clock replay regression net, adversarial GATE reviews run against a *copy* of real data, idempotent locked consolidation passes, and fail-open/fail-silent behavior everywhere a hook or service could stall.
+
 > Renamed 2026-07 to its current codename. Everything now uses `kopeng` — hook env vars are `KOPENG_*` and the client data directory is `~/.kopeng/`.
 
-KOPENG is a memory and context layer for coding agents (Claude Code, Codex CLI), exposed as MCP tools plus a REST API. It learns from observed tool-use — passively turning repeated tool calls, error-then-fix patterns, hot files, and cross-session sequences into confidence-scored memories with no LLM cost — and serves them back through a hybrid retrieval pipeline (RRF fusion of semantic + keyword, optional cross-encoder rerank, confidence-blended ranking), all running on local quantized ONNX models so there is no per-query API cost or data egress. Its distinguishing layer is autonomous nightly consolidation (the "dreaming Librarian"): a deterministic-first engine that collapses duplicate memories, decays stale ones, and routes contradictions and supersessions — every mutation snapshot-first, audited, and reversible. An optional local LLM (Ollama) is used only as a pair classifier; it never touches the write path.
+KOPENG is a memory and context layer for coding agents (Claude Code, Codex CLI), exposed as MCP tools plus a REST API. It learns from observed tool-use — passively turning repeated tool calls, error-then-fix patterns, hot files, and cross-session sequences into confidence-scored memories with no LLM cost — and serves them back through a hybrid retrieval pipeline (RRF fusion of semantic + keyword, optional cross-encoder rerank, confidence-blended ranking), all running on local quantized ONNX models so there is no per-query API cost or data egress. Its distinguishing layer is operator-gated nightly consolidation (the "dreaming Librarian"): a deterministic-first engine that collapses duplicate memories, decays stale ones, and routes contradictions and supersessions — every mutation snapshot-first, audited, and reversible. An optional local LLM (Ollama) is used only as a pair classifier; it never touches the write path.
 
 Memory that curates itself instead of growing into landfill.
 
@@ -16,12 +18,10 @@ Memory that curates itself instead of growing into landfill.
 
 Most "agent memory" is append-only store-and-retrieve RAG: it remembers, it never prunes. The corpus drifts — duplicates pile up, stale facts outrank current ones, contradictory memories ("we use X" / "we switched to Y") both keep surfacing — and the operator becomes the garbage collector. KOPENG adds the missing half: curation.
 
-- **It curates, not just recalls — the dreaming Librarian.** An autonomous nightly consolidation pass collapses duplicate memories, decays stale ones, and routes contradictions/supersessions for review. The engine is deterministic-first: routing, supersession direction, and **every mutation** are deterministic code — the optional LLM only *classifies* a pair (duplicate / preference-change / conditional / contested / unrelated) and is structurally locked out of the write path (`apply.ts`, invariant #3). Every consolidation write that changes an existing memory (archive, merge, supersede, contradiction-mark) is snapshot-first and audited — snapshot to revisions → mutate → append-only audit log, with a compensation path that unrolls the mutation if the audit append fails ("no unaudited change survives", invariant #11) — reversible via `POST /api/memories/:id/rollback`; memories the pass *creates* are undone by archiving them through the same endpoint. Supersession is a temporal chain (`deprecated_at` / `valid_from`), not a deletion: both the old and new statement stay active and direction is timestamp-deterministic. **This layer is feature-flagged (`DREAMING_ENABLED`, default OFF); auto-apply is hard-restricted in code to exactly two change classes (exact duplicates and decay), both shipping OFF by default — everything else queues for operator review.**
+- **It curates, not just recalls — the dreaming Librarian.** An operator-gated nightly consolidation pass collapses duplicate memories, decays stale ones, and routes contradictions/supersessions for review. The engine is deterministic-first: routing, supersession direction, and **every mutation** are deterministic code — the optional LLM only *classifies* a pair (duplicate / preference-change / conditional / contested / unrelated) and is structurally locked out of the write path (`apply.ts`, invariant #3). Every consolidation write that changes an existing memory (archive, merge, supersede, contradiction-mark) is snapshot-first and audited — snapshot to revisions → mutate → append-only audit log, with a compensation path that unrolls the mutation if the audit append fails ("no unaudited change survives", invariant #11) — reversible via `POST /api/memories/:id/rollback`; memories the pass *creates* are undone by archiving them through the same endpoint. Supersession is a temporal chain (`deprecated_at` / `valid_from`), not a deletion: both the old and new statement stay active and direction is timestamp-deterministic. **This layer is feature-flagged (`DREAMING_ENABLED`, default OFF); auto-apply is hard-restricted in code to exactly two change classes (exact duplicates and decay), both shipping OFF by default — everything else queues for operator review.**
 - **Learns passively from real tool-use, at zero LLM cost.** Six template-based heuristic detectors turn observed behavior — repeated tool+input, error-then-fix, hot files, repeated commands, recurring errors, A→B sequences — into confidence-scored memories. The operator never has to remember to save anything, and the replay harness asserts the detection loop makes zero model calls.
 - **Fully local, no per-query cost, no data egress.** Embeddings (`all-MiniLM-L6-v2`) and the reranker (`ms-marco-MiniLM-L-6-v2`) are quantized ONNX run in-process; the optional reasoner is local Ollama on your own GPU. No cloud LLM sits in the retrieval path *or* the consolidation path — your codebase context never leaves the box.
 - **Observable.** A live SSE event stream and a six-tab web viz (graph / live / ops / replay / review / slots) expose what the system is doing: real-time observation events, operational panels (confidence distribution, decay, dream history, corpus health), dream review controls, and historical session playback.
-
-The honest framing: this is a single-operator, self-hosted system. Advanced features ship behind flags and GATE reviews. What backs reliability is engineering rigor, not scale — a zero-LLM pinned-clock replay regression net, adversarial GATE reviews run against a *copy* of real data, idempotent locked consolidation passes, and fail-open/fail-silent behavior everywhere a hook or service could stall.
 
 ---
 
@@ -34,7 +34,7 @@ The honest framing: this is a single-operator, self-hosted system. Advanced feat
 | **Auto-discovery** | Observation ingestion → 6 zero-cost heuristic detectors → synthesizer → confidence scoring → semantic dedup → memory creation. Recurring-error classification and tiering. |
 | **Static surfacing** | Per-prompt injection of relevant tools, skills, and project conventions from the operator's `~/.claude` indexes, with a causal acceptance metric. |
 | **Optional reasoner** | Local Ollama pair classifier (`qwen3:8b`), classify/extract only — never writes. Off or provider-down degrades byte-for-byte to deterministic-only behavior. |
-| **Storage backends** | Dual: SQLite (`better-sqlite3` + in-memory vector index) or PostgreSQL (`pg` + `pgvector`), selected by `DATABASE_TYPE`. Both implement the same backend-agnostic store interfaces. |
+| **Storage backends** | SQLite (`better-sqlite3` + in-memory vector index) — the supported 0.x backend. An alternative PostgreSQL (`pg` + `pgvector`) backend implements the same store interfaces but is maintainer-only — see [docs/postgres-maintainer.md](docs/postgres-maintainer.md). |
 | **Optional services** | Neo4j (graph/entity traversal), Redis (ephemeral context), MinIO (S3 artifact storage) — each feature-flagged, gracefully degrades if absent. |
 | **Observability** | SSE observation stream + six-tab viz (graph, live events, ops panels, session replay, dream review, slots). |
 | **Interfaces** | **19 MCP tools** (thin stdio HTTP clients) + Fastify REST API on port 3200. |
@@ -56,25 +56,24 @@ cp .env.example .env    # then edit — see below
 npm run build
 ```
 
-First boot downloads the embedding model (~30 MB) into `models/` and auto-creates `data/` and `logs/` — no seed step. **Full walkthrough — service install, Claude Code / Codex CLI wiring, hooks, API keys, and troubleshooting — is in [SETUP.md](SETUP.md).**
+First boot downloads the embedding model (~30 MB) into `models/`, auto-creates `data/` and `logs/`, and — when no `ADMIN_API_KEY` is set in the launch environment or `.env` — generates one into `.env` (precedence: non-empty launch env > non-empty `.env` value > generated; an unwritable `.env` is a boot refusal with instructions, not a keyless boot). No seed step. **Full walkthrough — service install, Claude Code / Codex CLI wiring, hooks, API keys, and troubleshooting — is in [SETUP.md](SETUP.md).**
 
 ### Environment (.env)
 
-`.env.example` is the complete, commented **server** configuration reference (hook/client-side variables like `KOPENG_API_URL` are documented in SETUP.md); these are the ones you'll touch first:
+`.env.example` is the complete, commented **server** configuration reference for the default SQLite path (hook/client-side variables like `KOPENG_API_URL` are documented in SETUP.md; selecting the maintainer-only Postgres backend is covered in [docs/postgres-maintainer.md](docs/postgres-maintainer.md)); these are the ones you'll touch first:
 
 ```
 PORT=3200
 HOST=127.0.0.1
-DATABASE_TYPE=sqlite
 DATABASE_PATH=./data/memory.db
 EMBEDDING_MODEL=Xenova/all-MiniLM-L6-v2
 LOG_LEVEL=info
 MEMORY_API_URL=http://localhost:3200
 ```
 
-> **Before you change `HOST`.** KOPENG binds loopback by default and expects to stay there. Every auth gate is *optional* — with no `ADMIN_API_KEY` set, memory create/update/archive, slots, context, and artifacts are all open, and with no `OBSERVATION_API_KEY` set, observation ingest is too. That's deliberate for a single-operator local install, but it means a wildcard bind on an untrusted network hands over full read **and write** access to your memory corpus. Since memories are recalled into a model's context on later prompts, a write there is a persistent prompt-injection channel.
+> **Before you change `HOST`.** KOPENG binds loopback by default, and the 0.x preview is designed to stay there. A non-loopback `HOST` **refuses to boot** unless both `ADMIN_API_KEY` and `OBSERVATION_API_KEY` are set — the refusal names the missing key(s) and points at [SECURITY.md](SECURITY.md). "Loopback" here means `localhost`, `::1`, or a real IPv4 address starting `127.` — a hostname like `127.example.test` does not count. Even with both keys set, **remote deployment is unsupported for the 0.x preview**: an outer boundary (a private VPN or an authenticating reverse proxy) is required, because the keys gate mutations, not reads.
 >
-> To reach it from another machine: set both keys, and put it behind a VPN or an authenticating reverse proxy. Setting the keys alone is not a substitute for network placement — see [SECURITY.md](SECURITY.md).
+> The threat model in one paragraph: **operator mutations require the generated admin key; observation ingestion — OFF on the preview path — uses its own separate, optional key when enabled.** Reads are public by design — recall/search/surface/traverse, listing, the SSE stream, the ops snapshots, and the keyless `GET /api/operator-config` (which exposes the scope-alias map, i.e. client names) — so any process that can reach the port can read the whole corpus. Since memories are recalled into a model's context on later prompts, a write there would be a persistent prompt-injection channel — which is what the admin key exists to close. Full inventory and reasoning: [SECURITY.md](SECURITY.md).
 
 Optional layers are off by default and gated by their own flags (each degrades gracefully if its backing service is unavailable). Set a flag to `true` to enable that layer:
 
@@ -93,7 +92,7 @@ REDIS_ENABLED=false
 MINIO_ENABLED=false
 ```
 
-For PostgreSQL, set `DATABASE_TYPE=postgres` and provide the `pg`/`pgvector` connection settings (see `src/config/config.ts`).
+The alternative PostgreSQL backend is maintainer-only and not part of the 0.x preview path — see [docs/postgres-maintainer.md](docs/postgres-maintainer.md).
 
 ## Running
 
@@ -220,7 +219,7 @@ The passive-learning and proactive-surfacing layers run as Claude Code / Codex C
 npx tsx scripts/migrate-from-files.ts --dry-run
 npm run migrate
 
-# SQLite → PostgreSQL
+# SQLite → PostgreSQL (maintainer-only backend — see docs/postgres-maintainer.md)
 npm run migrate:postgres
 npm run migrate:verify
 ```
@@ -269,7 +268,7 @@ nssm start kopeng
 
 ## Network Access
 
-The server binds `127.0.0.1:3200` by default. To let other machines reach it (e.g. peers on a private VPN such as WireGuard or Tailscale) set `HOST=0.0.0.0` — but set `ADMIN_API_KEY` and `OBSERVATION_API_KEY` first, and read the warning under [Environment](#environment-env): with no keys configured every write endpoint is open. On Windows, also allow the port through the firewall (run as admin; scope `-InterfaceAlias` to your VPN interface if you have one):
+The server binds `127.0.0.1:3200` by default, and the 0.x preview path assumes it stays there — **remote deployment is unsupported for this preview**. If you point peers at it anyway (e.g. over a private VPN such as WireGuard or Tailscale), know that a non-loopback `HOST` refuses to boot unless both `ADMIN_API_KEY` and `OBSERVATION_API_KEY` are set, that the keys gate mutations while reads stay public, and that the VPN (or an authenticating reverse proxy) is therefore the required outer boundary — read the warning under [Environment](#environment-env) and [SECURITY.md](SECURITY.md) first. On Windows, also allow the port through the firewall (run as admin; scope `-InterfaceAlias` to your VPN interface if you have one):
 
 ```powershell
 New-NetFirewallRule -DisplayName "KOPENG API" `
@@ -341,6 +340,7 @@ KOPENG is source-available under the [Business Source License 1.1](LICENSE): you
 
 Built by **djy89** — a single-maintainer project.
 
+- **More of my work:** [djy89.net](https://djy89.net)
 - **Bugs, questions, design discussion:** open a [GitHub issue](https://github.com/djy89/kopeng/issues). Public discussion is preferred; it helps the next person with the same question.
 - **Anything else:** `hello@kopeng.net`
 - **Security vulnerabilities:** neither of the above — use GitHub's private vulnerability reporting, per [SECURITY.md](SECURITY.md). Please don't put exploitable details in a public issue or in email.
