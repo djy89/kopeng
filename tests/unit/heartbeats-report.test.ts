@@ -211,18 +211,29 @@ describe('expected-tasks registry lifecycle', () => {
     }
   });
 
-  it('both installers register after task creation and unregister only in -Uninstall', () => {
-    for (const [file, task, cadence] of [
+  it('every present installer registers after task creation and unregisters only in -Uninstall', () => {
+    // The public cut ships a SUBSET of these installers (install-sync-task.ps1 is
+    // operator-local — its runner drives the excluded sync:indexes script), so absent
+    // files are skipped rather than ENOENT-failing the shipped test suite. The ≥1
+    // floor keeps the test from passing vacuously on a tree with no installers at
+    // all; the dev repo always carries both, so both are asserted there.
+    const installers = [
       ['install-sync-task.ps1', 'sync-indexes', 24],
       ['install-corpus-health-task.ps1', 'corpus-health', 168],
-    ] as const) {
-      const source = fs.readFileSync(path.join(process.cwd(), 'scripts', 'ops', file), 'utf8');
+    ] as const;
+    let present = 0;
+    for (const [file, task, cadence] of installers) {
+      const installerPath = path.join(process.cwd(), 'scripts', 'ops', file);
+      if (!fs.existsSync(installerPath)) continue;
+      present++;
+      const source = fs.readFileSync(installerPath, 'utf8');
       const uninstallBlock = source.match(/if \(\$Uninstall\) \{([\s\S]*?)\n\}/)?.[1] ?? '';
       expect(uninstallBlock).toContain(`& node $ExpectedTasksHelper unregister ${task}`);
       expect(source.lastIndexOf('Register-ScheduledTask -TaskName')).toBeLessThan(
         source.indexOf(`& node $ExpectedTasksHelper register ${task} ${cadence}`)
       );
     }
+    expect(present).toBeGreaterThan(0);
   });
 });
 
