@@ -38,7 +38,8 @@ export const updateMemoryTool = {
     if (args.scope !== undefined) body.scope = args.scope;
     if (args.tags !== undefined) body.tags = args.tags;
     if (args.metadata !== undefined) body.metadata = args.metadata;
-    if (args.confidence !== undefined) body.confidence = args.confidence;
+    // Number(): see store-memory.ts — the same client-serialization quirk hits update.
+    if (args.confidence !== undefined) body.confidence = Number(args.confidence);
 
     const response = await fetch(`${apiUrl}/api/memories/${args.id}`, {
       method: 'PUT',

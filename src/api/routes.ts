@@ -52,7 +52,11 @@ const StoreSchema = z.object({
   metadata: z.record(z.unknown()).default({}),
   tags: z.array(z.string()).default([]),
   created_by: z.string().optional(),
-  confidence: z.number().min(0).max(1).optional(),
+  // z.coerce: some MCP clients serialize a whole-number confidence (e.g. 1.0,
+  // the value the tool's own description tells callers to pass) as a JSON
+  // string rather than a number — plain z.number() 400s on that instead of
+  // storing the anchor. Coercing here is the durable, client-agnostic fix.
+  confidence: z.coerce.number().min(0).max(1).optional(),
 });
 
 // Phase 3 (Task 9): re-drive a held scope's stored observations after a ruling.
@@ -168,7 +172,8 @@ const UpdateSchema = z.object({
   // F3/T22: confidence is the anchor-triage surface (demote a legacy 1.0 anchor,
   // or deliberately re-anchor). A change is snapshot-first + reversible via the
   // rollback API (see the PUT handler). Bounds mirror the store: 0..1.
-  confidence: z.number().min(0).max(1).optional(),
+  // z.coerce: see StoreSchema — the same client-serialization quirk hits update.
+  confidence: z.coerce.number().min(0).max(1).optional(),
 });
 
 const SearchSchema = z.object({

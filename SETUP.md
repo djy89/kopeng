@@ -81,14 +81,30 @@ clears), which takes precedence over the env value.
 
 ### Advanced: passive learning
 
-The auto-discovery pipeline (KOPENG learning from your tool use) is OFF by
-default and not part of the preview path. The observation hooks in §4 are
-inert without these two flags in the server `.env`:
+When you reach §4, `npm run wire` asks how much KOPENG should enable and shows
+the matching `.env` changes in its dry-run report:
+
+| Profile | Day-one behavior |
+|---------|------------------|
+| `minimal` | Adds no learning flags; fresh installs use manual memory only. |
+| `recommended` | Adds observation ingestion and discovery detection; it does not add dreaming. |
+| `everything` | Adds passive learning plus the nightly dreaming pass. Auto-apply is not armed. |
+
+Press Enter at the interactive prompt for `recommended`. Non-interactive runs
+never prompt and choose `minimal`; pass `--profile recommended` or
+`--profile everything` to opt in explicitly. `wire` appends only missing flags
+to this repo's `.env` and never overwrites an active assignment already there.
+The shipped defaults remain OFF for anyone who does not run `wire`.
+
+The manual equivalent for passive learning is:
 
 ```
 OBSERVATION_INGESTION_ENABLED=true     # accept + store tool-use observations
 DISCOVERY_DETECTION_ENABLED=true       # turn stored observations into discovered memories
 ```
+
+Add `DREAMING_ENABLED=true` for the `everything` posture. The `auto_accept_*`
+controls are separate operator-config gates and no `wire` profile changes them.
 
 **Observation write auth.** If other machines can reach the server, generate a shared secret:
 
@@ -100,9 +116,15 @@ The same value goes in two places under two names:
 - Server side: `OBSERVATION_API_KEY=<value>` in this repo's `.env` — the server then requires `X-API-Key` on the observation write endpoints.
 - Client side: `KOPENG_API_KEY=<value>` in the `env` block of `~/.claude/settings.json` (step 4b) — the hooks send it as `X-API-Key`.
 
+There are three key variable names but only two credentials: `ADMIN_API_KEY`
+is the server's operator-admin credential; `OBSERVATION_API_KEY` is the
+server-side observation credential; and client hooks receive that same
+observation credential as `KOPENG_API_KEY`. The recall hooks read no key —
+memory reads stay public by design.
+
 > **Naming note:** everything here uses the `kopeng` names — `KOPENG_*` env vars, the `kopeng-observe.js` hook script, the `~/.kopeng/` client-side data directory.
 
-If you skip this, observation writes are open — acceptable only when the server is loopback-only (the default `HOST=127.0.0.1`). This key is deliberately **separate** from `ADMIN_API_KEY`: it is distributed to hook clients on other machines and must not carry admin power.
+If you skip this, observation writes are open — acceptable only when the server is loopback-only (the default `HOST=127.0.0.1`). The observation credential is deliberately separate because it may be distributed to hook clients on other machines and must not carry admin power.
 
 ### Remote access
 
@@ -175,6 +197,35 @@ No root / prefer user-level? `systemctl --user` with the same unit in `~/.config
 
 ## 4. Wire to Claude Code
 
+From the repo root, let KOPENG merge its MCP registration and five baseline
+hooks into your existing Claude Code config:
+
+```bash
+npm run wire                 # choose a profile; dry-run and review actual values
+# Run the exact "Apply these changes with" command printed by the dry run.
+# Non-interactive example:
+npm run wire -- --apply --profile recommended
+# If wire changed .env, stop and restart the server process (or service) now.
+npm run doctor               # verify server + MCP + hooks + feature posture
+```
+
+Feature flags are read when the server starts. If `wire` adds profile values to
+`.env`, restart the foreground process or installed KOPENG service before
+running `doctor`.
+
+`wire` is idempotent: re-run it after moving the clone and it updates KOPENG's
+paths without duplicating entries. It preserves unrelated MCP servers, env
+values, hooks, and explicit profile flags. If your client uses a non-default
+server URL, pass it explicitly as
+`npm run wire -- --apply --api-url <url> --profile <profile>`.
+
+If you run the dry run from a linked Git worktree, `wire` warns that its paths
+may be temporary and refuses an implicit `--apply`. Run from the stable checkout
+or pass it explicitly with `--repo-root <path-to-stable-kopeng-checkout>`.
+
+Prefer to inspect or maintain the JSON yourself? The manual equivalent remains
+below as §4a–§4e.
+
 ### 4a. Register MCP server in `~/.claude.json`
 
 Add to `mcpServers`:
@@ -198,10 +249,14 @@ The top-level `env` block in `settings.json` is read by Claude Code and propagat
 
 ```json
 "env": {
-  "KOPENG_API_URL": "http://localhost:3200",
-  "KOPENG_API_KEY": "<your-generated-key>"
+  "KOPENG_API_URL": "http://localhost:3200"
 }
 ```
+
+On the default loopback install, that is the complete client env block.
+`KOPENG_API_KEY` is optional: add it only when you enabled observation write
+auth in §2, using the same value as the server's `OBSERVATION_API_KEY`. It is
+inert while passive learning is off, and the recall hooks never read it.
 
 ### 4c. Configure hooks in `~/.claude/settings.json`
 
@@ -268,11 +323,11 @@ Nothing to copy: every hook runs straight from `scripts/hooks/` in the repo. Jus
 
 **Why Node and not bash:** the recall hooks were originally bash scripts that shelled out to `jq` and `curl`. On 2026-06-02 `jq` vanished from the PATH and every recall hook silently bailed at its first line — memory recall went **completely OFF with no error**, while writes kept working (so nothing looked broken). The Node rewrite removes all external CLI dependencies: JSON via `JSON.parse`/`JSON.stringify`, HTTP via global `fetch`, git via `child_process` (its absence only drops git context, never disables a hook). Node is the same runtime that already runs the server and the observe hook — there is nothing ambient left to go missing.
 
-### 4e. Verify the hooks work (client-wiring check)
+### 4e. Verify the hooks manually (fallback client-wiring check)
 
-This is the **client-wiring check** — `npm run canary` (see
-[Verification](#verification)) proves the server-side path but does **not**
-test your `~/.claude/settings.json` wiring; this section does.
+`npm run doctor` is the recommended client-wiring check. It verifies these
+paths automatically and runs a live recall through the real hook. The commands
+below are the manual fallback when diagnosing one hook in isolation.
 
 From the repo root, simulate what Claude Code pipes to each hook on stdin:
 
@@ -468,7 +523,14 @@ The staple memory must appear with `score: 0.99`.
 
 ## Verification
 
-**`npm run canary`** is the one-command install proof. It stores a canary
+Run both checks after first setup:
+
+```bash
+npm run canary    # server path: store → embed → semantic recall
+npm run doctor    # whole install: server + MCP + hooks + feature posture
+```
+
+**`npm run canary`** is the server-path proof. It stores a canary
 memory carrying a fresh random token, then spawns the **real** recall hook
 (`scripts/hooks/memory-prompt-search.mjs`) and asserts the token comes back —
 so a pass exercises store → embed → **semantic** recall end to end. The canary
@@ -484,8 +546,10 @@ be crowded out of the probe's top-5 results by higher-scoring memories, so a
 failure there can misreport a healthy install — re-run, or verify via the
 §4e REST check.
 
-What the canary does **not** test: your Claude Code client wiring — the
-`~/.claude/settings.json` hook paths and MCP registration. That's [§4e](#4e-verify-the-hooks-work-client-wiring-check).
+What the canary does **not** test: the MCP registration and hook commands in
+your Claude Code config. `npm run doctor` checks that client half, reports each
+failure with its exact fix, and prints whether passive learning and dreaming
+are currently on or off. It never changes the feature flags.
 
 Quick liveness checks, any time:
 
@@ -542,7 +606,7 @@ First stop: `curl http://localhost:3200/api/health` — it reports embedding-ind
 
 **MCP tools don't appear in Claude Code.** Almost always the stdio registration path: `args` must be an **absolute path** to `dist/index.js` (forward slashes on Windows), and `dist/` must exist (`npm run build`). Restart Claude Code after editing `~/.claude.json`. Test the server directly: `curl http://localhost:3200/api/health` — the MCP process is a thin client; if the REST API is down, every tool call fails.
 
-**Hooks are silent (no recall, no observations).** Work through [§4e](#4e-verify-the-hooks-work-client-wiring-check): pipe a fake prompt into the hook script directly. If the script works standalone but not in Claude Code, check that `node` is on the PATH Claude Code spawns hooks with and that the `<REPO>` absolute paths in `settings.json` are correct. Hooks are deliberately fail-open — they exit 0 and print nothing rather than break your session, so a misconfigured path *looks* like silence, not an error.
+**Hooks are silent (no recall, no observations).** Run `npm run doctor`, then use [§4e](#4e-verify-the-hooks-manually-fallback-client-wiring-check) to pipe a fake prompt into one hook directly. If the script works standalone but not in Claude Code, check that `node` is on the PATH Claude Code spawns hooks with and that the `<REPO>` absolute paths in `settings.json` are correct. Hooks are deliberately fail-open — they exit 0 and print nothing rather than break your session, so a misconfigured path *looks* like silence, not an error.
 
 **Observation POSTs return 401/403.** `OBSERVATION_API_KEY` (server `.env`) and `KOPENG_API_KEY` (hook env in `~/.claude/settings.json`) must hold the same value — see §2. The hook buffers failed batches locally and retries, so nothing is lost while you fix the key.
 

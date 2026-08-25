@@ -53,7 +53,10 @@ export const storeMemoryTool = {
         scope: args.scope || 'global',
         tags: args.tags || [],
         metadata: args.metadata || {},
-        ...(args.confidence !== undefined ? { confidence: args.confidence } : {}),
+        // Number(): the calling client sometimes serializes a whole-number
+        // confidence (e.g. 1.0) as a JSON string; forwarding it as-is 400s
+        // against the server's numeric schema instead of storing the anchor.
+        ...(args.confidence !== undefined ? { confidence: Number(args.confidence) } : {}),
         // The stdio MCP server is shared by multiple clients (Claude Code, Codex,
         // …) and cannot reliably know which one is calling — record neutral MCP
         // provenance rather than a guessed client or a machine identifier.
