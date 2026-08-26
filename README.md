@@ -192,7 +192,17 @@ Plus context/artifact/graph tools (`set_context`, `get_context`, `store_artifact
 
 ### Claude Code registration
 
-Add to Claude Code user settings (`~/.claude.json` or the settings UI):
+The guided path — registers the MCP server and installs the hooks with a minimal-diff merge that owns only KOPENG's entries and never touches the rest of your config:
+
+```bash
+npm run wire             # dry-run: prints exactly what would change, changes nothing
+npm run wire -- --apply  # apply (backs up first; re-runnable, idempotent)
+npm run doctor           # end-to-end install check, including a live recall round-trip
+```
+
+`wire` also offers a minimal / recommended / everything learning profile at wire time; shipped defaults stay OFF either way. `doctor` is the one command that answers "is my whole install actually correct?" — run it whenever KOPENG seems quiet.
+
+Manual fallback — add to Claude Code user settings (`~/.claude.json` or the settings UI):
 
 ```json
 {
@@ -210,7 +220,7 @@ Add to Claude Code user settings (`~/.claude.json` or the settings UI):
 
 ### Observation + recall hooks
 
-The passive-learning and proactive-surfacing layers run as Claude Code / Codex CLI hooks (`scripts/hooks/`). The observe hook appends tool-use events to a local JSONL buffer and batch-flushes to the server; the recall hooks inject relevant memory, tools, skills, and conventions before each prompt. See `SETUP.md` and `docs/codex-setup.md` for wiring details.
+The passive-learning and proactive-surfacing layers run as Claude Code / Codex CLI hooks (`scripts/hooks/`). The observe hook appends tool-use events to a local JSONL buffer and batch-flushes to the server; the recall hooks inject relevant memory, tools, skills, and conventions before each prompt. `npm run wire` installs the Claude Code hooks for you (above); manual wiring and Codex CLI details are in `SETUP.md` and `docs/codex-setup.md`.
 
 ## Migration
 
