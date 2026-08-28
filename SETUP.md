@@ -8,7 +8,15 @@ Get KOPENG running on a fresh device and wired to Claude Code. For full architec
 
 ## Prerequisites
 
-- Node.js 20+
+- Node.js 20+. **On Windows prefer Node 20 or 22 LTS:** on Node 24 the recall hook is killed by an
+  upstream Node bug ([nodejs/node#58091](https://github.com/nodejs/node/issues/58091)) — a libuv assertion
+  when a script calls `process.exit()` after `fetch()` — so hooks fail silently (they are fail-open, so you
+  get no recall rather than an error). Installing and building are fine on Node 24; it is only the hooks.
+  Tracked as backlog T52.
+- **Windows only:** the [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe). The
+  embedding runtime (`onnxruntime-node`) is a native module that will not load without it. A fresh Windows
+  image often does not have it; see the `ERR_DLOPEN_FAILED` entry under [Troubleshooting](#troubleshooting)
+  for what that looks like.
 - A service manager — [NSSM](https://nssm.cc/) on Windows, systemd on Linux (built in)
 - Claude Code installed
 - A CLAUDE.md section teaching Claude to use KOPENG (see [§5 below](#5-teach-claude-how-to-use-kopeng))
@@ -601,6 +609,14 @@ First stop: `curl http://localhost:3200/api/health` — it reports embedding-ind
 **First boot is slow / needs network.** On first run the server downloads the embedding model (~30 MB) into `models/`, and the first *search* additionally lazy-loads the reranker (~1s one-time). Both are cached forever after. Air-gapped install: copy a populated `models/` directory from another machine — same layout, no code change. `data/` and `logs/` are auto-created; there is no seed step.
 
 **`better-sqlite3` fails to load (`NODE_MODULE_VERSION` mismatch / "was compiled against a different Node.js version").** The native module was built for a different Node than the one running. Rebuild against the active Node: `npm rebuild better-sqlite3` (or delete `node_modules` and `npm ci`). This bites most often when a service manager (NSSM, systemd) runs a different Node than your shell — point the service at the same `node` binary you built with. On Linux, if npm falls back to compiling from source (no prebuilt binary for your Node/arch), install the toolchain first: `sudo apt install build-essential python3` (or distro equivalent).
+
+**Embedding model never loads (`ERR_DLOPEN_FAILED` on `onnxruntime_binding.node`).** The ONNX runtime is a native
+module and needs the Microsoft Visual C++ Redistributable on Windows (see [Prerequisites](#prerequisites)); install it
+and restart. The server is *designed* to survive this — it logs `Continuing with keyword-only search` and keeps serving
+FTS/keyword results, so `/api/memories/search` still works while `/api/memories/recall` (semantic-only) returns empty.
+Until 2026-08-26 it logged that line and then died anyway on Node <= 20, because a failing ESM import of a throwing
+CommonJS dependency surfaces the same error twice and the second one is unreachable; that is fixed, and pinned by
+`tests/unit/import-duplicate-rejection.test.ts`.
 
 **`EADDRINUSE` on start.** Something already owns port 3200 — set `PORT` in `.env` (and update `MEMORY_API_URL` everywhere clients reference it: MCP registration, hook env).
 

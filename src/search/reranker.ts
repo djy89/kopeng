@@ -1,5 +1,6 @@
 import config from '../config/config.js';
 import logger from '../utils/logger.js';
+import { importWithoutDuplicateRejection } from '../utils/import-safely.js';
 
 let tokenizer: any;
 let model: any;
@@ -13,7 +14,10 @@ export async function initReranker(): Promise<void> {
   const modelName = config.reranker.model;
   logger.info(`Loading reranker model: ${modelName}`);
 
-  const { AutoTokenizer, AutoModelForSequenceClassification, env } = await import('@xenova/transformers');
+  // Same guard as the embedder: if a search is what first touches the ONNX
+  // runtime, its load failure must stay a caught error, not a fatal twin.
+  const { AutoTokenizer, AutoModelForSequenceClassification, env } =
+    await importWithoutDuplicateRejection(() => import('@xenova/transformers'));
   env.cacheDir = config.embedding.cacheDir;
   env.allowRemoteModels = true;
 

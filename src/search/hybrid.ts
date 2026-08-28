@@ -1,6 +1,6 @@
 import type { IMemoryStore, IVectorSearch } from '../database/interfaces.js';
 import type { VectorSearchResult } from '../embeddings/index.js';
-import { embed } from '../embeddings/embedder.js';
+import { embed, isEmbedderReady } from '../embeddings/embedder.js';
 import { rerank, isRerankerReady, initReranker } from './reranker.js';
 import type { MemoryType, SearchResult } from '../types/types.js';
 import { computeEffectiveConfidence } from '../discovery/confidence.js';
@@ -76,8 +76,13 @@ export async function hybridSearch(
     ? Math.max(rerankCandidates, limit + offset + 50)
     : limit + offset + 50;
 
-  // Semantic search
-  if (mode !== 'keyword' && embeddingIndex.isReady) {
+  // Semantic search.
+  // isReady describes the VECTOR INDEX, not the embedder — a populated corpus
+  // reports ready even when the model failed to load — so the embedder is
+  // checked too. Without it, a server that logged "continuing with keyword-only
+  // search" would still 500 every search on embed(): the fail-open promise held
+  // only on an empty corpus, where the index happens to report not-ready.
+  if (mode !== 'keyword' && embeddingIndex.isReady && isEmbedderReady()) {
     const queryEmbedding = await embed(query);
     semanticResults = await embeddingIndex.search(queryEmbedding, candidateIds, fetchLimit);
   }

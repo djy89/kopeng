@@ -19,13 +19,30 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        # Both ends of the supported range. Node 24 is here because a fresh
+        # install on current LTS fell into a node-gyp source build and died
+        # without VS Build Tools — better-sqlite3 9.x shipped no Node 24
+        # prebuild, and a matrix pinned to a single version could not see it.
+        node: [20, 24]
+        exclude:
+          # PARKED, not passing — backlog T52. On Windows + Node 24 the recall
+          # hook dies with a libuv assertion (uv_async_send on a closing handle,
+          # src\win\async.c:94) the moment it calls process.exit() after a
+          # fetch(): upstream nodejs/node#58091, not our logic. It took out all
+          # 13 child-process hook tests here. npm ci and tsc both PASS on this
+          # combination — the better-sqlite3 prebuild fix is proven by the
+          # Install/Build steps of this very job before it was excluded, and by
+          # ubuntu-latest + 24, which stays in the matrix. Documented as a
+          # known limitation in SETUP.md; remove this exclude when T52 lands.
+          - os: windows-latest
+            node: 24
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install
@@ -58,7 +75,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dream-effectiveness-${{ matrix.os }}
+          name: dream-effectiveness-${{ matrix.os }}-node${{ matrix.node }}
           path: scratch/dream-effectiveness.json
           if-no-files-found: ignore
 

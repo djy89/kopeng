@@ -48,6 +48,8 @@ Most "agent memory" is append-only store-and-retrieve RAG: it remembers, it neve
 
 ## Setup
 
+Requires Node 20+. On **Windows**, also install the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) — the local embedding runtime is a native module that will not load without it (KOPENG degrades to keyword-only search rather than failing, but you want the semantic half).
+
 ```bash
 git clone https://github.com/djy89/kopeng.git
 cd kopeng

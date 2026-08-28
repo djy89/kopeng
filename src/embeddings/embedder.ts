@@ -1,5 +1,6 @@
 import config from '../config/config.js';
 import logger from '../utils/logger.js';
+import { importWithoutDuplicateRejection } from '../utils/import-safely.js';
 
 // Dynamic import for @xenova/transformers (ESM)
 let pipeline: any;
@@ -32,8 +33,11 @@ export async function initEmbedder(): Promise<void> {
   const startTime = Date.now();
   logger.info(`Loading embedding model: ${config.embedding.model}`);
 
-  // Dynamic import
-  const { pipeline: pipelineFn, env } = await import('@xenova/transformers');
+  // Guarded: a native-binding load failure here must degrade to keyword-only
+  // search, not kill the process on an unreachable duplicate rejection.
+  const { pipeline: pipelineFn, env } = await importWithoutDuplicateRejection(
+    () => import('@xenova/transformers')
+  );
   pipeline = pipelineFn;
 
   // Set cache directory for model downloads
