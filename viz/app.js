@@ -3,7 +3,7 @@ const ENTITY_TYPES = ['concept', 'technology', 'project', 'organization', 'perso
 
 // Read color tokens from CSS so the palette stays in one place.
 function cssVar(name) {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return getComputedStyle(document.body).getPropertyValue(name).trim();
 }
 // COLORS / ENTITY_COLORS are rebuilt on theme change. Don't rely on the const'd
 // values across themes.
@@ -15,8 +15,16 @@ function refreshColors() {
 }
 
 // ---------- Theme switcher ----------
+const THEMES = ['void', 'ops', 'amber', 'linen'];
+function syncThemeButton(name) {
+  const label = document.getElementById('theme-name');
+  if (label) label.textContent = name.toUpperCase();
+  const btn = document.getElementById('theme-toggle');
+  if (btn) btn.title = `theme: ${name} — click to cycle`;
+}
 function setTheme(name) {
   document.body.dataset.theme = name;
+  syncThemeButton(name);
   try { localStorage.setItem('kopeng-viz-theme', name); } catch {}
   refreshColors();
   if (typeof lastStats !== 'undefined' && lastStats) {
@@ -29,6 +37,7 @@ try {
 } catch {
   document.body.dataset.theme = 'void';
 }
+syncThemeButton(document.body.dataset.theme);
 
 const STORES = [
   {
@@ -93,7 +102,7 @@ let bipartite = { entities: [], links: [] };
 let useEntityEdges = false; // true when Neo4j is enabled and edges fetched OK
 const activeTypes = new Set(TYPES);
 const activeEntityTypes = new Set(ENTITY_TYPES);
-let activeScope = '__all__';
+let activeScopes = new Set();
 let searchTerm = '';
 let lastStats = null;
 let nodeSel, linkSel; // active D3 selections (mixed: memory + entity nodes)
@@ -126,6 +135,50 @@ function el(tag, attrs, ...kids) {
   return node;
 }
 const clear = (n) => { while (n.firstChild) n.removeChild(n.firstChild); };
+
+// ---------- API latency (client-measured, /api/* only, 50-sample ring) ----------
+const latSamples = [];
+function updateP50() {
+  const elP = document.getElementById('health-p50');
+  if (!elP) return;
+  if (latSamples.length < 5) { elP.textContent = ''; return; }
+  const s = [...latSamples].sort((a, b) => a - b);
+  elP.textContent = ` · p50 ${Math.round(s[Math.floor(s.length / 2)])}ms`;
+}
+{
+  const origFetch = window.fetch.bind(window);
+  window.fetch = (input, init) => {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    const p = origFetch(input, init);
+    if (url.startsWith('/api/')) {
+      const t0 = performance.now();
+      p.finally(() => {
+        latSamples.push(performance.now() - t0);
+        if (latSamples.length > 50) latSamples.shift();
+        updateP50();
+      }).catch(() => {});
+    }
+    return p;
+  };
+}
+
+// Auto-discovery tier buckets — same edges as the ops confidence-distribution.
+function tierOf(conf) {
+  if (conf <= 0.55) return { name: 'noted', tone: '' };
+  if (conf <= 0.65) return { name: 'pattern', tone: 'radyn-pill--info' };
+  if (conf <= 0.85) return { name: 'actionable', tone: 'radyn-pill--warning' };
+  return { name: 'confirmed', tone: 'radyn-pill--success' };
+}
+function relTime(iso) {
+  if (!iso) return null;
+  const ms = Date.now() - new Date(iso + (iso.endsWith('Z') || iso.includes('+') ? '' : 'Z')).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const m = Math.floor(ms / 60000);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
 
 // ---------- Data ----------
 async function fetchAllMemories() {
@@ -242,6 +295,8 @@ function renderHealth(stats) {
     if (i > 0) els.health.append(' · ');
     els.health.append(el('b', null, String(n)), ' ' + label);
   });
+  els.health.append(el('span', { id: 'health-p50', class: 'radyn-value' }, ''));
+  updateP50();
 }
 
 // ---------- Stores panel ----------
@@ -262,7 +317,7 @@ function renderStores(stats, optional) {
     const row = el('div', { class: 'store' + (active ? ' active' : '') },
       el('div', { class: 'dot' }),
       el('div', null,
-        el('h3', null, s.name, ' ', el('span', { class: 'badge' }, s.badge)),
+        el('h3', null, s.name, ' ', el('span', { class: 'badge radyn-pill' }, s.badge)),
         el('p', null, s.desc),
         count != null
           ? el('span', { class: 'count' }, count.toLocaleString() + (s.key === 'neo4j' ? ' entities' : ' entries'))
@@ -347,6 +402,20 @@ function renderLegend() {
 }
 
 // ---------- Filters ----------
+function makeCheck(labelKids, checked, onChange) {
+  const btn = el('button', {
+    type: 'button', class: 'radyn-check radyn-focus', role: 'checkbox',
+    'aria-checked': String(!!checked),
+    onclick: () => {
+      const next = btn.getAttribute('aria-checked') !== 'true';
+      btn.setAttribute('aria-checked', String(next));
+      onChange(next);
+    },
+  }, el('span', { class: 'box', 'aria-hidden': 'true' }));
+  for (const kid of labelKids) btn.append(kid);
+  return btn;
+}
+
 function makeFilterGroup(title) {
   const group = el('div', { class: 'filter-group' });
   const body = el('div', { class: 'group-body' });
@@ -369,20 +438,15 @@ function renderFilters(stats) {
 
   const { group: typeGroup, body: typeBody } = makeFilterGroup('memory type');
   for (const t of TYPES) {
-    const cb = el('input', { type: 'checkbox', dataset: { type: t } });
-    cb.checked = activeTypes.has(t);
-    cb.addEventListener('change', () => {
-      cb.checked ? activeTypes.add(t) : activeTypes.delete(t);
-      renderGraph();
-    });
-    typeBody.append(
-      el('label', { class: 'opt' },
-        cb,
+    typeBody.append(makeCheck(
+      [
         el('span', { class: 'swatch', style: { background: COLORS[t] } }),
         el('span', null, t),
-        el('span', { class: 'count' }, (stats.by_type[t] || 0).toLocaleString())
-      )
-    );
+        el('span', { class: 'count' }, (stats.by_type[t] || 0).toLocaleString()),
+      ],
+      activeTypes.has(t),
+      next => { next ? activeTypes.add(t) : activeTypes.delete(t); renderGraph(); },
+    ));
   }
   els.filters.append(typeGroup);
 
@@ -392,35 +456,29 @@ function renderFilters(stats) {
 
     const { group: entGroup, body: entBody } = makeFilterGroup('entity type');
     for (const et of ENTITY_TYPES) {
-      const cb = el('input', { type: 'checkbox', dataset: { etype: et } });
-      cb.checked = activeEntityTypes.has(et);
-      cb.addEventListener('change', () => {
-        cb.checked ? activeEntityTypes.add(et) : activeEntityTypes.delete(et);
-        renderGraph();
-      });
-      entBody.append(
-        el('label', { class: 'opt' },
-          cb,
+      entBody.append(makeCheck(
+        [
           el('span', { class: 'swatch swatch-diamond', style: { borderColor: ENTITY_COLORS[et] || cssVar('--muted-foreground') } }),
           el('span', null, et),
-          el('span', { class: 'count' }, (entityCounts[et] || 0).toLocaleString())
-        )
-      );
+          el('span', { class: 'count' }, (entityCounts[et] || 0).toLocaleString()),
+        ],
+        activeEntityTypes.has(et),
+        next => { next ? activeEntityTypes.add(et) : activeEntityTypes.delete(et); renderGraph(); },
+      ));
     }
     els.filters.append(entGroup);
   }
 
   const { group: scopeGroup, body: scopeBody } = makeFilterGroup('scope');
-  const scopeSel = el('select');
-  scopeSel.append(el('option', { value: '__all__' }, 'all scopes'));
+  const scopeList = el('div', { class: 'scope-list' });
   Object.entries(stats.by_scope).sort((a, b) => b[1] - a[1]).forEach(([s, c]) => {
-    scopeSel.append(el('option', { value: s }, `${s} (${c})`));
+    scopeList.append(makeCheck(
+      [el('span', null, s), el('span', { class: 'count' }, c.toLocaleString())],
+      activeScopes.has(s),
+      next => { if (next) activeScopes.add(s); else activeScopes.delete(s); renderGraph(); },
+    ));
   });
-  scopeSel.addEventListener('change', e => {
-    activeScope = e.target.value;
-    renderGraph();
-  });
-  scopeBody.append(scopeSel);
+  scopeBody.append(scopeList);
   els.filters.append(scopeGroup);
 
   const searchGroup = el('div', { class: 'filter-group' });
@@ -442,7 +500,7 @@ function renderFilters(stats) {
 function visibleMemories() {
   return allMemories.filter(m => {
     if (!activeTypes.has(m.type)) return false;
-    if (activeScope !== '__all__' && m.scope !== activeScope) return false;
+    if (!(activeScopes.size === 0 || activeScopes.has(m.scope))) return false;
     if (searchTerm) {
       const hay = (m.content + ' ' + m.tags.join(' ') + ' ' + m.scope).toLowerCase();
       if (!hay.includes(searchTerm)) return false;
@@ -578,6 +636,14 @@ function renderGraph() {
     if (zoomHud) zoomHud.textContent = `${Math.round(e.transform.k * 100)}%`;
   }));
 
+  svg.on('click', (e) => {
+    if (e.defaultPrevented) return;            // zoom/drag gesture, not a click
+    if (e.target !== svg.node()) return;       // hit a node/link, their handler owns it
+    selectedNodeId = null;
+    clearSelection();
+    resetDetailPane();
+  });
+
   linksGroup = root.append('g').attr('class', 'links');
   const linkSelLocal = linksGroup.selectAll('line').data(links).enter().append('line')
     .attr('class', 'link')
@@ -606,7 +672,7 @@ function renderGraph() {
     .attr('height', d => d._r * 2)
     .attr('transform', 'rotate(45)');
 
-  node.on('click', (e, d) => showDetail(d));
+  node.on('click', (e, d) => { selectedNodeId = d.id; applySelection(); showDetail(d); });
   node.on('mouseover', (e, d) => { highlight(d.id); showTooltip(e, d); });
   node.on('mousemove', e => moveTooltip(e));
   node.on('mouseout', () => { unhighlight(); hideTooltip(); });
@@ -670,6 +736,9 @@ function renderGraph() {
 
   nodeSel = node;
   linkSel = linkSelLocal;
+
+  if (selectedNodeId != null && !allNodes.some(n => n.id === selectedNodeId)) selectedNodeId = null;
+  applySelection();
 }
 
 // ---------- Highlight ----------
@@ -699,6 +768,40 @@ function unhighlight() {
   if (litNodes) litNodes.classed('lit', false).classed('highlight', false);
   if (litLinks) litLinks.classed('lit', false).classed('highlight', false);
   litNodes = litLinks = null;
+}
+
+// ---------- Selection ----------
+// Persistent selection — parallel class namespace to the hover dim (sel-* vs
+// dimmed/lit) so mouseout restores TO the selection state, never to neutral.
+let selectedNodeId = null;
+let selNodes = null, selLinks = null;
+function clearSelection() {
+  if (nodeSel) {
+    nodesGroup.classed('sel-dimmed', false);
+    linksGroup.classed('sel-dimmed', false);
+    if (selNodes) selNodes.classed('sel-lit', false).classed('selected', false);
+    if (selLinks) selLinks.classed('sel-lit', false);
+  }
+  selNodes = selLinks = null;
+}
+function applySelection() {
+  clearSelection();
+  if (selectedNodeId == null || !nodeSel) return;
+  const adj = adjacency.get(selectedNodeId) || new Set();
+  nodesGroup.classed('sel-dimmed', true);
+  linksGroup.classed('sel-dimmed', true);
+  selNodes = nodeSel.filter(d => d.id === selectedNodeId || adj.has(d.id)).classed('sel-lit', true);
+  selNodes.filter(d => d.id === selectedNodeId).classed('selected', true);
+  selLinks = linkSel.filter(d => {
+    const s = typeof d.source === 'object' ? d.source.id : d.source;
+    const t = typeof d.target === 'object' ? d.target.id : d.target;
+    return s === selectedNodeId || t === selectedNodeId;
+  }).classed('sel-lit', true);
+}
+function resetDetailPane() {
+  clear(els.detail);
+  els.detail.classList.add('empty');
+  els.detail.append('click a memory or entity to view it');
 }
 
 // ---------- Tooltip ----------
@@ -782,11 +885,18 @@ function showMemoryDetail(m) {
     el('span', { class: 'pill' }, 'id ' + m.id),
     m.source ? el('span', { class: 'pill' }, m.source) : null,
     (m.confidence != null && m.confidence < 1) ? el('span', { class: 'pill' }, 'conf ' + Number(m.confidence).toFixed(2)) : null,
+    (m.confidence != null) ? (() => {
+      const t = tierOf(Number(m.confidence));
+      return el('span', { class: `pill radyn-pill ${t.tone}` }, t.name);
+    })() : null,
     m.created_at ? el('span', { class: 'pill' }, m.created_at) : null
   );
 
   const body = el('div', { class: 'body' }, m.content || '');
   els.detail.append(meta, body);
+  const seen = relTime(m.last_seen ?? m.updated_at);
+  if (seen) els.detail.append(el('div', { class: 'meta-line' },
+    `${m.observation_count ?? 1} obs · last seen ${seen}`));
   if (m.tags && m.tags.length) {
     const tagBox = el('div', { style: { marginTop: '0.6rem' } });
     for (const t of m.tags) tagBox.append(el('span', { class: 'tag' }, '#' + t));
@@ -857,7 +967,8 @@ window.addEventListener('resize', () => {
   const themeBtn = document.getElementById('theme-toggle');
   if (themeBtn) {
     themeBtn.addEventListener('click', () => {
-      setTheme(document.body.dataset.theme === 'linen' ? 'void' : 'linen');
+      const i = THEMES.indexOf(document.body.dataset.theme);
+      setTheme(THEMES[(i + 1) % THEMES.length]);
     });
   }
   refreshColors();
@@ -873,7 +984,10 @@ window.addEventListener('resize', () => {
   const statusEl = document.getElementById('live-status');
   const countEl = document.getElementById('live-count');
   const rateEl = document.getElementById('live-rate');
-  const pauseEl = document.getElementById('live-pause');
+  const pauseSlot = document.getElementById('live-pause-slot');
+  if (pauseSlot) pauseSlot.append(makeCheck(['pause'], false, () => {}));
+  const pauseEl = pauseSlot ? pauseSlot.querySelector('.radyn-check') : null;
+  if (pauseEl) pauseEl.id = 'live-pause';
   const clearBtn = document.getElementById('live-clear');
   const listEl = document.getElementById('live-list');
   const slotsCountEl = document.getElementById('slots-count');
@@ -954,7 +1068,7 @@ window.addEventListener('resize', () => {
       setStatus('error', 'reconnecting…');
     });
     es.addEventListener('observation', (e) => {
-      if (pauseEl?.checked) return;
+      if (pauseEl?.getAttribute('aria-checked') === 'true') return;
       let payload;
       try { payload = JSON.parse(e.data); } catch { return; }
       if (!payload || !payload.observation) return;
@@ -985,7 +1099,12 @@ window.addEventListener('resize', () => {
     const existing = obs.id != null ? listEl.querySelector(`[data-obs-id="${obs.id}"]`) : null;
     if (existing) {
       const pill = existing.querySelector('.live-pill');
-      if (pill) { pill.dataset.status = status; pill.textContent = status; }
+      if (pill) {
+        pill.className = 'live-pill radyn-pill'
+          + (status === 'completed' ? ' radyn-pill--success' : status === 'failed' ? ' radyn-pill--error' : '');
+        pill.dataset.status = status;
+        pill.textContent = status;
+      }
       const dur = existing.querySelector('.live-dur');
       if (dur && obs.duration_ms != null) dur.textContent = obs.duration_ms + 'ms';
       existing.classList.remove('fresh');
@@ -1005,7 +1124,8 @@ window.addEventListener('resize', () => {
     time.textContent = fmtTime(evt.ts || Date.parse(obs.started_at) || Date.now());
 
     const pill = document.createElement('span');
-    pill.className = 'live-pill';
+    pill.className = 'live-pill radyn-pill'
+      + (status === 'completed' ? ' radyn-pill--success' : status === 'failed' ? ' radyn-pill--error' : '');
     pill.dataset.status = status;
     pill.textContent = status;
 
@@ -1135,7 +1255,7 @@ window.addEventListener('resize', () => {
 
     for (const slot of rows) {
       const row = el('tr', { class: 'slot-row' },
-        el('td', null, slot.slot_key),
+        el('td', null, el('span', { class: 'slot-chevron', 'aria-hidden': 'true' }), slot.slot_key),
         el('td', null, slot.type),
         el('td', { class: 'ops-cell-scope', title: slot.scope }, slot.scope),
         el('td', { class: 'slot-content', title: slot.content }, slot.content.length > 80 ? slot.content.slice(0, 80) + '...' : slot.content),
@@ -1145,12 +1265,14 @@ window.addEventListener('resize', () => {
         const next = row.nextElementSibling;
         if (next?.classList.contains('slot-expand')) {
           next.remove();
+          row.classList.remove('slot-open');
           return;
         }
         const detail = el('tr', { class: 'slot-expand' },
           el('td', { colspan: 5 }, slot.content)
         );
         row.after(detail);
+        row.classList.add('slot-open');
       });
       slotsTbodyEl.append(row);
     }
@@ -1688,9 +1810,11 @@ window.addEventListener('resize', () => {
     time.textContent = fmtTime(Date.parse(obs.started_at) || Date.now());
 
     const pill = document.createElement('span');
-    pill.className = 'live-pill';
-    pill.dataset.status = obs.status || 'started';
-    pill.textContent = obs.status || 'started';
+    const replayStatus = obs.status || 'started';
+    pill.className = 'live-pill radyn-pill'
+      + (replayStatus === 'completed' ? ' radyn-pill--success' : replayStatus === 'failed' ? ' radyn-pill--error' : '');
+    pill.dataset.status = replayStatus;
+    pill.textContent = replayStatus;
 
     const tool = document.createElement('span');
     tool.className = 'live-tool';
@@ -2141,7 +2265,7 @@ window.addEventListener('resize', () => {
     ];
 
     for (const row of rows) {
-      const btn = el('button', { class: 'replay-btn' + (row.on ? ' review-toggle-on' : '') },
+      const btn = el('button', { class: 'replay-btn radyn-btn' + (row.on ? ' review-toggle-on' : '') },
         row.on ? (row.onText || 'on') : (row.offText || 'off'));
       btn.addEventListener('click', async () => {
         btn.disabled = true;
@@ -2212,9 +2336,9 @@ window.addEventListener('resize', () => {
 
     pane.append(el('div', { class: 'review-entry-head' },
       el('b', null, `dream #${dream.id}`),
-      el('span', { class: 'review-badge' }, dream.scope || '—'),
-      el('span', { class: 'review-badge review-badge-tier' }, dream.status || '—'),
-      el('span', { class: 'review-badge review-badge-tier' }, `${dream.changes_auto_applied ?? 0} auto · ${dream.changes_queued ?? 0} queued`)
+      el('span', { class: 'review-badge radyn-pill' }, dream.scope || '—'),
+      el('span', { class: 'review-badge radyn-pill review-badge-tier' }, dream.status || '—'),
+      el('span', { class: 'review-badge radyn-pill review-badge-tier' }, `${dream.changes_auto_applied ?? 0} auto · ${dream.changes_queued ?? 0} queued`)
     ));
 
     const pendingIndices = entries.filter(e => (e.resolution ?? 'pending') === 'pending').map(e => e.index);
@@ -2228,13 +2352,13 @@ window.addEventListener('resize', () => {
       const res = entry.resolution ?? 'pending';
       const card = el('div', { class: 'review-entry', 'data-entry-index': String(entry.index) });
       const head = el('div', { class: 'review-entry-head' },
-        el('span', { class: 'review-badge' }, `#${entry.index}`),
-        el('span', { class: 'review-badge' }, entry.change_class || '—'),
-        el('span', { class: 'review-badge review-badge-tier' }, entry.tier || '—'),
+        el('span', { class: 'review-badge radyn-pill' }, `#${entry.index}`),
+        el('span', { class: 'review-badge radyn-pill' }, entry.change_class || '—'),
+        el('span', { class: 'review-badge radyn-pill review-badge-tier' }, entry.tier || '—'),
         el('span', { class: `review-res-${res}` }, res)
       );
       const delta = fmtDelta(entry.confidence_delta);
-      if (delta) head.append(el('span', { class: 'review-badge review-badge-tier' }, delta));
+      if (delta) head.append(el('span', { class: 'review-badge radyn-pill review-badge-tier' }, delta));
       card.append(head);
 
       if (entry.rationale) card.append(el('div', { class: 'review-rationale' }, entry.rationale));
@@ -2257,11 +2381,11 @@ window.addEventListener('resize', () => {
           continue;
         }
         card.append(el('div', { class: 'review-member' },
-          el('span', { class: 'review-badge review-badge-tier' }, `#${m.id} ${m.type}`),
+          el('span', { class: 'review-badge radyn-pill review-badge-tier' }, `#${m.id} ${m.type}`),
           ' ',
-          el('span', { class: 'review-badge review-badge-tier', title: 'evidence sessions' }, `ev ${m.evidence_count ?? 0}`),
+          el('span', { class: 'review-badge radyn-pill review-badge-tier', title: 'evidence sessions' }, `ev ${m.evidence_count ?? 0}`),
           ' ',
-          el('span', { class: 'review-badge review-badge-tier' }, `conf ${typeof m.confidence === 'number' ? m.confidence.toFixed(2) : '—'}`),
+          el('span', { class: 'review-badge radyn-pill review-badge-tier' }, `conf ${typeof m.confidence === 'number' ? m.confidence.toFixed(2) : '—'}`),
           el('div', { class: 'review-member-excerpt' }, m.excerpt || '')
         ));
       }
@@ -2273,9 +2397,9 @@ window.addEventListener('resize', () => {
     const actions = el('div', { class: 'review-actions' });
     const hasPending = pendingIndices.length > 0;
 
-    const acceptAll = el('button', { class: 'replay-btn' }, 'accept all');
-    const rejectAll = el('button', { class: 'replay-btn' }, 'reject all');
-    const acceptSel = el('button', { class: 'replay-btn' }, 'accept checked');
+    const acceptAll = el('button', { class: 'replay-btn radyn-btn' }, 'accept all');
+    const rejectAll = el('button', { class: 'replay-btn radyn-btn' }, 'reject all');
+    const acceptSel = el('button', { class: 'replay-btn radyn-btn' }, 'accept checked');
     if (!hasPending) { acceptAll.disabled = true; rejectAll.disabled = true; acceptSel.disabled = true; }
 
     acceptAll.addEventListener('click', () => resolveDreamEntries(dream.id, 'accept', null, msg, [acceptAll, rejectAll, acceptSel]));

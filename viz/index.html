@@ -7,6 +7,7 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%237BB390'/%3E%3C/svg%3E">
   <!-- Local-first: no external font egress. Geist Mono is used if locally
        installed; styles.css falls back to a system monospace stack. -->
+  <link rel="stylesheet" href="radyn.css">
   <link rel="stylesheet" href="styles.css">
   <style>
     /* Review tab (T8) — pending-dreams diff review. Scoped here so the change
@@ -20,7 +21,6 @@
     .review-diff-pane { overflow: auto; max-height: calc(100vh - 180px); }
     .review-entry { border: 1px solid hsl(var(--border-subtle)); background: hsl(var(--surface-01)); padding: .6rem .7rem; margin-bottom: .6rem; }
     .review-entry-head { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-bottom: .4rem; }
-    .review-badge { font-size: .72rem; padding: .1rem .4rem; border: 1px solid var(--border); }
     .review-badge-tier { opacity: .8; }
     .review-res-pending { color: hsl(var(--color-warning)); }
     .review-res-accepted, .review-res-auto_applied { color: hsl(var(--color-success)); }
@@ -38,7 +38,7 @@
     .review-msg-ok { color: hsl(var(--color-success)); }
     .review-msg-err { color: hsl(var(--color-error)); }
     /* Round-2: section heads, history table, dreaming-controls panel. */
-    .review-section-head { font-size: .72rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; margin: .9rem 0 .35rem; padding-bottom: .25rem; border-bottom: 1px solid var(--border); }
+    .review-section-head { font-size: .72rem; font-weight: 500; letter-spacing: .1em; text-transform: uppercase; margin: .9rem 0 .35rem; padding-bottom: .25rem; border-bottom: 1px solid var(--border); }
     .review-list-pane .review-section-head:first-child { margin-top: 0; }
     #review-history-table tbody tr { cursor: pointer; }
     #review-history-table tbody tr.review-row-active { outline: 1px solid hsl(var(--accent)); background: hsl(var(--accent) / 0.1); }
@@ -54,7 +54,7 @@
     .review-controls-msg { font-size: .74rem; min-height: 1em; margin-top: .25rem; }
   </style>
 </head>
-<body>
+<body class="radyn-base">
   <!-- Lucide icon definitions, referenced by <use href="#icon-..."> in the graph.
        Stroke-only at currentColor; strokes scale with zoom for a terminal feel. -->
   <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
@@ -105,14 +105,8 @@
       <span class="brand-status-dot" title="connected"></span>
     </div>
     <div id="health" class="health">connecting…</div>
-    <button id="theme-toggle" title="Toggle light/dark theme" aria-label="Toggle theme">
-      <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>
-      </svg>
-      <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <circle cx="12" cy="12" r="4"/>
-        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
-      </svg>
+    <button id="theme-toggle" title="theme: void — click to cycle" aria-label="Cycle theme">
+      <span id="theme-name" class="radyn-label"></span>
     </button>
     <button id="drawer-right-btn" class="drawer-btn" title="open filters · selection" aria-label="Open right panel">
       <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="0"/><path d="M15 3v18"/></svg>
@@ -170,8 +164,8 @@
           <span class="live-sep">·</span>
           <span class="live-rate" id="live-rate">0/s</span>
           <span class="live-sep">·</span>
-          <label class="live-pause"><input type="checkbox" id="live-pause"> pause</label>
-          <button class="live-clear" id="live-clear" title="Clear list">clear</button>
+          <span id="live-pause-slot"></span>
+          <button class="live-clear radyn-btn" id="live-clear" title="Clear list">clear</button>
         </div>
         <div class="live-list" id="live-list">
           <div class="live-empty">waiting for tool events… run anything in another Claude Code window.</div>
@@ -293,16 +287,16 @@
           <select id="replay-session" class="replay-picker">
             <option value="">— pick a session —</option>
           </select>
-          <button class="replay-btn" id="replay-refresh" title="Refresh session list">↻</button>
+          <button class="replay-btn radyn-btn" id="replay-refresh" title="Refresh session list">↻</button>
           <span class="live-sep">·</span>
-          <button class="replay-btn replay-play" id="replay-play" disabled>play</button>
-          <button class="replay-btn" id="replay-reset" disabled title="Jump to start">reset</button>
+          <button class="replay-btn replay-play radyn-btn" id="replay-play" disabled>play</button>
+          <button class="replay-btn radyn-btn" id="replay-reset" disabled title="Jump to start">reset</button>
           <span class="live-sep">·</span>
           <label class="replay-speed-label">speed</label>
           <div class="replay-speed-group" role="group" aria-label="Playback speed">
-            <button class="replay-speed-btn" data-speed="1">1×</button>
-            <button class="replay-speed-btn active" data-speed="4">4×</button>
-            <button class="replay-speed-btn" data-speed="16">16×</button>
+            <button class="replay-speed-btn radyn-btn" data-speed="1">1×</button>
+            <button class="replay-speed-btn active radyn-btn" data-speed="4">4×</button>
+            <button class="replay-speed-btn radyn-btn" data-speed="16">16×</button>
           </div>
           <span class="replay-status" id="replay-status">pick a session above</span>
         </div>
@@ -322,7 +316,7 @@
           <span class="live-sep">·</span>
           <span id="review-poll-status">idle</span>
           <span class="live-sep">·</span>
-          <button class="replay-btn" id="review-refresh" title="Refresh dream lists">↻</button>
+          <button class="replay-btn radyn-btn" id="review-refresh" title="Refresh dream lists">↻</button>
           <span class="ops-hint">accept runs under the consolidation lock (423 when busy)</span>
         </div>
         <div class="review-split">

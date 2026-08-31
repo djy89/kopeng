@@ -1,179 +1,118 @@
 /*
-  KOPENG visualizer — styled with KOPENG UI tokens (v1.6).
-  All colors come from KOPENG's extended palette and theme surface stack.
-  Themes: VOID (dark, default) and LINEN (light). Switch via data-theme on <body>.
+  KOPENG visualizer — viz-specific EXTENSION layer over viz/radyn.css.
+  radyn.css is a VERBATIM copy of the canonical Radyn token file — never edit it
+  locally; re-copy from ~/.claude/personal-design-system/tokens/radyn.css to update.
+  Themes: void (default) / ops / amber / linen — this file adds only graph,
+  memory-type, and entity-type tokens per theme, plus component styles.
 */
 
 /* ============================================================================
-   EXTENDED COLOR PALETTE — theme-constant named colors (3 stops each)
-   ============================================================================ */
-:root {
-  --kopeng-sage-1:   #4A7A5A;  --kopeng-sage-2:   #7BB390;  --kopeng-sage-3:   #A8CEBA;
-  --kopeng-coral-1:  #B03D35;  --kopeng-coral-2:  #FC5A50;  --kopeng-coral-3:  #FD8C86;
-  --kopeng-ember-1:  #7A1F1F;  --kopeng-ember-2:  #CC3333;  --kopeng-ember-3:  #E06666;
-  --kopeng-fog-1:    #C8C7AC;  --kopeng-fog-2:    #DDD9C4;  --kopeng-fog-3:    #F2F1DC;
-  --kopeng-moss-1:   #2A4A35;  --kopeng-moss-2:   #3D6B4A;  --kopeng-moss-3:   #558A63;
-  --kopeng-stone-1:  #4A524A;  --kopeng-stone-2:  #6B786B;  --kopeng-stone-3:  #8A9A8A;
-  --kopeng-dusk-1:   #2A3D4A;  --kopeng-dusk-2:   #3D5F72;  --kopeng-dusk-3:   #5A7A8A;
-  --kopeng-tide-1:   #1A4A42;  --kopeng-tide-2:   #2D7268;  --kopeng-tide-3:   #4A9A8E;
-  --kopeng-clay-1:   #5A3D28;  --kopeng-clay-2:   #8A5E3A;  --kopeng-clay-3:   #B07848;
-  --kopeng-violet-1: #2D2645;  --kopeng-violet-2: #4A3D72;  --kopeng-violet-3: #6B5A9A;
-  --kopeng-resin-1:  #4A3318;  --kopeng-resin-2:  #7A5425;  --kopeng-resin-3:  #B07C3A;
-  --kopeng-void-1:   #0A151B;  --kopeng-void-2:   #111F27;  --kopeng-void-3:   #1C3040;
-}
-
-/* ============================================================================
    THEME: VOID (dark, default) — molten orange on achromatic dark
-   Both raw HSL tokens (KOPENG-spec) and pre-resolved aliases live here so the
-   theme switch is bulletproof — descendants inherit the resolved values
-   directly from body.
+   This block holds only graph/type/entity tokens; canonical tokens come from
+   radyn.css, and the alias chains live on body below.
    ============================================================================ */
 :root,
 [data-theme="void"] {
-  /* KOPENG surface stack (HSL components — used directly by KOPENG-aware code) */
-  --surface-00: 0 0% 2%;
-  --surface-01: 0 0% 6%;
-  --surface-02: 0 0% 10%;
-  --surface-03: 0 0% 14%;
-  --surface-hover: 0 0% 12%;
-  --surface-active: 0 0% 8%;
-
-  --text-primary:    0 0% 95%;
-  --text-secondary:  0 0% 75%;
-  --text-tertiary:   0 0% 55%;
-  --text-disabled:   0 0% 30%;
-  --text-on-color:   0 0% 5%;
-
-  --border-subtle:      0 0% 18%;
-  --border-strong:      0 0% 30%;
-  --border-interactive: 0 0% 50%;
-  --border-divider:     0 0% 14%;
-
-  --color-success: 140 60% 55%;
-  --color-warning:  40 90% 60%;
-  --color-error:     0 70% 60%;
-  --color-info:    200 70% 60%;
-
-  --accent:        14 100% 57%;
-  --accent-hover:  14 100% 65%;
-  --accent-active: 14 100% 48%;
-
   /* void */  --graph-bg: 0 0% 4%;   --graph-grid: 0 0% 16%; --graph-link: 0 0% 40%;
 
   /* Memory-type colors (extended palette — lighter stops for dark theme) */
-  --type-user:      var(--kopeng-clay-3);
-  --type-feedback:  var(--kopeng-coral-2);
-  --type-project:   var(--kopeng-dusk-3);
-  --type-reference: var(--kopeng-violet-3);
-  --type-discovery: var(--kopeng-sage-2);
+  --type-user:      var(--radyn-clay-3);
+  --type-feedback:  var(--radyn-coral-2);
+  --type-project:   var(--radyn-dusk-3);
+  --type-reference: var(--radyn-violet-3);
+  --type-discovery: var(--radyn-sage-2);
 
   /* Entity-type colors (used by the bipartite graph diamonds). Concept is
      intentionally muted — it's the largest, least informative class — so it
      fades into the background. The other types pull from distinct palette
      stops so technology / project / org / person hubs read clearly. */
-  --entity-concept:      var(--kopeng-stone-3);
-  --entity-technology:   var(--kopeng-tide-3);
-  --entity-project:      var(--kopeng-fog-1);
-  --entity-organization: var(--kopeng-resin-3);
-  --entity-person:       var(--kopeng-sage-3);
+  --entity-concept:      var(--radyn-stone-3);
+  --entity-technology:   var(--radyn-tide-3);
+  --entity-project:      var(--radyn-fog-1);
+  --entity-organization: var(--radyn-resin-3);
+  --entity-person:       var(--radyn-sage-3);
+}
 
-  /* Pre-resolved aliases used throughout the stylesheet (no var() chain) */
-  --background:        hsl(0 0% 2%);
-  --foreground:        hsl(0 0% 75%);
-  --card:              hsl(0 0% 10%);
-  --panel:             hsl(0 0% 6%);
-  --popover:           hsl(0 0% 14%);
-  --muted-foreground:  hsl(0 0% 55%);
-  --text-strong:       hsl(0 0% 95%);
-  --border:            hsl(0 0% 18%);
-  --border-strong-c:   hsl(0 0% 30%);
-  --input:             hsl(0 0% 6%);
-  --ring:              hsl(0 0% 50%);
-  --success:           hsl(140 60% 55%);
-  --warning:           hsl(40 90% 60%);
-  --error:             hsl(0 70% 60%);
-  --info:              hsl(200 70% 60%);
-  --accent-color:      hsl(14 100% 57%);
-  --surface-hover-c:   hsl(0 0% 12%);
+/* Alias names used by all component CSS below. Declared on body (the data-theme
+   carrier) so the var() chains substitute against the ACTIVE theme's tokens and
+   every descendant inherits the themed result. On :root they would bake void. */
+body {
+  --background: hsl(var(--surface-00));   --panel: hsl(var(--surface-01));
+  --card: hsl(var(--surface-02));         --popover: hsl(var(--surface-03));
+  --input: hsl(var(--surface-01));        --surface-hover-c: hsl(var(--surface-hover));
+  --foreground: hsl(var(--text-secondary)); --text-strong: hsl(var(--text-primary));
+  --muted-foreground: hsl(var(--text-tertiary));
+  --border: hsl(var(--border-subtle));    --border-strong-c: hsl(var(--border-strong));
+  --ring: hsl(var(--border-interactive));
+  --success: hsl(var(--color-success));   --warning: hsl(var(--color-warning));
+  --error: hsl(var(--color-error));       --info: hsl(var(--color-info));
+  --accent-color: hsl(var(--accent));
 }
 
 /* ============================================================================
    THEME: LINEN (light) — Hazy Grove ground, Sage Veil accent
    ============================================================================ */
 [data-theme="linen"] {
-  --surface-00: 60 42% 90%;
-  --surface-01: 72 28% 87%;
-  --surface-02: 84 22% 82%;
-  --surface-03: 96 18% 76%;
-  --surface-hover: 80 20% 84%;
-  --surface-active: 68 25% 88%;
-
-  --text-primary:   200 47% 11%;
-  --text-secondary: 195 35% 22%;
-  --text-tertiary:  160 12% 42%;
-  --text-disabled:  120 6% 65%;
-  --text-on-color:   60 42% 90%;
-
-  --border-subtle:       90 16% 74%;
-  --border-strong:      160 14% 55%;
-  --border-interactive: 155 24% 42%;
-  --border-divider:      80 18% 78%;
-
-  --color-success: 140 50% 35%;
-  --color-warning:  40 70% 42%;
-  --color-error:     0 60% 42%;
-  --color-info:    200 55% 38%;
-
-  --accent:        155 24% 47%;
-  --accent-hover:  155 28% 38%;
-  --accent-active: 155 30% 30%;
-
   /* linen */ --graph-bg: 60 30% 86%; --graph-grid: 90 14% 72%; --graph-link: 160 10% 50%;
 
   /* Memory-type colors (darker stops for readability on Hazy Grove) */
-  --type-user:      var(--kopeng-clay-2);
-  --type-feedback:  var(--kopeng-ember-2);
-  --type-project:   var(--kopeng-dusk-2);
-  --type-reference: var(--kopeng-violet-2);
-  --type-discovery: var(--kopeng-moss-2);
+  --type-user:      var(--radyn-clay-2);
+  --type-feedback:  var(--radyn-ember-2);
+  --type-project:   var(--radyn-dusk-2);
+  --type-reference: var(--radyn-violet-2);
+  --type-discovery: var(--radyn-moss-2);
 
   /* Entity-type colors (Linen — darker palette stops for contrast on light bg). */
-  --entity-concept:      var(--kopeng-stone-1);
-  --entity-technology:   var(--kopeng-tide-2);
-  --entity-project:      var(--kopeng-clay-1);
-  --entity-organization: var(--kopeng-resin-2);
-  --entity-person:       var(--kopeng-moss-2);
-
-  /* Pre-resolved aliases — Linen palette */
-  --background:        hsl(60 42% 90%);
-  --foreground:        hsl(195 35% 22%);
-  --card:              hsl(84 22% 82%);
-  --panel:             hsl(72 28% 87%);
-  --popover:           hsl(96 18% 76%);
-  --muted-foreground:  hsl(160 12% 42%);
-  --text-strong:       hsl(200 47% 11%);
-  --border:            hsl(90 16% 74%);
-  --border-strong-c:   hsl(160 14% 55%);
-  --input:             hsl(72 28% 87%);
-  --ring:              hsl(155 24% 42%);
-  --success:           hsl(140 50% 35%);
-  --warning:           hsl(40 70% 42%);
-  --error:             hsl(0 60% 42%);
-  --info:              hsl(200 55% 38%);
-  --accent-color:      hsl(155 24% 47%);
-  --surface-hover-c:   hsl(80 20% 84%);
+  --entity-concept:      var(--radyn-stone-1);
+  --entity-technology:   var(--radyn-tide-2);
+  --entity-project:      var(--radyn-clay-1);
+  --entity-organization: var(--radyn-resin-2);
+  --entity-person:       var(--radyn-moss-2);
 }
 
-:root { --radius: 0; }
+/* ============================================================================
+   THEME: OPS (dark professional) — cyan/teal on achromatic dark
+   ============================================================================ */
+[data-theme="ops"] {
+  --graph-bg: 140 30% 3%; --graph-grid: 140 25% 12%; --graph-link: 140 20% 40%;
+
+  --type-user:      var(--radyn-clay-3);
+  --type-feedback:  var(--radyn-coral-2);
+  --type-project:   var(--radyn-dusk-3);
+  --type-reference: var(--radyn-violet-3);
+  --type-discovery: var(--radyn-sage-2);
+
+  --entity-concept:      var(--radyn-stone-3);
+  --entity-technology:   var(--radyn-tide-3);
+  --entity-project:      var(--radyn-fog-1);
+  --entity-organization: var(--radyn-resin-3);
+  --entity-person:       var(--radyn-sage-3);
+}
+
+/* ============================================================================
+   THEME: AMBER (dark warm) — golden amber on dark ground
+   ============================================================================ */
+[data-theme="amber"] {
+  --graph-bg: 30 30% 3%; --graph-grid: 40 28% 12%; --graph-link: 40 30% 42%;
+
+  --type-user:      var(--radyn-clay-3);
+  --type-feedback:  var(--radyn-coral-2);
+  --type-project:   var(--radyn-dusk-3);
+  --type-reference: var(--radyn-violet-3);
+  --type-discovery: var(--radyn-sage-2);
+
+  --entity-concept:      var(--radyn-stone-3);
+  --entity-technology:   var(--radyn-tide-3);
+  --entity-project:      var(--radyn-fog-1);
+  --entity-organization: var(--radyn-resin-3);
+  --entity-person:       var(--radyn-sage-3);
+}
 
 * { box-sizing: border-box; }
 * { box-shadow: none; text-shadow: none; }
 html, body { height: 100%; margin: 0; }
 
 body {
-  font-family: 'Geist Mono', 'JetBrains Mono', ui-monospace, 'SF Mono', Consolas, monospace;
-  background: var(--background);
-  color: var(--foreground);
   display: flex;
   flex-direction: column;
   overflow: hidden auto;
@@ -181,11 +120,6 @@ body {
   font-feature-settings: "ss01", "ss02";
   letter-spacing: 0.01em;
   -webkit-font-smoothing: antialiased;
-}
-
-::selection {
-  background: hsl(var(--accent) / 0.3);
-  color: hsl(var(--text-primary));
 }
 
 /* ----- Header ----- */
@@ -202,7 +136,7 @@ header {
 }
 .brand-name {
   color: var(--foreground);
-  font-weight: 600;
+  font-weight: 500;
   letter-spacing: 0.06em;
 }
 .brand-sub {
@@ -228,7 +162,7 @@ header {
 }
 .health b {
   color: var(--foreground);
-  font-weight: 600;
+  font-weight: 500;
 }
 
 button {
@@ -251,13 +185,11 @@ button:hover {
 
 #theme-toggle {
   display: inline-flex; align-items: center; justify-content: center;
-  flex: none; width: 28px; height: 28px; padding: 0;
+  flex: none; height: 28px; padding: 0 8px;
   color: var(--muted-foreground);
 }
 #theme-toggle:hover { color: var(--text-strong); }
-#theme-toggle .theme-icon { display: none; }
-body[data-theme="void"]  #theme-toggle .theme-icon-moon { display: block; }
-body[data-theme="linen"] #theme-toggle .theme-icon-sun  { display: block; }
+#theme-toggle .radyn-label { color: inherit; }
 
 /* ----- Main grid -----
    Sidebar widths live in CSS variables so the collapse toggles can shrink
@@ -376,10 +308,8 @@ aside h2 {
   align-items: center;
   gap: 0.4rem;
 }
-aside h2::before {
-  content: ">";
-  color: var(--muted-foreground);
-  opacity: 0.5;
+aside h2::before, .legend-section-label::before, .review-section-head::before {
+  content: "> "; color: hsl(var(--text-disabled));
 }
 
 .hint {
@@ -422,7 +352,7 @@ aside h2::before {
 .store h3 {
   margin: 0;
   font-size: 0.78rem;
-  font-weight: 600;
+  font-weight: 500;
   color: var(--foreground);
 }
 .store p {
@@ -443,12 +373,7 @@ aside h2::before {
 .store .count.dim { color: var(--muted-foreground); }
 .store .badge {
   display: inline-block;
-  padding: 1px 6px;
   margin-left: 0.4rem;
-  font-size: 0.6rem;
-  border: 1px solid var(--border);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
   color: var(--muted-foreground);
 }
 .store.active .badge { color: var(--foreground); }
@@ -480,7 +405,7 @@ aside h2::before {
 .pipeline b,
 .legend-list b {
   color: var(--foreground);
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .legend-row {
@@ -529,19 +454,6 @@ aside h2::before {
 .filter-group.collapsed .group-chevron { transform: rotate(-45deg); }
 .filter-group.collapsed .group-body { display: none; }
 
-.filter-group label.opt {
-  display: flex;
-  align-items: center;
-  gap: 0.55rem;
-  padding: 0.25rem 0.4rem;
-  font-size: 0.78rem;
-  cursor: pointer;
-  border-left: 1px solid transparent;
-}
-.filter-group label.opt:hover {
-  background: var(--surface-hover-c);
-  border-left-color: var(--border);
-}
 .filter-group .swatch {
   width: 8px; height: 8px;
   border-radius: 50%;
@@ -616,7 +528,7 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
 }
 #detail .pill.type {
   color: var(--foreground);
-  font-weight: 600;
+  font-weight: 500;
 }
 #detail .body {
   background: transparent; border: none; border-left: 2px solid hsl(var(--accent));
@@ -625,13 +537,17 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
 }
 #detail .body.entity-name {
   border-left: none; padding-left: 0; font-size: 0.78rem; letter-spacing: 0.02em;
-  color: var(--text-strong); font-weight: 600; white-space: normal; word-break: break-word;
+  color: var(--text-strong); font-weight: 500; white-space: normal; word-break: break-word;
 }
 #detail .tag {
   display: inline-block; padding: 1px 6px; border: 1px solid var(--border);
   font-size: 0.625rem; margin: 3px 4px 0 0; color: var(--muted-foreground);
   text-transform: lowercase; letter-spacing: 0.04em;
 }
+#detail .meta-line { font-size: 0.625rem; color: var(--muted-foreground); margin-top: 0.35rem; }
+#detail .pill.radyn-pill--info    { border-color: var(--info);    color: var(--info); }
+#detail .pill.radyn-pill--warning { border-color: var(--warning); color: var(--warning); }
+#detail .pill.radyn-pill--success { border-color: var(--success); color: var(--success); }
 
 /* Entity detail — name displays larger than the body text since an entity
    has no content of its own; the name *is* the data. (entity-name rule lives
@@ -674,7 +590,7 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   font-size: 0.62rem;
   text-transform: uppercase;
   letter-spacing: 0.1em;
-  font-weight: 600;
+  font-weight: 500;
   width: 60px;
 }
 #detail .entity-list-snippet {
@@ -700,9 +616,9 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   flex-direction: column;
   min-height: 0;
   background:
-    linear-gradient(var(--border) 1px, transparent 1px) 0 0 / 80px 80px,
-    linear-gradient(90deg, var(--border) 1px, transparent 1px) 0 0 / 80px 80px,
-    var(--background);
+    linear-gradient(hsl(var(--graph-grid)) 1px, transparent 1px) 0 0 / 80px 80px,
+    linear-gradient(90deg, hsl(var(--graph-grid)) 1px, transparent 1px) 0 0 / 80px 80px,
+    hsl(var(--graph-bg));
   background-blend-mode: normal;
 }
 #graph::before {
@@ -735,7 +651,7 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   border: 1px solid var(--border-strong-c); font-variant-numeric: tabular-nums;
 }
 .zoom-hud .zoom-label { color: var(--muted-foreground); text-transform: uppercase; letter-spacing: 0.1em; font-size: 0.62rem; }
-.zoom-hud #zoom-value { font-weight: 600; letter-spacing: 0.04em; }
+.zoom-hud #zoom-value { font-weight: 500; letter-spacing: 0.04em; }
 
 .overlay-hint {
   white-space: nowrap; color: var(--muted-foreground); font-size: 9px;
@@ -827,7 +743,7 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   font-family: inherit;
 }
 .link {
-  stroke: var(--border);
+  stroke: hsl(var(--graph-link));
   stroke-opacity: 0.5;
   stroke-linecap: round;
 }
@@ -842,6 +758,12 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   stroke: var(--foreground);
   stroke-opacity: 0.55;
 }
+/* Persistent selection — parallel to the hover dim above (sel-* namespace vs
+   dimmed/lit) so a click survives mouseout; see applySelection()/clearSelection()
+   in app.js. */
+#canvas .node.selected .dot, #canvas .node.selected .diamond { stroke: var(--accent-color); stroke-width: 2px; }
+#canvas g.sel-dimmed .node:not(.sel-lit) { opacity: 0.25; }
+#canvas g.sel-dimmed .link:not(.sel-lit) { stroke-opacity: 0.15; }
 
 /* Legend swatch icons reuse the same symbols at small size. */
 .legend-icon {
@@ -948,7 +870,7 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   letter-spacing: 0.08em;
   background: var(--panel);
 }
-.live-toolbar b { color: var(--foreground); font-weight: 600; }
+.live-toolbar b { color: var(--foreground); font-weight: 500; }
 .live-sep { opacity: 0.5; }
 .live-status {
   display: inline-flex;
@@ -963,12 +885,8 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
 }
 .live-status[data-state="connected"]::before { background: var(--success); }
 .live-status[data-state="error"]::before     { background: var(--error); }
-.live-pause { cursor: pointer; display: inline-flex; align-items: center; gap: 0.3rem; }
-.live-pause input { accent-color: var(--accent-c); }
 .live-clear {
   margin-left: auto;
-  padding: 0.25rem 0.6rem;
-  font-size: 0.65rem;
 }
 
 .live-list {
@@ -1010,20 +928,12 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
 .live-pill {
   display: inline-block;
   text-align: center;
-  padding: 1px 6px;
-  font-size: 0.62rem;
-  font-weight: 600;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  border: 1px solid var(--border);
+  font-weight: 500;
   color: var(--muted-foreground);
 }
-.live-pill[data-status="started"]   { color: var(--info, var(--muted-foreground)); border-color: var(--info, var(--border)); }
-.live-pill[data-status="completed"] { color: var(--success); border-color: var(--success); }
-.live-pill[data-status="failed"]    { color: var(--error); border-color: var(--error); }
 .live-tool {
   color: var(--foreground);
-  font-weight: 600;
+  font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1077,7 +987,7 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   top: 0;
   z-index: 2;
 }
-.ops-label { color: var(--foreground); font-weight: 600; }
+.ops-label { color: var(--foreground); font-weight: 500; }
 .ops-hint { opacity: 0.7; text-transform: none; letter-spacing: 0.04em; }
 
 .ops-grid {
@@ -1111,7 +1021,7 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
 .ops-card-head h3 {
   margin: 0;
   font-size: 0.72rem;
-  font-weight: 600;
+  font-weight: 500;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--foreground);
@@ -1272,7 +1182,7 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
 }
 .ops-table th {
   color: var(--muted-foreground);
-  font-weight: 600;
+  font-weight: 500;
   font-size: 0.62rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -1315,7 +1225,7 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
 .panel-header h3 {
   margin: 0;
   font-size: 0.72rem;
-  font-weight: 600;
+  font-weight: 500;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--foreground);
@@ -1344,7 +1254,7 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
 }
 #slots-table th {
   color: var(--muted-foreground);
-  font-weight: 600;
+  font-weight: 500;
   font-size: 0.62rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -1368,6 +1278,10 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   word-break: break-word;
   border-left: 2px solid var(--border);
 }
+.slot-chevron { display: inline-block; width: 5px; height: 5px; margin-right: 7px;
+  border-right: 1px solid currentColor; border-bottom: 1px solid currentColor;
+  transform: rotate(-45deg); transition: transform 100ms ease-out; }
+tr.slot-open .slot-chevron { transform: rotate(45deg); }
 
 /* ============================================================================
    REPLAY panel — historical session playback
@@ -1406,10 +1320,6 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   text-transform: none;
   letter-spacing: 0.02em;
 }
-.replay-btn {
-  padding: 0.25rem 0.7rem;
-  font-size: 0.65rem;
-}
 .replay-btn[disabled] {
   opacity: 0.35;
   cursor: not-allowed;
@@ -1425,22 +1335,10 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   border: 1px solid var(--border);
 }
 .replay-speed-btn {
-  padding: 0.25rem 0.55rem;
-  font-size: 0.62rem;
-  border: 0;
-  border-right: 1px solid var(--border);
   background: transparent;
   color: var(--muted-foreground);
 }
 .replay-speed-btn:last-child { border-right: 0; }
-.replay-speed-btn.active {
-  background: var(--surface-hover-c);
-  color: var(--foreground);
-}
-.replay-speed-btn:hover {
-  background: var(--surface-hover-c);
-  color: var(--foreground);
-}
 .replay-status {
   margin-left: auto;
   color: var(--muted-foreground);
@@ -1495,22 +1393,52 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   text-align: right;
 }
 
+/* ---- Radyn primitives (v0 primitives.tsx ports) ---- */
+.radyn-pill { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border-strong-c);
+  padding: 1px 6px; font-size: 0.625rem; text-transform: uppercase; letter-spacing: 0.08em;
+  line-height: 1.4; white-space: nowrap; color: var(--foreground); }
+.radyn-pill--accent  { border-color: var(--accent-color); color: var(--accent-color); }
+.radyn-pill--success { border-color: var(--success); color: var(--success); }
+.radyn-pill--warning { border-color: var(--warning); color: var(--warning); }
+.radyn-pill--error   { border-color: var(--error);   color: var(--error); }
+.radyn-pill--info    { border-color: var(--info);    color: var(--info); }
+
+.radyn-btn { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border-strong-c);
+  background: transparent; color: var(--foreground); height: 28px; padding: 0 10px;
+  font: inherit; font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.06em;
+  line-height: 1; cursor: pointer; transition: color 100ms ease-out, background-color 100ms ease-out; }
+.radyn-btn:hover { background: var(--surface-hover-c); color: var(--text-strong); }
+.radyn-btn.active { border-color: var(--accent-color); color: var(--accent-color);
+  background: hsl(var(--accent) / 0.1); }
+
+.radyn-check { display: inline-flex; align-items: center; gap: 7px; background: none; border: none;
+  padding: 0; font: inherit; color: var(--foreground); cursor: pointer; }
+.radyn-check .box { width: 12px; height: 12px; flex: none; display: inline-flex;
+  align-items: center; justify-content: center; border: 1px solid var(--ring); background: transparent; }
+.radyn-check[aria-checked="true"] .box { background: var(--accent-color); }
+.radyn-check .box::after { content: ""; width: 4px; height: 4px; background: transparent; }
+.radyn-check[aria-checked="true"] .box::after { background: hsl(var(--text-on-color)); }
+
+/* Filter rows built from radyn-check: full-width row, right-aligned count. */
+.filter-group .radyn-check { width: 100%; justify-content: flex-start; }
+.filter-group .radyn-check .count { margin-left: auto; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+
+.scope-list { display: flex; flex-direction: column; gap: 4px; }
+
 /* TK utility primitives */
-.kopeng-noscroll { scrollbar-width: none; -ms-overflow-style: none; }
-.kopeng-noscroll::-webkit-scrollbar { display: none; }
-.kopeng-scroll { scrollbar-width: thin; scrollbar-color: var(--border-strong-c) transparent; }
-.kopeng-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
-.kopeng-scroll::-webkit-scrollbar-thumb { background: var(--border-strong-c); }
-.kopeng-scroll::-webkit-scrollbar-track { background: transparent; }
-.kopeng-label { font-size: 10px; line-height: 1.4; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted-foreground); }
-.kopeng-tabular { font-variant-numeric: tabular-nums; }
-.kopeng-led { width: 6px; height: 6px; flex: none; display: inline-block; }
-@keyframes kopeng-flash { from { background-color: hsl(var(--accent) / 0.16); } to { background-color: transparent; } }
-.kopeng-flash { animation: kopeng-flash 700ms cubic-bezier(0, 0, 0.2, 1); }
-.kopeng-focus:focus-visible { outline: 1px solid hsl(var(--accent)); outline-offset: 1px; }
-.kopeng-range { -webkit-appearance: none; appearance: none; height: 2px; background: var(--border-strong-c); cursor: pointer; }
-.kopeng-range::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 10px; height: 14px; background: hsl(var(--accent)); border-radius: 0; }
-.kopeng-range::-moz-range-thumb { width: 10px; height: 14px; background: hsl(var(--accent)); border: none; border-radius: 0; }
+.radyn-noscroll { scrollbar-width: none; -ms-overflow-style: none; }
+.radyn-noscroll::-webkit-scrollbar { display: none; }
+.radyn-scroll { scrollbar-width: thin; scrollbar-color: var(--border-strong-c) transparent; }
+.radyn-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.radyn-scroll::-webkit-scrollbar-thumb { background: var(--border-strong-c); }
+.radyn-scroll::-webkit-scrollbar-track { background: transparent; }
+.radyn-tabular { font-variant-numeric: tabular-nums; }
+.radyn-led { width: 6px; height: 6px; flex: none; display: inline-block; }
+@keyframes radyn-flash { from { background-color: hsl(var(--accent) / 0.16); } to { background-color: transparent; } }
+.radyn-flash { animation: radyn-flash 700ms cubic-bezier(0, 0, 0.2, 1); }
+.radyn-range { -webkit-appearance: none; appearance: none; height: 2px; background: var(--border-strong-c); cursor: pointer; }
+.radyn-range::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 10px; height: 14px; background: hsl(var(--accent)); border-radius: 0; }
+.radyn-range::-moz-range-thumb { width: 10px; height: 14px; background: hsl(var(--accent)); border: none; border-radius: 0; }
 select {
   -webkit-appearance: none; appearance: none;
   background-image:

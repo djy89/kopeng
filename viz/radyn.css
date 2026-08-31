@@ -1,0 +1,395 @@
+/* ----------------------------------------------------------------------------
+   VENDORED — do not hand-edit. Upstream: https://github.com/djy89/radyn (MIT)
+   Pinned to tag v1.6. To update, re-fetch that exact tag:
+     curl -o viz/radyn.css https://raw.githubusercontent.com/djy89/radyn/v1.6/tokens/radyn.css
+   (bump the tag in BOTH the URL and this header, then re-run the export gate)
+
+   Vendored rather than referenced at runtime, deliberately: the viz is a
+   local-first tool served on 127.0.0.1 and shipped inside the npm tarball
+   (package.json `files` includes `viz`). Loading tokens from a CDN would make a
+   localhost tool require network access to render correctly and would add a
+   third-party request for every installed user. Operator ruling 2026-08-30.
+   ---------------------------------------------------------------------------- */
+
+/* ============================================================================
+   RADYN DESIGN SYSTEM - Portable Tokens (vanilla CSS)
+   v1.6 / 2026-05-06
+   Drop into any project. No framework required.
+   For Tailwind v4 integration, use radyn-tailwind.css instead.
+   ============================================================================ */
+
+/* ============================================================================
+   THEME: VOID (default — molten orange on achromatic dark)
+   ============================================================================ */
+:root,
+[data-theme="void"] {
+  /* Surface stack — deeper = darker */
+  --surface-00: 0 0% 2%;          /* Deep void — app background */
+  --surface-01: 0 0% 6%;          /* Default panel */
+  --surface-02: 0 0% 10%;         /* Elevated panel (cards, modals) */
+  --surface-03: 0 0% 14%;         /* Highest (popovers, dropdowns) */
+  --surface-hover: 0 0% 12%;
+  --surface-active: 0 0% 8%;
+
+  /* Text — three readable tiers + disabled */
+  --text-primary: 0 0% 95%;       /* Headings, key data */
+  --text-secondary: 0 0% 75%;     /* Body */
+  --text-tertiary: 0 0% 55%;      /* Labels, metadata */
+  --text-disabled: 0 0% 30%;
+  --text-on-color: 0 0% 5%;       /* Text on accent backgrounds */
+
+  /* Borders */
+  --border-subtle: 0 0% 18%;
+  --border-strong: 0 0% 30%;
+  --border-interactive: 0 0% 50%;
+  --border-divider: 0 0% 14%;
+
+  /* Semantic status — never decorative, theme-constant */
+  --color-success: 140 60% 55%;
+  --color-warning: 40 90% 60%;
+  --color-error: 0 70% 60%;
+  --color-info: 200 70% 60%;
+
+  /* Brand accent — molten orange #ff5722 */
+  --accent: 14 100% 57%;
+  --accent-hover: 14 100% 65%;
+  --accent-active: 14 100% 48%;
+  --accent-glow: 14 100% 57%;
+
+  --font-radyn: 'Geist Mono', ui-monospace, 'Cascadia Code', 'SF Mono', monospace;
+}
+
+/* ============================================================================
+   THEME: OPS (phosphor green for monitoring dashboards)
+   ============================================================================ */
+[data-theme="ops"] {
+  --surface-00: 140 30% 4%;
+  --surface-01: 140 25% 6%;
+  --surface-02: 140 20% 9%;
+  --surface-03: 140 18% 13%;
+  --surface-hover: 140 22% 11%;
+  --surface-active: 140 25% 7%;
+
+  --text-primary: 140 30% 90%;
+  --text-secondary: 140 25% 70%;
+  --text-tertiary: 140 20% 50%;
+  --text-disabled: 140 15% 25%;
+  --text-on-color: 140 30% 5%;
+
+  --border-subtle: 140 25% 18%;
+  --border-strong: 140 30% 35%;
+  --border-interactive: 140 50% 55%;
+  --border-divider: 140 22% 12%;
+
+  --accent: 140 70% 55%;
+  --accent-hover: 140 75% 65%;
+  --accent-active: 140 70% 50%;
+}
+
+/* ============================================================================
+   THEME: AMBER (warm CRT for late-night vintage tooling)
+   ============================================================================ */
+[data-theme="amber"] {
+  --surface-00: 30 30% 4%;
+  --surface-01: 30 25% 6%;
+  --surface-02: 30 20% 10%;
+  --surface-03: 30 18% 14%;
+  --surface-hover: 30 22% 12%;
+  --surface-active: 30 25% 8%;
+
+  --text-primary: 40 80% 75%;
+  --text-secondary: 40 60% 60%;
+  --text-tertiary: 40 40% 45%;
+  --text-disabled: 40 20% 25%;
+  --text-on-color: 30 30% 5%;
+
+  --border-subtle: 40 30% 18%;
+  --border-strong: 40 35% 30%;
+  --border-interactive: 40 50% 50%;
+  --border-divider: 40 25% 12%;
+
+  --accent: 40 90% 60%;
+  --accent-hover: 40 90% 70%;
+  --accent-active: 40 90% 55%;
+}
+
+/* ============================================================================
+   SCALES — non-color tokens (constant across themes)
+   ============================================================================ */
+:root {
+  /* Type scale */
+  --radyn-text-2xs: 0.625rem;   /* 10px */
+  --radyn-text-xs: 0.75rem;     /* 12px */
+  --radyn-text-sm: 0.875rem;    /* 14px */
+  --radyn-text-base: 1rem;
+  --radyn-text-lg: 1.125rem;
+  --radyn-text-xl: 1.25rem;
+  --radyn-text-2xl: 1.5rem;
+  --radyn-text-3xl: 1.875rem;
+  --radyn-text-4xl: 2.25rem;
+  --radyn-text-5xl: 3rem;
+
+  /* Spacing scale (4px base, 14 steps) */
+  --radyn-space-0: 0;
+  --radyn-space-1: 2px;
+  --radyn-space-2: 4px;
+  --radyn-space-3: 8px;
+  --radyn-space-4: 12px;
+  --radyn-space-5: 16px;
+  --radyn-space-6: 24px;
+  --radyn-space-7: 32px;
+  --radyn-space-8: 48px;
+  --radyn-space-9: 64px;
+  --radyn-space-10: 96px;
+  --radyn-space-11: 128px;
+  --radyn-space-12: 192px;
+  --radyn-space-13: 256px;
+
+  /* Borders — only three. anything thicker is off-brand */
+  --radyn-border-0: 0;
+  --radyn-border-1: 1px;
+  --radyn-border-2: 2px;
+
+  /* Zero radius — sharp edges */
+  --radyn-radius: 0;
+
+  /* Motion — 50-150ms only, no bounces */
+  --radyn-duration-instant: 0ms;
+  --radyn-duration-fast: 50ms;
+  --radyn-duration-default: 100ms;
+  --radyn-duration-slow: 150ms;
+  --radyn-ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --radyn-ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --radyn-ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Grid (16-col) */
+  --radyn-grid-cols: 16;
+  --radyn-grid-gutter: 8px;
+  --radyn-grid-margin: 16px;
+
+  /* Z-index */
+  --radyn-z-base: 0;
+  --radyn-z-dropdown: 100;
+  --radyn-z-sticky: 200;
+  --radyn-z-fixed: 300;
+  --radyn-z-modal-backdrop: 400;
+  --radyn-z-modal: 500;
+  --radyn-z-popover: 600;
+  --radyn-z-tooltip: 700;
+  --radyn-z-notification: 800;
+}
+
+/* ============================================================================
+   BASE STYLES — applied to body
+   Add `.radyn-base` to your <body> to opt in, or remove the class selector
+   to apply globally.
+   ============================================================================ */
+.radyn-base {
+  background: hsl(var(--surface-00));
+  color: hsl(var(--text-secondary));
+  font-family: var(--font-radyn);
+  font-feature-settings: "rlig" 1, "calt" 1, "tnum" 1;
+  border-radius: var(--radyn-radius);
+}
+
+.radyn-base ::selection {
+  background: hsl(var(--accent) / 0.3);
+  color: hsl(var(--text-primary));
+}
+
+.radyn-base ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.radyn-base ::-webkit-scrollbar-track { background: hsl(var(--surface-00)); }
+.radyn-base ::-webkit-scrollbar-thumb { background: hsl(var(--border-subtle)); }
+.radyn-base ::-webkit-scrollbar-thumb:hover { background: hsl(var(--accent) / 0.5); }
+
+/* ============================================================================
+   UTILITY CLASSES — apply directly to elements
+   ============================================================================ */
+
+/* Uppercase tracked label — 10px, tertiary text, the most-used pattern in Radyn */
+.radyn-label {
+  font-size: var(--radyn-text-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 500;
+  color: hsl(var(--text-tertiary));
+}
+
+/* Tabular numerics for any data display */
+.radyn-value {
+  font-family: var(--font-radyn);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Spacing utilities (for flex/grid gap) */
+.radyn-gap-tight   { gap: var(--radyn-space-2); }
+.radyn-gap-default { gap: var(--radyn-space-3); }
+.radyn-gap-loose   { gap: var(--radyn-space-4); }
+
+/* Focus ring — 1px outlined accent at 50% */
+.radyn-focus:focus-visible {
+  outline: 1px solid hsl(var(--accent) / 0.5);
+  outline-offset: 1px;
+}
+
+/* Standard transition — use anywhere a state changes */
+.radyn-transition {
+  transition-duration: var(--radyn-duration-default);
+  transition-timing-function: var(--radyn-ease-out);
+}
+.radyn-transition-fast {
+  transition-duration: var(--radyn-duration-fast);
+  transition-timing-function: var(--radyn-ease-out);
+}
+
+/* Density modes — toggle on any container via [data-density] */
+[data-density="compact"] {
+  --radyn-space-3: 4px;
+  --radyn-space-4: 6px;
+  --radyn-space-5: 8px;
+}
+[data-density="loose"] {
+  --radyn-space-3: 12px;
+  --radyn-space-4: 16px;
+  --radyn-space-5: 24px;
+}
+
+/* Optional terminal atmospherics (opt-in per project) */
+.radyn-glow {
+  text-shadow: 0 0 4px hsl(var(--accent) / 0.5);
+}
+.radyn-scanlines {
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent 0,
+    transparent 2px,
+    hsl(var(--text-primary) / 0.03) 2px,
+    hsl(var(--text-primary) / 0.03) 3px
+  );
+}
+
+/* ============================================================================
+   SEMANTIC HELPER CLASSES — most common alert/status pattern
+   ============================================================================ */
+.radyn-alert {
+  border: 1px solid hsl(var(--border-subtle));
+  background: hsl(var(--surface-01));
+  padding: var(--radyn-space-4);
+}
+.radyn-alert--success { border-left: 2px solid hsl(var(--color-success)); }
+.radyn-alert--warning { border-left: 2px solid hsl(var(--color-warning)); }
+.radyn-alert--error   { border-left: 2px solid hsl(var(--color-error)); }
+.radyn-alert--info    { border-left: 2px solid hsl(var(--color-info)); }
+
+
+/* ============================================================================
+   EXTENDED COLOR PALETTE — terminal-native named colors
+   v1.6 / 2026-05-06
+   These are allowed UI colors. Three stops per color: 1=dim/bg, 2=base, 3=emphasis.
+   Not themes. Not semantic tokens. Pull these into components, badges, charts,
+   category dots, syntax highlights — anywhere a named color is needed.
+   Surface stack is NOT affected by any token in this section.
+   ============================================================================ */
+
+:root {
+
+  /* GROVE ANCHORS — locked from the Grove palette image */
+  --radyn-sage-1:   #4A7A5A;   /* Dim / bg tint */
+  --radyn-sage-2:   #7BB390;   /* Base — output alive, success, process complete */
+  --radyn-sage-3:   #A8CEBA;   /* Emphasis / highlight */
+
+  --radyn-coral-1:  #B03D35;   /* Dim / bg tint */
+  --radyn-coral-2:  #FC5A50;   /* Base — alert, warning-adjacent, attention */
+  --radyn-coral-3:  #FD8C86;   /* Emphasis / highlight */
+
+  --radyn-ember-1:  #7A1F1F;   /* Dim / bg tint */
+  --radyn-ember-2:  #CC3333;   /* Base — error, critical, stop, danger */
+  --radyn-ember-3:  #E06666;   /* Emphasis / highlight */
+
+  --radyn-fog-1:    #C8C7AC;   /* Dim / muted */
+  --radyn-fog-2:    #DDD9C4;   /* Base — mid tone warm off-white */
+  --radyn-fog-3:    #F2F1DC;   /* Full brightness — Hazy Grove / prompt text */
+
+  /* EXTENDED — terminal register */
+  --radyn-moss-1:   #2A4A35;   /* Dim / bg tint */
+  --radyn-moss-2:   #3D6B4A;   /* Base — secondary output, dim alive */
+  --radyn-moss-3:   #558A63;   /* Emphasis / highlight */
+
+  --radyn-stone-1:  #4A524A;   /* Dim / near-invisible */
+  --radyn-stone-2:  #6B786B;   /* Base — disabled, inert, noise, muted label */
+  --radyn-stone-3:  #8A9A8A;   /* Emphasis / readable */
+
+  --radyn-dusk-1:   #2A3D4A;   /* Dim / bg tint */
+  --radyn-dusk-2:   #3D5F72;   /* Base — info, network, cold data, incoming */
+  --radyn-dusk-3:   #5A7A8A;   /* Emphasis / highlight */
+
+  --radyn-tide-1:   #1A4A42;   /* Dim / bg tint */
+  --radyn-tide-2:   #2D7268;   /* Base — process running, pipes, active stream */
+  --radyn-tide-3:   #4A9A8E;   /* Emphasis / highlight */
+
+  --radyn-clay-1:   #5A3D28;   /* Dim / bg tint */
+  --radyn-clay-2:   #8A5E3A;   /* Base — filesystem, data at rest, warm data */
+  --radyn-clay-3:   #B07848;   /* Emphasis / highlight */
+
+  --radyn-violet-1: #2D2645;   /* Dim / bg tint */
+  --radyn-violet-2: #4A3D72;   /* Base — syntax highlight, tmux, vim accent, meta */
+  --radyn-violet-3: #6B5A9A;   /* Emphasis / highlight */
+
+  --radyn-resin-1:  #4A3318;   /* Dim / bg tint */
+  --radyn-resin-2:  #7A5425;   /* Base — warm amber, aged CRT, caution-adjacent */
+  --radyn-resin-3:  #B07C3A;   /* Emphasis / highlight */
+
+  /* VOID — named palette color for component use. Does NOT override surface stack. */
+  --radyn-void-1:   #0A151B;   /* Deepest — component backgrounds */
+  --radyn-void-2:   #111F27;   /* Midnight Carbon — base reference */
+  --radyn-void-3:   #1C3040;   /* Lifted dark — borders, dividers */
+
+}
+
+/* ============================================================================
+   THEME: LINEN (light mode — first light theme for Radyn)
+   v1.6 / 2026-05-06
+   Hazy Grove as the page ground. Sage Veil as the accent.
+   Midnight Carbon text — 18.32:1 contrast on Hazy Grove (verified).
+   Use for client-facing deliverables, print previews, or any light-surface need.
+   ============================================================================ */
+[data-theme="linen"] {
+
+  /* Surface stack — lighter = higher elevation */
+  --surface-00: 60 42% 90%;         /* #F2F1DC — Hazy Grove, page ground */
+  --surface-01: 72 28% 87%;         /* #E8EDD8 — default panel */
+  --surface-02: 84 22% 82%;         /* #D8E4CC — elevated (cards, modals) */
+  --surface-03: 96 18% 76%;         /* #C8D9B8 — highest (popovers, dropdowns) */
+  --surface-hover: 80 20% 84%;
+  --surface-active: 68 25% 88%;
+
+  /* Text */
+  --text-primary:    200 47% 11%;   /* #111F27 — Midnight Carbon, 18.32:1 on surface-00 */
+  --text-secondary:  195 35% 22%;   /* #243D42 — readable mid tone */
+  --text-tertiary:   160 12% 42%;   /* #5E6B62 — labels, metadata */
+  --text-disabled:   120 6% 65%;    /* #A0A89E — disabled state */
+  --text-on-color:   60 42% 90%;    /* #F2F1DC — text on dark/accent backgrounds */
+
+  /* Borders */
+  --border-subtle:      90 16% 74%; /* #BAC8B0 — quiet dividers */
+  --border-strong:      160 14% 55%;/* #7A9A84 — visible separation */
+  --border-interactive: 155 24% 42%;/* #527A62 — focus / hover rings */
+  --border-divider:     80 18% 78%; /* #C8D4BC — section rule */
+
+  /* Semantic status — same hues, adjusted lightness for light surfaces */
+  --color-success: 140 50% 35%;    /* Darker sage — readable on light */
+  --color-warning:  40 70% 42%;    /* Muted amber — not too bright */
+  --color-error:     0 60% 42%;    /* Ember-register red */
+  --color-info:    200 55% 38%;    /* Dusk-register blue */
+
+  /* Accent — Sage Veil as primary interactive color */
+  --accent:        155 24% 47%;    /* #7BB390 — Sage Veil base */
+  --accent-hover:  155 28% 38%;    /* Darkened for contrast on light */
+  --accent-active: 155 30% 30%;    /* Pressed state */
+  --accent-glow:   155 24% 47%;
+
+}
+
