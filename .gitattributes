@@ -1,0 +1,25 @@
+# Vendored third-party assets — never line-ending-convert these.
+#
+# The repo has no other .gitattributes and core.autocrlf is commonly `true` on
+# Windows, which rewrites LF -> CRLF in the WORKING TREE on checkout. `npm pack`
+# reads the working tree, so without these rules a tarball built on Windows would
+# ship different bytes than one built on Linux, and the vendored files would stop
+# matching the upstream hashes their comments tell you to verify against.
+#
+# viz/d3.min.js is pinned to d3 7.9.0 and is byte-identical to what the CDN served
+# before it was vendored (T75); its provenance is checkable via that tag's own SRI
+# hash, recorded in viz/index.html. Line-ending conversion silently breaks that.
+viz/d3.min.js -text
+#
+# viz/radyn.css is vendored from djy89/radyn at tag v1.6; its header documents a
+# curl + diff update path that only works if the bytes survive round-tripping.
+viz/radyn.css -text
+#
+# TRAP when adding a file here: `-text` tells git to store the WORKING-TREE bytes
+# verbatim — it does not normalize them. So a file that was already CRLF-ified by
+# an earlier checkout gets its CRLF LOCKED IN by this rule, which is the opposite
+# of the intent. That happened to radyn.css: adding `-text` + `git add
+# --renormalize` produced a 790-line diff and a blob that no longer matched
+# upstream. Convert the file to LF FIRST, then add the rule, then verify the
+# stored blob (`git cat-file -p :<path>`) against the upstream bytes or hash.
+# Fetching fresh with curl gives you LF already, which is why d3.min.js was fine.

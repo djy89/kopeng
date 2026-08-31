@@ -391,9 +391,24 @@
   </main>
   <div id="drawer-backdrop" class="drawer-backdrop" aria-hidden="true"></div>
 
-  <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"
-          integrity="sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i"
-          crossorigin="anonymous"></script>
+  <!--
+    d3 is VENDORED, not loaded from a CDN (T75). KOPENG is a local-first tool: the
+    server binds 127.0.0.1 by default and the viz is served off it, so requiring a
+    third-party request to draw the graph meant an offline, air-gapped, or
+    proxy-restricted install got an empty GRAPH tab while every other tab worked —
+    a connectivity failure that reads as a data problem.
+
+    viz/d3.min.js is byte-identical to the file this tag used to fetch, verified
+    against that tag's own SRI hash:
+      sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i
+    To update, fetch a pinned version and re-verify before committing:
+      curl -sL https://cdn.jsdelivr.net/npm/d3@<ver>/dist/d3.min.js -o viz/d3.min.js
+    d3 is ISC-licensed; its copyright banner is preserved at the top of the file.
+
+    No `integrity`/`crossorigin` here: SRI is for resources fetched over the
+    network from another origin. This one ships in the tarball.
+  -->
+  <script src="d3.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

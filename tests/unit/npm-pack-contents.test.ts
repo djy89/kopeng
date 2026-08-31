@@ -45,6 +45,11 @@ const MUST_SHIP = [
   'scripts/hooks/memory-prompt-search.mjs',
   'scripts/viz-server.js',
   'viz/index.html',
+  // T75: d3 is the graph engine and is VENDORED rather than CDN-loaded, so it has
+  // to be in the tarball — without it an installed viz renders an empty GRAPH tab
+  // while every other tab works. That is the exact failure this pins against.
+  'viz/d3.min.js',
+  'viz/radyn.css',
   '.env.example',
   'SETUP.md',
   'SECURITY.md',
