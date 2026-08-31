@@ -37,6 +37,7 @@ import { readFileSync, writeFileSync, unlinkSync, appendFileSync, mkdirSync } fr
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
+import { isEntrypoint } from './entrypoint.mjs';
 
 const HINTS_DIR = process.env.KOPENG_HINTS_DIR || join(homedir(), '.kopeng', 'hints');
 const METRICS_DIR = process.env.KOPENG_METRICS_DIR || join(homedir(), '.kopeng', 'metrics');
@@ -147,5 +148,6 @@ function main() {
   allow();
 }
 
-const isMain = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+// Symlink-safe (T72) — see scripts/hooks/entrypoint.mjs.
+const isMain = isEntrypoint(import.meta.url);
 if (isMain) main();

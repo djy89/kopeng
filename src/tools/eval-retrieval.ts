@@ -33,8 +33,31 @@ export const evalRetrievalTool = {
   },
 
   handler: async (args: Record<string, unknown>, apiUrl: string) => {
+    // Both of these are declared `required` in inputSchema, but nothing enforces
+    // that at runtime — the MCP layer passes the args through as-is. Without these
+    // guards a missing `expected_ids` reached `expectedIds.length` below and threw
+    // "Cannot read properties of undefined (reading 'length')", which reads like a
+    // broken tool rather than a malformed call. That message cost ~3 months of a
+    // wrong belief ("eval_retrieval is broken") across several sessions before
+    // anyone read the source. Say what is missing and how to supply it.
     const query = args.query as string;
     const expectedIds = args.expected_ids as number[];
+
+    if (typeof query !== 'string' || query.trim() === '') {
+      throw new Error(
+        'eval_retrieval: `query` is required and must be a non-empty string — the search text to evaluate.',
+      );
+    }
+    if (!Array.isArray(expectedIds) || !expectedIds.every(id => typeof id === 'number')) {
+      throw new Error(
+        'eval_retrieval: `expected_ids` is required and must be an array of numeric memory IDs — ' +
+          'the memories that SHOULD be returned for this query. Precision/recall/MRR are scored against ' +
+          'it, so there is no useful result without it. Example: ' +
+          '{"query": "how do we deploy", "expected_ids": [123, 456]}. ' +
+          'To search without scoring, use search_memories instead.',
+      );
+    }
+
     const mode = (args.mode as string) || 'hybrid';
     const shouldRerank = args.rerank !== false;
     const k = (args.k as number) || 5;

@@ -1,9 +1,7 @@
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import config from './config/config.js';
+import config, { RESOLVED_ENV_FILE } from './config/config.js';
 import logger from './utils/logger.js';
 import { getDatabase, closeDatabase, getDatabaseStats, backupDatabase } from './database/database.js';
 import { MemoryQueries } from './database/queries.js';
@@ -50,6 +48,7 @@ import { runFirstRunPreflight } from './config/first-run.js';
 import type { AppContext } from './types/app-context.js';
 import type pg from 'pg';
 import type Database from 'better-sqlite3';
+import { isEntrypoint } from './utils/entrypoint.js';
 
 export interface ComposedServer {
   app: FastifyInstance;
@@ -60,12 +59,29 @@ export interface ComposedServer {
   startSchedulers: () => void;
 }
 
+export interface ComposeServerDeps {
+  /**
+   * Task 2.4 fix round 1 (Finding 1): called with exit code 0 once
+   * `services.requestShutdown`'s full graceful-shutdown routine has actually
+   * completed. Defaults to the real `process.exit` — main()'s SIGTERM/SIGINT
+   * handler already calls `process.exit(0)` itself after awaiting `shutdown`,
+   * so this only matters for the requestShutdown path (the admin endpoint),
+   * which otherwise closed Fastify+DBs but left the process alive (open
+   * Winston/onnxruntime handles keep the event loop running) — exactly the
+   * failure `kopeng uninstall` hit deleting the app dir out from under a
+   * still-running process. Tests inject a fake here to prove requestShutdown
+   * drives a real exit without killing the test worker.
+   */
+  exit?: (code: number) => void;
+}
+
 /**
  * Build every store/service/closure and register routes — but do NOT listen,
  * do NOT start schedulers, do NOT call initEmbedder. The construction seam the
  * server-wiring tests drive; main() (entry-guarded below) adds the runtime.
  */
-export async function composeServer(): Promise<ComposedServer> {
+export async function composeServer(deps: ComposeServerDeps = {}): Promise<ComposedServer> {
+  const exit = deps.exit ?? process.exit;
   let queries: IMemoryStore;
   let embeddingIndex: IVectorSearch;
   let dbLifecycle: IDatabaseLifecycle;
@@ -442,6 +458,21 @@ export async function composeServer(): Promise<ComposedServer> {
     reply.status(err.statusCode || 500).send({ error: err.message || 'Internal server error' });
   });
 
+  // Graceful shutdown minus process.exit — main() wraps it with the exit.
+  // Defined BEFORE ctx (Task 2.4.1) so services.requestShutdown can close
+  // over it: registerRoutes destructures ctx.services synchronously, so the
+  // closure must already exist at that point, not be assigned afterward.
+  const shutdown = async (signal?: string) => {
+    logger.info(`Received ${signal ?? 'shutdown'}, shutting down...`);
+    if (discoveryScheduler) discoveryScheduler.stop();
+    if (dreamScheduler) dreamScheduler.stop();
+    await app.close();
+    if (config.neo4j.enabled) await closeNeo4j();
+    if (config.redis.enabled) await closeRedis();
+    if (config.discovery.ingestionEnabled) closeObservationsDatabase();
+    await shutdownDb();
+  };
+
   // Register routes (R7: one AppContext instead of a positional parameter list)
   const ctx: AppContext = {
     stores: {
@@ -460,22 +491,21 @@ export async function composeServer(): Promise<ComposedServer> {
       reasonerStatus,
       scopeAliases,
       scopeRegistry,
+      // POST /api/admin/shutdown (Task 2.4.1) fires the SAME path SIGTERM/
+      // SIGINT use — `kopeng uninstall`/`kopeng update` call it instead of
+      // sending a signal, since the CLI runs as a separate process. Fix
+      // round 1 (Finding 1): mirror main()'s `stop` — exit ONLY after
+      // `shutdown` actually completes, never bare-close-and-hope.
+      requestShutdown: () => {
+        void (async () => {
+          await shutdown('admin-shutdown');
+          exit(0);
+        })();
+      },
     },
     lifecycle: dbLifecycle,
   };
   registerRoutes(app, ctx);
-
-  // Graceful shutdown minus process.exit — main() wraps it with the exit.
-  const shutdown = async (signal?: string) => {
-    logger.info(`Received ${signal ?? 'shutdown'}, shutting down...`);
-    if (discoveryScheduler) discoveryScheduler.stop();
-    if (dreamScheduler) dreamScheduler.stop();
-    await app.close();
-    if (config.neo4j.enabled) await closeNeo4j();
-    if (config.redis.enabled) await closeRedis();
-    if (config.discovery.ingestionEnabled) closeObservationsDatabase();
-    await shutdownDb();
-  };
 
   const startSchedulers = () => {
     if (discoveryScheduler) {
@@ -495,9 +525,10 @@ async function main() {
   // First-run preflight (S1/S2): resolve-or-generate the admin key and refuse a
   // keyless non-loopback bind BEFORE composition. config is post-dotenv, so its
   // values are the launch-env channel first-run.ts expects (it never reads
-  // process.env for resolution). server.ts sits in src/ (or dist/), so '..' is
-  // the repo root in both layouts — same .env config.ts loads.
-  const envPath = path.join(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'), '.env');
+  // process.env for resolution). Task 2.3 / Ruling 7: target the SAME file
+  // config.ts loaded from (RESOLVED_ENV_FILE) — a packaged install's env
+  // lives at ~/.kopeng/.env, not next to this compiled file.
+  const envPath = RESOLVED_ENV_FILE;
   const firstRunEnv = {
     host: config.server.host,
     adminApiKey: config.server.adminApiKey,
@@ -551,8 +582,7 @@ async function main() {
 
 // Boot only when server.ts is the process entry (node dist/server.js) — the
 // viz-server.js pattern, so tests can import composeServer without booting.
-const isMain = process.argv[1] != null &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const isMain = isEntrypoint(import.meta.url);
 if (isMain) {
   main().catch((error) => {
     logger.error('Fatal startup error:', error);

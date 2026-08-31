@@ -197,6 +197,7 @@ export async function selectDecayCandidates(store: IMemoryStore, now: Date): Pro
         updated_at: m.updated_at,
         type: m.type,
         tags: m.tags,
+        is_locked: m.is_locked,
       };
       if (isDecayedAtRisk(inputs, now)) {
         candidates.push({ id: m.id, strength: memoryStrength(inputs, now) });

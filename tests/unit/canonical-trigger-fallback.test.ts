@@ -35,7 +35,17 @@ const BUFFER_DIR = join(tmp, 'buffer');
 const HINT_FILE = join(HINTS_DIR, 'canonical_path.json');
 const STATE_FILE = join(HINTS_DIR, 'canonical_fallback_state.json');
 
-const PROJECT_CWD = 'C:/tmp/projX';
+// Must be a REAL absolute path on the host OS, outside any git repo, and it must
+// exist. It was `'C:/tmp/projX'` until WS0, which is absolute only on Windows —
+// on POSIX it is a RELATIVE path (a dir literally named `C:`), so it resolved
+// inside the repo checkout. That was harmless while the scope was just
+// basename(cwd), but WS7.6 made deriveProjectScope walk UP for `.git/config`:
+// on Linux the walk climbed out of the fake path into the real repo and returned
+// the repo's own `project:<owner>-<repo>` instead of `project:projX`. The cache
+// was then written under a different filename (ENOENT) and the guard never
+// matched the project, so it emitted nothing and parseDeny died on empty input —
+// green on Windows, six failures on Linux CI. Keep this derived from tmpdir().
+const PROJECT_CWD = join(tmp, 'projX');
 const PROJECT_SCOPE = 'project:projX';
 const CACHE_FILE = join(CACHE_DIR, 'canonical_triggers_project_projX.json');
 const SESSION = 'sessA';
@@ -53,6 +63,9 @@ beforeAll(async () => {
   mkdirSync(HINTS_DIR, { recursive: true });
   mkdirSync(CACHE_DIR, { recursive: true });
   mkdirSync(BUFFER_DIR, { recursive: true });
+  // The fake project dir must exist: the hooks resolve their scope by walking UP
+  // from cwd, and the walk should terminate in tmpdir() with no `.git` above it.
+  mkdirSync(PROJECT_CWD, { recursive: true });
   // The module resolves KOPENG_CACHE_DIR at load — set it BEFORE the dynamic
   // import so the in-process pure tests read/write the isolated tmp cache.
   process.env.KOPENG_CACHE_DIR = CACHE_DIR;

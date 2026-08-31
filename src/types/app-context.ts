@@ -41,6 +41,14 @@ export interface AppContext {
     scopeAliases?: ScopeAliasService;
     /** Phase 3 scope registry: write-time minting/quarantine/reroute + primary-scope triage. */
     scopeRegistry?: ScopeRegistryService;
+    /**
+     * Task 2.4.1: fires the SAME graceful-shutdown routine the SIGTERM/SIGINT
+     * handlers use (server.ts wires it to `shutdown`), so `POST
+     * /api/admin/shutdown` and a real signal take one code path. Absent only
+     * in tests/harnesses that compose routes without the full server.ts
+     * wiring — the route degrades to a named refusal rather than crashing.
+     */
+    requestShutdown?: () => void;
   };
   lifecycle: IDatabaseLifecycle;
 }

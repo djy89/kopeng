@@ -396,6 +396,7 @@ export class DuplicateCandidateSelector implements CandidateSelector {
         updated_at: m.updated_at,
         type: m.type,
         tags: m.tags,
+        is_locked: m.is_locked,
       };
       if (isDecayedAtRisk(inputs, now)) {
         groups.push({ kind: 'single', members: [m], signal: 'decayed', similarity: memoryStrength(inputs, now) });

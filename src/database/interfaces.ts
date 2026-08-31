@@ -112,6 +112,16 @@ export interface IMemoryStore {
   updateConfidence(id: number, confidence: number): Promise<void>;
 
   /**
+   * WS7.4 B1: is_locked is THE Hard Anchor write path (deprecating the
+   * confidence>=1.0 / metadata.pinned spellings). Mirrors updateConfidence:
+   * a targeted column write, called only when the PUT handler's lockChanged
+   * check is true. NOT snapshotted into memory_revisions (Ruling 4 — the lock
+   * is protection state, not content state) and therefore never restored by
+   * rollback.
+   */
+  updateLocked(id: number, locked: boolean): Promise<void>;
+
+  /**
    * Reinforcement-on-access (D1.1): bump observation_count and refresh last_seen
    * for memories that were genuinely surfaced (recall/search results, direct get).
    * Resets the durability decay clock. Deliberately does NOT touch content,
@@ -381,7 +391,14 @@ export interface IDreamStore {
   /** Bump observation_count and refresh last_seen (recall/reinforce reset of the decay clock). */
   reinforceMemory(memoryId: number, at?: string): Promise<void>;
 
-  /** Set the Hard-Anchor lock flag. */
+  /**
+   * DEPRECATED — set the Hard-Anchor lock flag. `IMemoryStore.updateLocked` is the
+   * canonical lock write (it is what PUT /api/memories/:id calls) and both backend
+   * implementations of this method now FORWARD to it, so there is one implementation
+   * per backend, not two that can drift. Retained because it is an exported store
+   * method with possible out-of-repo callers; no in-repo production caller. Prefer
+   * `updateLocked` in new code.
+   */
   setMemoryLock(memoryId: number, locked: boolean): Promise<void>;
 
   /** Serialize the diff for a dream pass into output_diff. */

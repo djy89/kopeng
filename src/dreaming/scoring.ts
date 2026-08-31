@@ -37,6 +37,11 @@ export interface StrengthInputs {
   // them falls back to the default 60d half-life and no floor (pre-T30 behavior).
   type?: string;
   tags?: readonly string[];
+  // WS7.4: is_locked freezes the curve at the stored confidence (THE Hard
+  // Anchor). Optional and boolean-or-number — same row-shape split as
+  // AnchorInputs, below — a caller that omits it falls back to unfrozen
+  // (pre-WS7.4 behavior).
+  is_locked?: boolean | number | null;
 }
 
 /** The stored inputs the Hard-Anchor contract is decided from. Subset of the
@@ -48,10 +53,14 @@ export interface AnchorInputs {
   metadata?: string | null;
 }
 
-/** THE Hard-Anchor contract (CR-1): pinned / locked / operator-confirmed rows are
- *  never mutated by ANY automated path. Consumers: dream selector eligibility,
- *  auditedArchiveMemory apply-time re-check, promotion decay selection,
- *  maintenance §2 sweep, corpus-health panel. */
+/** THE Hard-Anchor contract (CR-1, amended WS7.4): `is_locked` is THE anchor —
+ *  `confidence >= 1.0` and `metadata.pinned` are DEPRECATED spellings, still
+ *  honored this release (doctor warns; `npm run migrate:anchors` moves them to
+ *  `is_locked`). An anchored row is never mutated by ANY automated path, and
+ *  (WS7.4 B2) its read-time effective confidence is frozen at the stored value
+ *  — see `computeEffectiveConfidence`'s `locked` param. Consumers: dream
+ *  selector eligibility, auditedArchiveMemory apply-time re-check, promotion
+ *  decay selection, maintenance §2 sweep, corpus-health panel. */
 export function isAnchored(m: AnchorInputs): boolean {
   return !!m.is_locked || m.confidence >= 1.0 || isPinnedMetadata(m.metadata);
 }
@@ -81,7 +90,8 @@ export function memoryStrength(memory: StrengthInputs, now: Date = new Date()): 
     false,
     memory.observation_count ?? 1,
     memory.type,
-    memory.tags
+    memory.tags,
+    !!memory.is_locked
   );
 }
 
@@ -98,6 +108,7 @@ export function isDecayedAtRisk(memory: StrengthInputs, now: Date, opts?: DecayP
     opts?.dormant ?? false,
     memory.observation_count ?? 1,
     memory.type,
-    memory.tags
+    memory.tags,
+    !!memory.is_locked
   ) < DECAY_ARCHIVE_THRESHOLD;
 }

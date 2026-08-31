@@ -178,6 +178,8 @@ export function durabilityFactor(observationCount: number): number {
  *
  * Rules:
  * - Explicit memories (confidence >= 1.0) never decay
+ * - Locked memories (is_locked, WS7.4 — THE Hard Anchor) never decay either:
+ *   effective confidence is always the stored value
  * - Dormant projects (no observations in 30+ days) freeze confidence
  * - Archive threshold: effective < 0.2
  *
@@ -193,6 +195,8 @@ export function durabilityFactor(observationCount: number): number {
  * @param observationCount Stored evidence/usage count (memories.observation_count)
  * @param type Memory type — selects the per-type decay half-life (T30)
  * @param tags Memory tags — error-pattern (fast decay) + structural (floor) detection (T30)
+ * @param locked WS7.4: is_locked — THE Hard Anchor. Freezes effective confidence
+ *   at the stored value, same as the confidence>=1.0 short-circuit above it.
  */
 export function computeEffectiveConfidence(
   storedConfidence: number,
@@ -201,11 +205,18 @@ export function computeEffectiveConfidence(
   projectDormant: boolean = false,
   observationCount: number = 1,
   type?: string,
-  tags?: readonly string[]
+  tags?: readonly string[],
+  locked: boolean = false
 ): number {
   // Explicit memories (operator-set confidence of 1.0) never decay (Hard Anchor —
   // checked FIRST so no per-type curve or floor can touch a deliberate anchor).
   if (storedConfidence >= 1.0) return 1.0;
+
+  // WS7.4: is_locked is THE Hard Anchor — freezes effective confidence at the
+  // stored value, same short-circuit shape as the >=1.0 check above. Checked
+  // before the dormant freeze so a locked row's confidence never depends on
+  // project activity either.
+  if (locked) return storedConfidence;
 
   // Dormant project: freeze confidence — pattern may still be valid, project just inactive
   if (projectDormant) return storedConfidence;

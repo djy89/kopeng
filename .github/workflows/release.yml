@@ -1,0 +1,215 @@
+name: Release
+
+# Task 2.5.3 (Install Strategy release pipeline). Separate from ci.yml (which
+# gates every push/PR) — this runs on a version tag or a manual dispatch and
+# is the ONLY workflow that can publish to npm, gated by four sequential
+# jobs: prove the tag names the version it ships, pack the release candidate,
+# prove it installs for real on every supported platform, then
+# (operator-approved) publish.
+#
+# T74: that sentence described the INTENT, not the configuration. `guard`'s
+# version check is `if: github.ref_type == 'tag'`, so a workflow_dispatch
+# skipped it — while `publish` carried no `if:` at all and the `npm-publish`
+# environment had zero protection rules. A dispatch run therefore reached a
+# real `npm publish` and stopped only on ENEEDAUTH; the instant NPM_TOKEN
+# existed, `gh workflow run release.yml --ref main` (the command used to run
+# the install smoke) would have shipped whatever package.json said, with no
+# version-agreement check, permanently.
+#
+# Investigating the fix turned up a second, larger fact: this job could never
+# have SUCCEEDED from this repo anyway. npm dropped support for provenance
+# from private source repositories in July 2023 — `npm publish --provenance`
+# here fails with "Unsupported GitHub Actions source repository visibility.
+# Only public source repositories are supported when publishing with
+# provenance". ENEEDAUTH was simply the first error it reached, not the last.
+# package.json already names the PUBLIC repo (`github.com/djy89/kopeng`), and
+# provenance additionally requires that field to match where you publish from,
+# so kopeng-dev fails that check too. The signed release tags (v1.0.0, v1.1.0)
+# already live on the public repo — releasing has always been a public-repo
+# ritual; only this job hadn't caught up.
+#
+# So `publish` is now gated on THREE axes, all free: tag-only, public-repo-only,
+# and required reviewers on the public repo's `npm-publish` environment
+# (protection rules are billing-gated on private repos, free on public ones —
+# which is why the reviewer gate was unavailable while this job lived here).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Read-only by default, same posture as ci.yml — only the publish job (below)
+# elevates, and only with the one scope it needs (OIDC for npm provenance).
+permissions:
+  contents: read
+
+jobs:
+  # The tag IS the version claim, and npm publishes are IMMUTABLE — a tarball
+  # published under a tag that disagrees with package.json cannot be fixed by
+  # re-tagging, only by a new version. So this runs first and everything else
+  # hangs off it: a mismatch costs one checkout and nothing packs or publishes.
+  #
+  # ${{ github.ref_name }} reaches the shell through `env:`, never interpolated
+  # into the `run:` line — a tag name is attacker-influencable from a fork, and
+  # direct interpolation is the script-injection shape this workflow avoids
+  # everywhere else.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # workflow_dispatch has no tag to check (ref_type is 'branch'), so the
+      # guard is a no-op there. That is safe only because `publish` is itself
+      # tag-gated (T74) — this comment used to claim the environment gated it
+      # regardless, which was false: the environment had no protection rules.
+      - name: Tag matches package.json version
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::Release tag '$TAG' does not match package.json version '$version' (expected tag 'v$version'). Fix the version or the tag — npm publishes are immutable."
+            exit 1
+          fi
+          echo "Tag '$TAG' matches package.json version '$version'."
+
+  # Builds the release candidate ONCE and hands the exact same tarball to
+  # every platform in `smoke` and, if they all pass, to `publish` — so the
+  # thing that gets installed everywhere and the thing that ships to npm are
+  # byte-identical, never "rebuilt per-OS and hoped to match".
+  pack:
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build (strict tsc)
+        run: npm run build
+
+      - name: Unit tests
+        run: npx vitest run tests/unit
+
+      - name: npm pack
+        run: npm pack
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kopeng-tarball
+          path: kopeng-*.tgz
+          if-no-files-found: error
+
+  # A REAL install of the packed tarball on every target platform: init ->
+  # canary -> uninstall, against a sandboxed fake HOME (never the runner's
+  # real one) — see scripts/ci/install-smoke.mjs for the full flow. This is
+  # what actually proves "this tarball installs", not just "this tarball has
+  # the right files in it" (that's tests/unit/npm-pack-contents.test.ts,
+  # which already runs in ci.yml on every push).
+  smoke:
+    needs: pack
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest     # x64
+          # arm64 Linux — GA on GitHub-hosted runners since 2025-08-07
+          # (github.blog/changelog/2025-08-07-arm64-hosted-runners-for-public-
+          # repositories-are-now-generally-available/). NOTE: that changelog's
+          # "free" applies to PUBLIC repos; `djy89/kopeng-dev` is PRIVATE
+          # (`gh repo view` 2026-08-30), so this row bills minutes like any
+          # other private-repo runner. An earlier version of this comment
+          # asserted the repo was public and drew the wrong billing
+          # conclusion from it.
+          - ubuntu-24.04-arm  # arm64
+          - windows-latest    # x64
+          - macos-latest      # arm64 (Apple Silicon)
+          # x64 (Intel). Was `macos-13`, which GitHub has RETIRED — the label
+          # no longer maps to any runner, so the job queued forever instead of
+          # failing: two dispatches (33312427226, 33324268989) sat 3h and 1h20m
+          # with every other row finishing in ~2min. A retired label is silent,
+          # not loud, which is why this went unnoticed until the smoke was run
+          # for the first time. `macos-15-intel` is the current GA Intel image
+          # (actions/runner-images lists 15 and 26 as the two GA lines; 14 is
+          # already deprecated) and is the closer proxy for real Intel-Mac
+          # users than `macos-26-intel`. Re-check this row whenever
+          # actions/runner-images promotes a new GA pair.
+          - macos-15-intel    # x64 (Intel)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kopeng-tarball
+
+      # bash explicitly: the glob below needs POSIX-shell globbing on every
+      # OS, including Windows (whose GitHub-hosted runner ships Git Bash).
+      - name: Real install smoke (init -> canary -> uninstall, sandboxed HOME)
+        shell: bash
+        run: node scripts/ci/install-smoke.mjs kopeng-*.tgz
+
+  # RULING-D: the operator does the first publish. This job is inert by
+  # construction until BOTH the `npm-publish` environment (created lazily by
+  # GitHub the first time a workflow references it — protection rules,
+  # required reviewers, etc. are then configured repo-side by the operator;
+  # see docs/ops/release.md) and the NPM_TOKEN secret exist. Until then, a
+  # pushed tag stops at a green `smoke` with nothing further happening.
+  #
+  # T74 — THREE independent gates, deliberately, because each covers what the
+  # others miss. Do not drop one as redundant: npm publishes are IMMUTABLE, so
+  # the first mistake here is permanent and unfixable except by burning a
+  # version number.
+  #
+  #   1. `github.ref_type == 'tag'` — a workflow_dispatch (the way the
+  #      5-platform install smoke gets run on demand) can no longer reach this
+  #      job at all. This also restores the guard's meaning: the only refs that
+  #      reach `publish` are exactly the refs `guard` actually version-checks.
+  #   2. `github.repository == 'djy89/kopeng'` — publish only from the PUBLIC
+  #      repo. This is not belt-and-braces, it is a correctness requirement:
+  #      provenance needs a public source repo AND a package.json `repository`
+  #      that matches it, and this file also ships to the private dev repo via
+  #      the export manifest's recursive `.github` include. Without this line a
+  #      tag on kopeng-dev would run a doomed publish; with it, the job is
+  #      structurally unreachable anywhere it could not succeed. A fork is
+  #      excluded too (and has no NPM_TOKEN regardless).
+  #   3. Required reviewers on the `npm-publish` environment — a human approves
+  #      each run. This is the one that defends paths nobody has thought of; a
+  #      condition only ever defends the path it names.
+  publish:
+    needs: smoke
+    if: github.ref_type == 'tag' && github.repository == 'djy89/kopeng'
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    # Scoped to THIS job only (npm provenance needs the OIDC id-token) — the
+    # top-level `contents: read` default is not re-added here because this
+    # job never checks out the repo; it only downloads the artifact `pack`
+    # already built and publishes that exact tarball.
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kopeng-tarball
+
+      - name: Publish to npm (provenance)
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public kopeng-*.tgz

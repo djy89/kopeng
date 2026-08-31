@@ -1,5 +1,6 @@
 import type pg from 'pg';
 import type { IDreamStore, IOperatorConfigStore } from './interfaces.js';
+import { PgQueries } from './pg-queries.js';
 import {
   PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON, REVISION_KEEP_PER_MEMORY,
   type Dream, type DreamDiff, type MemoryRevision, type DreamAuditEntry, type OperatorConfig,
@@ -9,6 +10,18 @@ import {
 /** Postgres implementation of the dreaming-layer stores (D0.2). */
 export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
   constructor(private pool: pg.Pool) {}
+
+  /**
+   * Handle to the canonical memory store over the SAME pool, so the deprecated
+   * `setMemoryLock` can forward instead of re-spelling the write. PgQueries'
+   * constructor only stores the pool, so this is free; lazy anyway to mirror the
+   * SQLite side. pg-queries.ts already imports queries.ts, so cross-store
+   * imports are an established edge here — no cycle.
+   */
+  private memoryStore?: PgQueries;
+  private get memories(): PgQueries {
+    return (this.memoryStore ??= new PgQueries(this.pool));
+  }
 
   // ─────────────────────────── dreams ───────────────────────────
 
@@ -131,18 +144,21 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
   // ───────────────────────── revisions ──────────────────────────
 
   async snapshotRevision(memoryId: number, createdByDreamId?: number | null): Promise<{ id: number; revision: number }> {
+    // is_locked is snapshotted (v12) because the lock is THE Hard Anchor and is
+    // model-writable through update_memory {locked} — without it an unlock left no
+    // record and no way back.
     const insertSql =
       `INSERT INTO memory_revisions
         (memory_id, revision, content, content_hash, summary, embedding, embedding_model,
          confidence, observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
-         scope, type, updated_at, last_seen, created_by_dream_id)
+         scope, type, updated_at, last_seen, is_locked, created_by_dream_id)
        SELECT m.id,
          (SELECT COALESCE(MAX(revision), 0) + 1 FROM memory_revisions WHERE memory_id = $1),
          m.content, m.content_hash, m.summary, m.embedding, m.embedding_model,
          m.confidence, m.observation_count, m.metadata,
          (SELECT COALESCE(jsonb_agg(tag ORDER BY tag), '[]'::jsonb) FROM memory_tags WHERE memory_id = $1),
          m.last_contradicted, m.deprecated_at, m.valid_from,
-         m.scope, m.type, m.updated_at, m.last_seen, $2
+         m.scope, m.type, m.updated_at, m.last_seen, m.is_locked, $2
        FROM memories m WHERE m.id = $1
        RETURNING id, revision`;
     const insertParams = [memoryId, createdByDreamId ?? null];
@@ -204,7 +220,7 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
     const r = await this.pool.query(
       `SELECT id, memory_id, revision, content, content_hash, summary, confidence,
         observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
-        scope, type, updated_at, last_seen, created_by_dream_id, created_at
+        scope, type, updated_at, last_seen, is_locked, created_by_dream_id, created_at
        FROM memory_revisions WHERE memory_id = $1 ORDER BY revision DESC`,
       [memoryId]
     );
@@ -215,7 +231,7 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
     const r = await this.pool.query(
       `SELECT id, memory_id, revision, content, content_hash, summary, confidence,
         observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
-        scope, type, updated_at, last_seen, created_by_dream_id, created_at
+        scope, type, updated_at, last_seen, is_locked, created_by_dream_id, created_at
        FROM memory_revisions WHERE memory_id = $1 AND revision = $2`,
       [memoryId, revision]
     );
@@ -239,21 +255,24 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
         `INSERT INTO memory_revisions
           (memory_id, revision, content, content_hash, summary, embedding, embedding_model,
            confidence, observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
-           scope, type, updated_at, last_seen, created_by_dream_id)
+           scope, type, updated_at, last_seen, is_locked, created_by_dream_id)
          SELECT m.id,
            (SELECT COALESCE(MAX(revision), 0) + 1 FROM memory_revisions WHERE memory_id = $1),
            m.content, m.content_hash, m.summary, m.embedding, m.embedding_model,
            m.confidence, m.observation_count, m.metadata,
            (SELECT COALESCE(jsonb_agg(tag ORDER BY tag), '[]'::jsonb) FROM memory_tags WHERE memory_id = $1),
            m.last_contradicted, m.deprecated_at, m.valid_from,
-           m.scope, m.type, m.updated_at, m.last_seen, NULL
+           m.scope, m.type, m.updated_at, m.last_seen, m.is_locked, NULL
          FROM memories m WHERE m.id = $1`,
         [memoryId]
       );
 
       // Copy the revision back over the live row (search_vector regenerates automatically).
-      // scope/type/last_seen are NULL-safe COALESCEs: a legacy (pre-v10) revision has
-      // NULL in these columns and must never clobber the live values (ruling 7).
+      // scope/type/last_seen/is_locked are NULL-safe COALESCEs: a legacy revision has
+      // NULL in these columns (pre-v10 for the first three, pre-v12 for is_locked) and
+      // must never clobber the live values (ruling 7). For is_locked that guard is the
+      // difference between "rollback restores the anchor" and "rollback strips the
+      // anchor off a live locked row".
       // updated_at is NOT restored from the revision — it always gets the restore's own
       // stamp, since it is the correction clock, not part of what's being reverted.
       await client.query(
@@ -263,6 +282,7 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
           last_contradicted = r.last_contradicted, deprecated_at = r.deprecated_at, valid_from = r.valid_from,
           scope = COALESCE(r.scope, m.scope), type = COALESCE(r.type, m.type),
           last_seen = COALESCE(r.last_seen, m.last_seen),
+          is_locked = COALESCE(r.is_locked, m.is_locked),
           updated_at = NOW()
          FROM memory_revisions r WHERE r.memory_id = $1 AND r.revision = $2 AND m.id = $1`,
         [memoryId, revision]
@@ -330,8 +350,15 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
     );
   }
 
+  /**
+   * DEPRECATED — kept only because it is an exported store method that may have
+   * out-of-repo callers. It now FORWARDS to `IMemoryStore.updateLocked`, the
+   * canonical lock write, so there is exactly ONE implementation of "write
+   * is_locked" per backend rather than two that can drift. (This spelling had
+   * already drifted: it skipped `updated_at`.) Prefer `updateLocked` in new code.
+   */
   async setMemoryLock(memoryId: number, locked: boolean): Promise<void> {
-    await this.pool.query(`UPDATE memories SET is_locked = $2 WHERE id = $1`, [memoryId, locked]);
+    return this.memories.updateLocked(memoryId, locked);
   }
 
   // ───────────────────── consolidation lock ─────────────────────
@@ -458,6 +485,11 @@ function rowToRevision(row: Record<string, unknown>): MemoryRevision {
     type: (row.type as string | null) ?? null,
     updated_at: toIsoOrNull(row.updated_at),
     last_seen: toIsoOrNull(row.last_seen),
+    // PG already hands back a boolean; the coercion mirrors the SQLite mapper so
+    // both backends expose the same shape. `== null` (not `=== null`) so a pre-v12
+    // row, where the column is absent entirely rather than NULL, also reads as
+    // "this revision predates the column".
+    is_locked: row.is_locked == null ? null : !!row.is_locked,
     created_by_dream_id: row.created_by_dream_id !== null && row.created_by_dream_id !== undefined ? Number(row.created_by_dream_id) : null,
     created_at: toIso(row.created_at),
   };

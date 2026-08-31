@@ -140,7 +140,10 @@ export interface ApiResponse<T> {
 }
 
 export interface HealthResponse {
-  status: 'ready' | 'loading' | 'error';
+  // T56: `degraded` = the embedding-model load terminally failed but the
+  // server is up and serving keyword-only search (embedding: 'error',
+  // search: 'keyword_only') — distinct from the transient cold-start shape.
+  status: 'ready' | 'loading' | 'degraded' | 'error';
   embedding: 'loaded' | 'initializing' | 'error';
   search: 'hybrid' | 'keyword_only' | 'unavailable';
   memories: number;
@@ -277,6 +280,13 @@ export interface CorpusHealthStats {
   mean_confidence: number | null;
   /** Distinct active memories carrying the contradiction-flagged tag. */
   contradiction_flagged_count: number;
+  /**
+   * WS7.4 B3: active rows anchored by a DEPRECATED spelling
+   * (confidence >= 1.0 or metadata.pinned === true) that are NOT also
+   * is_locked — i.e. anchors `migrate:anchors` would still move. Zero once a
+   * corpus has fully migrated to is_locked.
+   */
+  legacy_anchor_count: number;
 }
 
 /**
@@ -485,6 +495,13 @@ export interface MemoryRevision {
   type: string | null;
   updated_at: string | null;
   last_seen: string | null;
+  /** WS0: the `is_locked` Hard Anchor at snapshot time (SQLite v10 / PG v12).
+   *  NULL on revisions written before that migration; restore COALESCEs, so a
+   *  legacy NULL never strips the anchor off a live locked row. Deliberately
+   *  `boolean | null` rather than the 1|0 shape `Memory.is_locked` carries — the
+   *  two backends store INTEGER and BOOLEAN respectively, and both mappers
+   *  normalize here so the revision surface has one spelling. */
+  is_locked: boolean | null;
   created_by_dream_id: number | null;
   created_at: string;
 }

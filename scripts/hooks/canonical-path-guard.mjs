@@ -42,11 +42,14 @@
  */
 
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
 import {
   readTriggerCache, matchTrigger, TRIGGER_FALLBACK_COOLDOWN_MS,
 } from './canonical-triggers.mjs';
+// RULING-C (WS7.6): project:<basename(cwd)> is now project:<owner>-<repo>
+// derived from the git remote, marker-overridable — see project-scope.mjs.
+import { deriveProjectScope } from './project-scope.mjs';
 
 const HINTS_DIR = process.env.KOPENG_HINTS_DIR || join(homedir(), '.kopeng', 'hints');
 const HINT_FILE = join(HINTS_DIR, 'canonical_path.json');
@@ -151,7 +154,7 @@ function fallbackCheck(input, sessionId) {
   try {
     const cwd = String(input.cwd || process.env.CLAUDE_CWD || '');
     if (!cwd) return null; // no project identity — cache is per-project, fail open
-    const projectScope = `project:${basename(cwd)}`;
+    const projectScope = deriveProjectScope(cwd).scope;
 
     const cache = readTriggerCache(projectScope);
     if (!cache || cache.entries.length === 0) return null;

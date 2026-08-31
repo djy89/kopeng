@@ -10,7 +10,7 @@ If private reporting is unavailable to you (no GitHub account, or the tab is mis
 
 ## Threat model (read this before reporting)
 
-KOPENG 0.x is a **local developer preview**: self-hosted, single-operator infrastructure designed to run on a machine you own, bound to loopback. **Remote deployment is unsupported for the 0.x preview**, even with all keys configured — if you route to it over a private VPN or an authenticating reverse proxy, that outer boundary is required and is yours to provide. Several properties are deliberate design decisions, not vulnerabilities:
+KOPENG is a **local developer preview**: self-hosted, single-operator infrastructure designed to run on a machine you own, bound to loopback. **Remote deployment is unsupported for the preview**, even with all keys configured — if you route to it over a private VPN or an authenticating reverse proxy, that outer boundary is required and is yours to provide. Several properties are deliberate design decisions, not vulnerabilities:
 
 - **Reads are unauthenticated by design — the whole read surface, not just ops.** `/api/stats`, `/api/ops/*`, `/api/observations/stream` (SSE), the replay endpoints, memory listing, the POST-shaped reads (`/api/memories/recall`, `/search`, `/surface`, `/traverse` — called by the recall hooks on every prompt with no key), and the keyless `GET /api/operator-config`, which exposes operator settings including the scope-alias map (i.e. client names). The consequence to understand on a shared machine: **any local process that can reach the port can read the whole corpus.** The mitigation is network placement and machine hygiene, not auth. Do not expose port 3200 to untrusted networks.
 - **Operator mutations require the admin key, and there is no keyless default.** On first run the server resolves `ADMIN_API_KEY` (precedence: non-empty launch env > non-empty `.env` value) or **generates one into `.env`** (written atomically, mode `0600` on POSIX — the key must not be readable by other local accounts); if `.env` cannot be written, the boot is refused with instructions rather than proceeding keyless (`tests/unit/first-run.test.ts`). The key gates memory create/update/archive and batch, slots, Redis context, MinIO artifacts, graph writes, operator-config PATCH, dream trigger/resolve, memory rollback, and admin promote/reindex/backup/discover/discovery-maintain (`X-API-Key` header; pinned by `tests/unit/core-crud-auth.test.ts` — mutations 401 without the key, reads never 401).
@@ -30,7 +30,7 @@ KOPENG 0.x is a **local developer preview**: self-hosted, single-operator infras
 
 ## Out of scope
 
-- Reports assuming the API is exposed to the public internet or reachable from untrusted networks (remote deployment is unsupported for the 0.x preview — see the threat model above)
+- Reports assuming the API is exposed to the public internet or reachable from untrusted networks (remote deployment is unsupported for the preview — see the threat model above)
 - Missing auth on the deliberately-open read endpoints listed above
 - Denial of service via the local, unauthenticated surface
 

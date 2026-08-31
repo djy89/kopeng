@@ -428,6 +428,19 @@ const migrations: Migration[] = [
       `ALTER TABLE operator_config ADD COLUMN primary_scope TEXT`,
     ],
   },
+  {
+    version: 10,
+    description: "WS0: memory_revisions snapshots is_locked — the lock is now THE Hard Anchor and is model-writable via update_memory {locked}, so an unlock has to leave a restorable record",
+    up: [
+      // NULLABLE with NO DEFAULT, deliberately (same shape as v8's scope/type/
+      // last_seen). A `DEFAULT 0` would backfill every pre-v10 revision with
+      // "was unlocked", and restoreRevision's COALESCE could then silently
+      // strip the anchor off a live locked row when rolling back to an old
+      // revision. NULL means "this revision predates the column" and the
+      // COALESCE keeps the live value.
+      `ALTER TABLE memory_revisions ADD COLUMN is_locked INTEGER`,
+    ],
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

@@ -1,5 +1,6 @@
 import fs from 'fs';
 import net from 'net';
+import path from 'path';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import logger from '../utils/logger.js';
@@ -47,6 +48,13 @@ export function ensureAdminKey(envPath: string, env: FirstRunEnv): { key: string
       if (content.length > 0 && !content.endsWith('\n')) content += '\n';
       content += `${comment}\n${line}\n`;
     }
+    // Defense in depth (Ruling 8 finding): the RESOLVED envPath can now be
+    // ~/.kopeng/.env, whose parent directory a from-source dev/test run has
+    // no other reason to have created. `kopeng init` (Task 2.2) is expected
+    // to create it first on a real packaged install, but first-run must not
+    // depend on that ordering — an absent parent here must not turn into an
+    // unexplained boot refusal. Idempotent when it already exists.
+    fs.mkdirSync(path.dirname(envPath), { recursive: true });
     // tmp-then-rename (the CX-12 discipline): a crash mid-write must never
     // leave a truncated .env, which holds every other operator setting too.
     // mode 0o600 on create + chmod on the renamed file: the key is the only

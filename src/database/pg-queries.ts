@@ -577,6 +577,13 @@ export class PgQueries implements IMemoryStore {
     );
   }
 
+  async updateLocked(id: number, locked: boolean): Promise<void> {
+    await this.pool.query(
+      'UPDATE memories SET is_locked = $1, updated_at = NOW() WHERE id = $2',
+      [locked, id]
+    );
+  }
+
   async trimAccessLog(days: number): Promise<number> {
     if (days <= 0) return 0; // 0 = keep forever — never run the DELETE
     // Backend-native cutoff (CX-7): interval arithmetic in PG, not a JS string.
@@ -721,15 +728,42 @@ export class PgQueries implements IMemoryStore {
   }
 
   async getCorpusHealthStats(): Promise<CorpusHealthStats> {
-    const agg = (await this.pool.query<{ count: string; mean: number | null }>(
-      'SELECT COUNT(*) AS count, AVG(confidence) AS mean FROM memories WHERE is_archived = false'
-    )).rows[0];
-    const flagged = (await this.pool.query<{ count: string }>(
-      `SELECT COUNT(DISTINCT mt.memory_id) AS count
-       FROM memory_tags mt JOIN memories m ON m.id = mt.memory_id
-       WHERE mt.tag = $1 AND m.is_archived = false`,
-      [CONTRADICTION_FLAG_TAG]
-    )).rows[0];
+    // Three independent full-corpus counts, so they go out CONCURRENTLY rather
+    // than as three sequential round-trips. legacy_anchor_count is the reason
+    // this matters: its predicate (is_locked = false AND (confidence >= 1.0 OR
+    // a metadata JSON probe)) cannot use an index — it is a sequential scan with
+    // a per-row JSON read — and it was added as a third serial hop in front of
+    // the already-expensive corpus-health compute. Contained today (one
+    // 60s-memoized ops endpoint), but there is no reason to pay for it in series.
+    //
+    // legacy_anchor_count is TRANSITIONAL: it counts rows still anchored only by
+    // a deprecated spelling (confidence >= 1.0 / metadata.pinned) and reads 0
+    // once a corpus is migrated onto is_locked. DROP the metric and this query
+    // when it reaches 0 corpus-wide — the scan has no other consumer.
+    const [aggRes, flaggedRes, legacyAnchorRes] = await Promise.all([
+      this.pool.query<{ count: string; mean: number | null }>(
+        'SELECT COUNT(*) AS count, AVG(confidence) AS mean FROM memories WHERE is_archived = false'
+      ),
+      this.pool.query<{ count: string }>(
+        `SELECT COUNT(DISTINCT mt.memory_id) AS count
+         FROM memory_tags mt JOIN memories m ON m.id = mt.memory_id
+         WHERE mt.tag = $1 AND m.is_archived = false`,
+        [CONTRADICTION_FLAG_TAG]
+      ),
+      // WS7.4 B3: rows still anchored by a DEPRECATED spelling and not already
+      // is_locked. metadata is already jsonb — ->>'pinned' stringifies the raw
+      // scalar, so a JSON boolean true reads 'true' and a JSON number 1 reads
+      // '1' (no collision with the SQLite json_extract shape, above).
+      this.pool.query<{ count: string }>(
+        `SELECT COUNT(*) AS count FROM memories
+         WHERE ${ARCHIVED_SQL_PREDICATE} = false
+           AND is_locked = false
+           AND (confidence >= 1.0 OR (metadata::jsonb ->> 'pinned') = 'true')`
+      ),
+    ]);
+    const agg = aggRes.rows[0];
+    const flagged = flaggedRes.rows[0];
+    const legacyAnchor = legacyAnchorRes.rows[0];
     const activeCount = parseInt(agg.count, 10);
     return {
       active_count: activeCount,
@@ -737,6 +771,7 @@ export class PgQueries implements IMemoryStore {
       // Number() is a defensive no-op. null when the corpus is empty.
       mean_confidence: activeCount > 0 && agg.mean != null ? Number(agg.mean) : null,
       contradiction_flagged_count: parseInt(flagged.count, 10),
+      legacy_anchor_count: parseInt(legacyAnchor.count, 10),
     };
   }
 

@@ -26,6 +26,10 @@ import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+// RULING-C (WS7.6): project:<basename(cwd)> is now project:<owner>-<repo>
+// derived from the git remote, marker-overridable — see project-scope.mjs.
+import { deriveProjectScope } from './project-scope.mjs';
+import { isEntrypoint } from './entrypoint.mjs';
 
 // ── Configuration ──
 
@@ -989,7 +993,7 @@ async function main() {
   // Code provides the same stdin fields, so this is parity, not a behavior change.
   const sessionId = hookData.session_id || getSessionId();
   const cwd = hookData.cwd || process.env.CLAUDE_CWD || process.cwd();
-  const projectScope = `project:${basename(cwd)}`;
+  const projectScope = deriveProjectScope(cwd).scope;
 
   // Build input/output summaries with scrubbing
   let inputSummary = null;
@@ -1128,5 +1132,6 @@ export {
   criticalHintFile,
 };
 
-const isMain = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+// Symlink-safe (T72) — see scripts/hooks/entrypoint.mjs.
+const isMain = isEntrypoint(import.meta.url);
 if (isMain) main().catch(() => process.exit(0));

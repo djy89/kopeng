@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import type { IMemoryStore } from '../database/interfaces.js';
-import { embed, embedWithModel, embeddingToBuffer, isEmbedderReady } from '../embeddings/embedder.js';
+import { embed, embedWithModel, embeddingToBuffer, isEmbedderReady, getEmbedderLoadState } from '../embeddings/embedder.js';
 import { hybridSearch } from '../search/hybrid.js';
 import type { Memory, MemoryType } from '../types/types.js';
 import config from '../config/config.js';
@@ -33,9 +33,10 @@ import { surface } from '../surfacing/surface.js';
 import { isAnchored, isDecayedAtRisk } from '../dreaming/scoring.js';
 import { cosineSimilarity, COSINE_DUPLICATE_THRESHOLD, classifyDupPair } from '../dreaming/pipeline.js';
 import { buildScopeDrift } from '../scopes/drift.js';
-import { buildScopeResolution, type ScopeResolution, isGlobalScope, isScopeForm, slugifyScope, GLOBAL_SCOPE } from '../scopes/resolver.js';
+import { buildScopeResolution, type ScopeResolution, type RejectedAlias, isGlobalScope, isScopeForm, slugifyScope, GLOBAL_SCOPE } from '../scopes/resolver.js';
 import { SCOPE_ALIASES_CONFIG_KEY } from '../services/scope-alias.js';
 import { bufferToEmbedding } from '../embeddings/embedder.js';
+import { KOPENG_VERSION } from '../version.js';
 
 // Zod schemas
 const MemoryTypeEnum = z.enum(['user', 'feedback', 'project', 'reference', 'discovery']);
@@ -174,6 +175,17 @@ const UpdateSchema = z.object({
   // rollback API (see the PUT handler). Bounds mirror the store: 0..1.
   // z.coerce: see StoreSchema — the same client-serialization quirk hits update.
   confidence: z.coerce.number().min(0).max(1).optional(),
+  // WS7.4 B1: is_locked is THE Hard Anchor write path on a PUBLIC API — unlike
+  // confidence's z.coerce.number (numeric coercion has no surprising cases),
+  // z.coerce.boolean uses JS truthiness: Boolean("false") is true, and
+  // Boolean(null) is false, so "false" would SILENTLY LOCK and null would
+  // SILENTLY UNLOCK instead of "no change" (fix round 1, Finding 3). A strict
+  // enumerated union accepts only the wire shapes an MCP/REST client actually
+  // sends (real boolean, 0/1, "true"/"false") and 400s everything else,
+  // including null — absent (not present at all) remains "no change".
+  is_locked: z.union([z.boolean(), z.literal(0), z.literal(1), z.literal('true'), z.literal('false')])
+    .transform(v => v === true || v === 1 || v === 'true')
+    .optional(),
 });
 
 const SearchSchema = z.object({
@@ -452,7 +464,7 @@ async function resolveWriteScope(
 export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
   // R7: destructure the AppContext once — route bodies keep their original names.
   const { queries, observations: observationStore, dreams: dreamStore, operatorConfig: operatorConfigStore } = ctx.stores;
-  const { embeddingIndex, memoryCache, discoveryScheduler, observationBus, activityTracker, dreamRunner, reasonerStatus, scopeAliases, scopeRegistry } = ctx.services;
+  const { embeddingIndex, memoryCache, discoveryScheduler, observationBus, activityTracker, dreamRunner, reasonerStatus, scopeAliases, scopeRegistry, requestShutdown } = ctx.services;
   const dbLifecycle = ctx.lifecycle;
 
   // Admin-key gate. Originally only the operator-mutating endpoints (PATCH
@@ -504,13 +516,22 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
   // --- Health ---
   app.get('/api/health', async () => {
     const memoryCount = await queries.getCount();
+    // T56: a terminally-failed embedder load must not read like a cold start
+    // forever. `failed` is a distinct, permanent state: the server is up and
+    // serving keyword-only search (the Finding #2 degrade path), so report
+    // `degraded`/`error`/`keyword_only` instead of the transient
+    // `loading`/`initializing` shape.
+    const embedderFailed = getEmbedderLoadState() === 'failed';
     return {
       data: {
-        status: isEmbedderReady() ? 'ready' : 'loading',
-        embedding: isEmbedderReady() ? 'loaded' : 'initializing',
-        search: isEmbedderReady() ? 'hybrid' : (memoryCount > 0 ? 'keyword_only' : 'unavailable'),
+        status: isEmbedderReady() ? 'ready' : (embedderFailed ? 'degraded' : 'loading'),
+        embedding: isEmbedderReady() ? 'loaded' : (embedderFailed ? 'error' : 'initializing'),
+        search: isEmbedderReady()
+          ? 'hybrid'
+          : (embedderFailed || memoryCount > 0 ? 'keyword_only' : 'unavailable'),
         memories: memoryCount,
         uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
+        version: KOPENG_VERSION,
       },
     };
   });
@@ -823,6 +844,19 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     // dream_audit_log row (operator ruling 2026-08-18 #4).
     const confidenceChanged =
       input.confidence !== undefined && input.confidence !== existing.confidence;
+    // WS7.4 B1: is_locked mirrors the confidenceChanged pattern exactly — it is
+    // an effective mutation, so it snapshots. WS0 completed the loop: the lock
+    // IS now written into the revision (memory_revisions.is_locked, SQLite v10 /
+    // PG v12) and restored by rollback. That closes the real hole — the lock is
+    // THE Hard Anchor and is model-writable via the MCP `update_memory {locked}`
+    // argument, so a model-issued unlock used to be both unrecorded and
+    // irreversible, leaving the row archivable on the next promotion/dream pass.
+    // Deliberately NOT audited into dream_audit_log: an operator PUT has no dream
+    // to hang an audit row off, and per ruling 4 the revision snapshot IS the
+    // reversibility record for the operator-edit class (same posture as T30.3
+    // crystallization).
+    const lockChanged =
+      input.is_locked !== undefined && input.is_locked !== !!existing.is_locked;
     // Phase 3: only a patch that SUPPLIES a scope resolves through the registry.
     // Truthy check, deliberately — pre-Phase-3 behavior preserved: an omitted OR
     // empty-string scope keeps the current one.
@@ -842,6 +876,7 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
     const nextTags = input.tags ?? existing.tags;
     const tagsChanged = JSON.stringify([...nextTags].sort()) !== JSON.stringify([...existing.tags].sort());
     const mutated = confidenceChanged
+      || lockChanged
       || nextContent !== existing.content
       || nextType !== existing.type
       || scope !== existing.scope
@@ -871,12 +906,17 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       await queries.updateConfidence(memoryId, input.confidence!);
     }
 
+    if (lockChanged) {
+      await queries.updateLocked(memoryId, input.is_locked!);
+    }
+
     const updated = await queries.get(memoryId);
     return {
       data: updated,
       meta: {
         content_changed: result.contentChanged,
         confidence_changed: confidenceChanged,
+        lock_changed: lockChanged,
         duration_ms: Date.now() - start,
         ...resolved.meta,
       },
@@ -959,11 +999,12 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       limit: z.number().int().min(1).max(10).default(3),
     }).parse(request.body);
 
-    if (!isEmbedderReady()) {
-      return { data: [], meta: { duration_ms: Date.now() - start } };
-    }
-
-    const queryVec = await embed(input.query);
+    // T55: an unavailable embedder (still loading, or terminally failed) must
+    // degrade to FTS-only recall, not an empty response — /search already
+    // serves keyword hits in the same state, and the per-prompt hook rides
+    // THIS endpoint. The FTS and staple lanes below are embedder-independent;
+    // with no semantic side the RRF merge simply gets no vector ranks.
+    const queryVec = isEmbedderReady() ? await embed(input.query) : null;
 
     // Normalize: accept both `scope` (string) and `scopes` (array); `scopes` takes priority.
     //
@@ -1040,7 +1081,9 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
 
     // ── Parallel: semantic + FTS + staple IDs ──
     const [vectorResults, ftsRows, stapleIds] = await Promise.all([
-      embeddingIndex.search(queryVec, candidateIds, input.limit * 4),
+      queryVec
+        ? embeddingIndex.search(queryVec, candidateIds, input.limit * 4)
+        : Promise.resolve([]),
       ftsQuery
         ? queries.searchFts(ftsQuery, input.limit * 4)
             .then(rows => (candidateSet ? rows.filter(r => candidateSet.has(r.rowid)) : rows))
@@ -1257,6 +1300,25 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       data: { backup_path: backupPath },
       meta: { duration_ms: Date.now() - start },
     };
+  });
+
+  // --- Admin: Shutdown (Task 2.4.1) ---
+  // Registered unconditionally (unlike dreamRunner/discoveryScheduler-gated
+  // routes) so `kopeng uninstall`/`kopeng update` get a stable, always-401-or-
+  // 202-or-501 target rather than a 404 that would be indistinguishable from
+  // "wrong URL". Absent `requestShutdown` (a route registered without the
+  // full server.ts wiring — see AppContext) degrades to a named 501 refusal
+  // instead of crashing, mirroring how other optional services degrade.
+  app.post('/api/admin/shutdown', { preHandler: [requireAdminKey] }, async (_request, reply) => {
+    if (!requestShutdown) {
+      reply.status(501);
+      return { error: 'graceful shutdown is not wired on this server (no requestShutdown service configured)' };
+    }
+    reply.status(202).send({ data: { shutting_down: true } });
+    // AFTER replying — the caller (CLI or a load balancer) must see the 202
+    // before the server starts tearing down its Fastify instance.
+    setImmediate(() => requestShutdown());
+    return;
   });
 
   // --- Admin: Reindex ---
@@ -2070,6 +2132,7 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       const run = configPatchChain.then(async () => {
         const { config: configPatch, ...rest } = input;
         let patch: Record<string, unknown> = rest;
+        let aliasRejects: RejectedAlias[] | undefined;
         if (configPatch !== undefined) {
           const current = await operatorConfigStore.getConfig('default');
           let blob: Record<string, unknown>;
@@ -2086,13 +2149,29 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
             else blob[key] = value;
           }
           patch = { ...rest, config: JSON.stringify(blob) };
+          // A PATCH that touches scope_aliases used to 200 with no signal at all
+          // when the SHARED resolver would go on to reject an entry (self-map,
+          // chain, malformed scope, generic capture). The write path then keeps
+          // ignoring that entry — new rows keep landing on the alias scope and
+          // recall never expands it — while the operator has every reason to
+          // believe the ruling took. Run the RESULTING (merged) table through
+          // buildScopeResolution and report what it dropped.
+          //   Reporting only, deliberately: refusing the PATCH would be a
+          // breaking change on a release branch, and POST /api/admin/scopes/rule
+          // is already the validating path for alias entries. This makes the
+          // silent reject visible; it does not change what persists.
+          if (Object.prototype.hasOwnProperty.call(configPatch, SCOPE_ALIASES_CONFIG_KEY)) {
+            const rejected = buildScopeResolution(blob[SCOPE_ALIASES_CONFIG_KEY]).rejected;
+            if (rejected.length > 0) aliasRejects = rejected;
+          }
         }
-        return operatorConfigStore.updateConfig('default', patch);
+        const cfg = await operatorConfigStore.updateConfig('default', patch);
+        return { cfg, aliasRejects };
       });
       // Keep the chain alive even if this run rejects (one failure must not
       // wedge later PATCHes); the awaited `run` still surfaces the error here.
       configPatchChain = run.catch(() => {});
-      const cfg = await run;
+      const { cfg, aliasRejects } = await run;
       // T46: a PATCH may have changed the scope_aliases key in the config
       // blob — drop the service's cache so the next write/recall sees it
       // immediately instead of waiting out the TTL.
@@ -2100,6 +2179,25 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       // Phase 3: same posture for primary_scope — the registry service caches
       // it; drop the cache so the next write routes against the new value.
       scopeRegistry?.invalidate();
+      // Additive meta — absent unless the patch actually produced rejects, so a
+      // clean PATCH is byte-identical to the pre-WS0 response.
+      if (aliasRejects) {
+        for (const r of aliasRejects) {
+          logger.warn(
+            `PATCH /api/operator-config stored a scope_aliases entry the resolver rejects: ` +
+            `"${r.alias}" -> ${JSON.stringify(r.canonical)} (${r.reason}) — it will be ignored by the write path and by recall expansion`
+          );
+        }
+        return {
+          data: cfg,
+          meta: {
+            alias_entries_rejected: aliasRejects.map(r => ({
+              alias: r.alias, canonical: r.canonical, reason: r.reason,
+            })),
+            note: 'These scope_aliases entries were STORED but the shared resolver rejects them, so they have no effect: writes will not canonicalize and recall will not expand. Fix them and resend the FULL map, or use POST /api/admin/scopes/rule.',
+          },
+        };
+      }
       return { data: cfg };
     });
 
@@ -2815,6 +2913,7 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
         duplicate_pair_count: duplicatePairs.total,
         duplicate_pairs: duplicatePairs,
         decayed_at_risk_count: decayedAtRisk,
+        legacy_anchor_count: stats.legacy_anchor_count,
       },
       meta: {
         sample_size: sample.length,

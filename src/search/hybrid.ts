@@ -150,7 +150,8 @@ export async function hybridSearch(
 
       // Decay clock anchors on last_seen (reinforcement-on-access); durability from
       // observation_count slows decay for well-evidenced memories (D1.1). The dormant
-      // freeze is intentionally not wired here — see maintenance.ts.
+      // freeze is intentionally not wired here — see maintenance.ts. WS7.4: a
+      // locked row's rank must freeze too, same as a >=1.0 anchor.
       const effectiveConfidence = computeEffectiveConfidence(
         memory.confidence,
         memory.last_seen ?? memory.updated_at,
@@ -158,7 +159,8 @@ export async function hybridSearch(
         false,
         memory.observation_count ?? 1,
         memory.type,
-        memory.tags
+        memory.tags,
+        !!memory.is_locked
       );
       if (minConfidence !== undefined && effectiveConfidence < minConfidence) continue;
 
@@ -231,6 +233,7 @@ async function buildResults(
     if (!includeDiscoveries && memory.type === 'discovery') continue;
 
     // Apply confidence blending: score * (floor + (1-floor) * effectiveConfidence)
+    // WS7.4: a locked row's blended score must freeze too, same as a >=1.0 anchor.
     const effectiveConf = computeEffectiveConfidence(
       memory.confidence,
       memory.last_seen ?? memory.updated_at,
@@ -238,7 +241,8 @@ async function buildResults(
       false,
       memory.observation_count ?? 1,
       memory.type,
-      memory.tags
+      memory.tags,
+      !!memory.is_locked
     );
 
     // Apply min_confidence filter

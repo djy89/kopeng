@@ -4,6 +4,30 @@
   "description": "Persistent memory system with semantic search, accessible via MCP and REST API",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "kopeng": "dist/cli/index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/djy89/kopeng.git"
+  },
+  "homepage": "https://github.com/djy89/kopeng#readme",
+  "bugs": {
+    "url": "https://github.com/djy89/kopeng/issues"
+  },
+  "files": [
+    "dist",
+    "scripts/hooks",
+    "scripts/viz-server.js",
+    "viz",
+    ".env.example",
+    "SETUP.md",
+    "SECURITY.md",
+    "docs/codex-setup.md",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "dev:mcp": "tsx watch src/index.ts",
@@ -45,14 +69,16 @@
     "snapshot:corpus-health": "tsx scripts/ops/corpus-health-snapshot.ts",
     "propose:scope-aliases": "tsx scripts/ops/propose-scope-aliases.ts",
     "migrate:scope-aliases": "tsx scripts/ops/migrate-scope-aliases.ts",
+    "migrate:anchors": "tsx scripts/ops/migrate-anchors-to-lock.ts",
     "reconcile:archived": "tsx scripts/ops/reconcile-archived-columns.ts",
-    "canary": "tsx scripts/ops/recall-canary.ts",
-    "wire": "tsx scripts/ops/wire-client.ts",
-    "doctor": "tsx scripts/ops/doctor.ts",
+    "canary": "tsx src/cli/recall-canary.ts",
+    "wire": "tsx src/cli/wire-client.ts",
+    "doctor": "tsx src/cli/doctor.ts",
     "heartbeats": "tsx scripts/ops/heartbeats-report.ts",
     "backup": "tsx scripts/ops/backup-local.ts",
     "clean:client": "node scripts/ops/clean-client.mjs",
-    "restore:verify": "tsx scripts/ops/backup-local.ts --verify"
+    "restore:verify": "tsx scripts/ops/backup-local.ts --verify",
+    "prepublishOnly": "npm run build && vitest run tests/unit"
   },
   "author": "djy89 (https://github.com/djy89)",
   "license": "BUSL-1.1",

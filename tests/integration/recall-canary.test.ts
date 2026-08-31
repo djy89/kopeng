@@ -57,7 +57,7 @@ process.env.HOME = tmpDir;
 
 let server: typeof import('../../src/server.js');
 let composed: Awaited<ReturnType<typeof server.composeServer>>;
-let canary: typeof import('../../scripts/ops/recall-canary.js');
+let canary: typeof import('../../src/cli/recall-canary.js');
 let apiUrl: string;
 
 beforeAll(async () => {
@@ -68,7 +68,7 @@ beforeAll(async () => {
   await composed.app.listen({ port: 0, host: '127.0.0.1' });
   const addr = composed.app.server.address() as AddressInfo;
   apiUrl = `http://127.0.0.1:${addr.port}`;
-  canary = await import('../../scripts/ops/recall-canary.js');
+  canary = await import('../../src/cli/recall-canary.js');
 }, 120_000);
 
 afterAll(async () => {

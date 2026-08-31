@@ -30,6 +30,8 @@ const CLASS_MEMBERS: Array<{ dir: string; name: string }> = [
   { dir: 'hints', name: 'canonical_path.json' },
   { dir: 'hints', name: 'canonical_fallback_state.json' },
   { dir: 'hints', name: 'critical_sess-abc123.json' },
+  { dir: 'hints', name: 'ensure_conflict.json' },
+  { dir: 'hints', name: 'ensure_spawn.json' },
   { dir: 'cache', name: 'sequences_kopeng.json' },
   { dir: 'cache', name: 'canonical_triggers_kopeng.json' },
 ];
@@ -53,8 +55,8 @@ afterEach(() => {
 });
 
 describe('DELETABLE_CLASSES', () => {
-  it('covers exactly the six allowlisted hint/cache classes', () => {
-    expect(DELETABLE_CLASSES).toHaveLength(6);
+  it('covers exactly the eight allowlisted hint/cache classes', () => {
+    expect(DELETABLE_CLASSES).toHaveLength(8);
     for (const member of CLASS_MEMBERS) {
       const matches = DELETABLE_CLASSES.filter(
         (c: { dir: string; pattern: RegExp }) => c.dir === member.dir && c.pattern.test(member.name)

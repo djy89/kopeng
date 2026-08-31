@@ -37,6 +37,7 @@ export class MemoryQueries implements IMemoryStore {
   private updateEmbedding: Database.Statement;
   private getAllEmbeddings: Database.Statement;
   private updateConfidenceStmt: Database.Statement;
+  private updateLockedStmt: Database.Statement;
   private reinforceOnAccessStmt: Database.Statement;
 
   constructor(db: Database.Database) {
@@ -109,6 +110,10 @@ export class MemoryQueries implements IMemoryStore {
 
     this.updateConfidenceStmt = db.prepare(`
       UPDATE memories SET confidence = ?, updated_at = datetime('now') WHERE id = ?
+    `);
+
+    this.updateLockedStmt = db.prepare(`
+      UPDATE memories SET is_locked = ?, updated_at = datetime('now') WHERE id = ?
     `);
 
     this.reinforceOnAccessStmt = db.prepare(`
@@ -461,6 +466,10 @@ export class MemoryQueries implements IMemoryStore {
     this.updateConfidenceStmt.run(confidence, id);
   }
 
+  async updateLocked(id: number, locked: boolean): Promise<void> {
+    this.updateLockedStmt.run(locked ? 1 : 0, id);
+  }
+
   async trimAccessLog(days: number): Promise<number> {
     if (days <= 0) return 0; // 0 = keep forever — never run the DELETE
     // Backend-native cutoff (CX-7): SQLite stores 'YYYY-MM-DD HH:MM:SS' text,
@@ -616,10 +625,28 @@ export class MemoryQueries implements IMemoryStore {
        FROM memory_tags mt JOIN memories m ON m.id = mt.memory_id
        WHERE mt.tag = ? AND m.is_archived = 0`
     ).get(CONTRADICTION_FLAG_TAG) as { count: number };
+    // WS7.4 B3: rows still anchored by a DEPRECATED spelling and not already
+    // is_locked. TRANSITIONAL metric: the predicate cannot use an index (a
+    // sequential scan with a per-row JSON read) and it reads 0 once a corpus is
+    // migrated onto is_locked — DROP the metric and this query when it reaches 0
+    // corpus-wide; the scan has no other consumer.
+    // json_valid guards json_extract/json_type, which throw on
+    // malformed JSON rather than returning NULL. json_type(...) = 'true' (not
+    // json_extract(...) = 1) so a JSON number 1 ({"pinned":1}) does NOT count —
+    // json_extract maps both JSON `true` and the integer 1 to the SQL value 1,
+    // but json_type distinguishes 'true' from 'integer', matching PG's
+    // `->>'pinned' = 'true'` and isPinnedMetadata's strict `=== true` exactly.
+    const legacyAnchor = this.db.prepare(
+      `SELECT COUNT(*) AS count FROM memories
+       WHERE ${ARCHIVED_SQL_PREDICATE} = 0
+         AND is_locked = 0
+         AND (confidence >= 1.0 OR (json_valid(metadata) AND json_type(metadata, '$.pinned') = 'true'))`
+    ).get() as { count: number };
     return {
       active_count: agg.count,
       mean_confidence: agg.count > 0 ? (agg.mean ?? null) : null,
       contradiction_flagged_count: flagged.count,
+      legacy_anchor_count: legacyAnchor.count,
     };
   }
 

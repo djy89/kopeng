@@ -2,7 +2,65 @@
 
 Get KOPENG running on a fresh device and wired to Claude Code. For full architecture, REST API, and eval harness see [README.md](./README.md).
 
-> **Platform note:** this walkthrough was written from a Windows production deployment, but KOPENG is plain Node — everything except the OS-specific sections (§3 NSSM, §6 firewall, §6b winnat) is identical on Linux/macOS. Linux users: install/build in §1 (use bash instead of PowerShell), then jump to [§3b systemd](#3b-linux-systemd-service); §6b does not apply to you.
+---
+
+## The fast path: `npx kopeng init`
+
+```bash
+npx kopeng init
+```
+
+One command: it checks Node/port/disk/client prerequisites, shows exactly what it's about to
+put on your machine and asks you to confirm, installs the server into `~/.kopeng/app`,
+downloads the embedding model, registers a zero-admin-rights autostart entry, starts the
+server, wires Claude Code's hooks + MCP registration, and finishes with a `doctor`/`canary`
+health check. Non-interactive/CI installs: `npx kopeng init --non-interactive --profile
+minimal`. `npx kopeng uninstall` reverses everything it lists on the consent screen.
+
+**Uninstalling:** `npx kopeng uninstall` stops the server (`POST /api/admin/shutdown`), removes
+the autostart entry and ensure knob, reverses the Claude Code MCP/hook wiring, and deletes
+`~/.kopeng/app`. Your database, downloaded models, and `.env` are **kept** — pass `--purge` to
+remove `~/.kopeng` entirely too (gated behind `--yes` or typing `purge` at a prompt, since
+deleting your memory corpus is the one irreversible step here). `--dry-run` prints the full plan
+without touching anything. Every step degrades to a printed reason and continues rather than
+failing outright — an already-stopped server, a missing autostart entry, or a hand-edited config
+file are all handled, not treated as errors.
+
+**Updating:** `npx kopeng update` (optionally `--from <tarball|spec>`) installs a newer release
+into `~/.kopeng/app` and, only if the version actually changed, stops the server, restarts it,
+and prints a `doctor` summary. Already up to date is a no-op — nothing restarts. A brief pass;
+the full command-reference update is tracked separately.
+
+### npm-installed layout
+
+Everything the npm install touches lives under `~/.kopeng/`: `app/` (the server + CLI,
+prebuilt — nothing compiles), `data/` (SQLite database(s)), `models/` (the cached embedding +
+reranker models), `logs/` (server output), and `.env` (config, including the generated admin
+key). The server resolves which `.env` to load in one order: `KOPENG_ENV_FILE` (an explicit
+override) beats the project's own `.env` when running from a source checkout, which beats
+`~/.kopeng/.env` — the packaged-install fallback, reached only when there is no source-checkout
+`.env` to use instead.
+
+Beyond `init`/`uninstall`/`update` above, three more commands manage a packaged install day to
+day: `kopeng autostart status|register|unregister` inspects or (re)applies the user-level login
+autostart entry (a Scheduled Task on Windows, a `systemd --user` unit on Linux, a LaunchAgent on
+macOS — the same zero-admin-rights mechanism `init` registers automatically); `kopeng ensure` is
+the fire-and-forget self-heal that `init` wires into the SessionStart hook — it probes the
+server and launches it if nothing answers, and does nothing (beyond a `doctor`-visible note) if
+a foreign process already owns the port; `kopeng viz` launches the web dashboard (see
+[README.md's "Watch it think"](./README.md#watch-it-think)) in the foreground — Ctrl-C stops it.
+
+**Offline / air-gapped install:** copy a populated `~/.kopeng/models` directory from another
+machine (same layout — the embedding model's `.onnx` files under `Xenova/all-MiniLM-L6-v2/`),
+then run `npx kopeng init --offline` on the target machine: it verifies the model files are
+already there instead of downloading them, and fails plainly naming what's missing if they
+aren't.
+
+Everything below this point is the **from-source** path — clone the repo yourself, build it,
+and wire/run it with the individual `wire`/`doctor`/`canary` commands. Use it for development
+on KOPENG itself, or if you'd rather manage the pieces by hand.
+
+> **Platform note:** this walkthrough was written from a Windows production deployment, but KOPENG is plain Node — everything except the OS-specific sections (§3a NSSM, §6 firewall, §6b winnat) is identical on Linux/macOS. Linux users: install/build in §1 (use bash instead of PowerShell), then jump to [§3b systemd](#3b-linux-systemd-service); §6b does not apply to you.
 
 ---
 
@@ -43,7 +101,7 @@ recommended day-one value: `PRIMARY_SCOPE=project:my-project`.
 **Terminal 1 — start the server and leave this terminal running:**
 
 ```bash
-npm start          # or install as a service first (§3 / §3b)
+npm start          # or install as a service first (§3a / §3b)
 ```
 
 **Terminal 2 — open a second terminal in the same repo directory:**
@@ -136,7 +194,7 @@ If you skip this, observation writes are open — acceptable only when the serve
 
 ### Remote access
 
-**Remote deployment is unsupported for the 0.x preview.** `HOST=127.0.0.1`
+**Remote deployment is unsupported for the preview.** `HOST=127.0.0.1`
 (default) binds loopback only, and the server **refuses to boot** on a
 non-loopback `HOST` unless BOTH `ADMIN_API_KEY` and `OBSERVATION_API_KEY` are
 set — the refusal message names the missing key(s) and points at
@@ -151,7 +209,16 @@ reverse proxy. See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ---
 
-## 3. Install Windows Service (NSSM)
+## 3. Run it as a proper service (operators)
+
+NSSM (Windows) and systemd (Linux), below, are the **operator-grade** option: a real service
+manager, always-on, with log rotation and `systemctl status`. Most single-operator installs
+don't need this — the npm-installed layout above already gives you `kopeng autostart` +
+`kopeng ensure`, a lighter zero-admin-rights way to survive a reboot. See
+["Server lifecycle: which mechanism do I need?"](#server-lifecycle-which-mechanism-do-i-need)
+below for the full comparison before choosing.
+
+### 3a. Windows Service (NSSM)
 
 ```powershell
 nssm install kopeng "C:\Program Files\nodejs\node.exe" "C:\path\to\kopeng\dist\server.js"
@@ -168,7 +235,7 @@ Verify: `curl http://localhost:3200/api/health`
 
 ---
 
-## 3b. Linux: systemd service
+### 3b. Linux: systemd service
 
 ```ini
 # /etc/systemd/system/kopeng.service
@@ -200,6 +267,43 @@ curl http://localhost:3200/api/health   # ready?
 ```
 
 No root / prefer user-level? `systemctl --user` with the same unit in `~/.config/systemd/user/` (add `loginctl enable-linger youruser` so it survives logout), or just `pm2 start dist/server.js --name kopeng`.
+
+### Server lifecycle: which mechanism do I need?
+
+NSSM (§3a) and systemd (§3b) above are the **operator-grade** option — a real
+service manager, always-on, log rotation, `systemctl status`. If you installed
+KOPENG as the `kopeng` npm package rather than from source, you already have a
+lighter zero-admin-rights alternative: `kopeng autostart register` sets up a
+user-level login autostart (a Scheduled Task on Windows, a `systemd --user`
+unit on Linux, a LaunchAgent on macOS — no root/admin needed), and `kopeng
+ensure` self-heals between prompts by probing the server and launching it if
+it isn't already up (wired automatically into the SessionStart hook once
+`kopeng init` has run). Use NSSM/systemd if you want a supervised, always-on
+service with logs; use `kopeng autostart` + `ensure` if you just want the
+server to come back after a reboot without setting up a service manager.
+
+### 3c. Docker (alternative, not primary)
+
+No published KOPENG image exists yet — this is a run-from-source-in-a-container recipe, not a
+`docker pull`. Build once from a clone, then run it like any other Node service:
+
+```dockerfile
+FROM node:20-slim
+WORKDIR /app
+COPY . .
+RUN npm ci && npm run build
+EXPOSE 3200
+CMD ["node", "dist/server.js"]
+```
+
+```bash
+docker build -t kopeng .
+docker run -d --name kopeng -p 127.0.0.1:3200:3200 -v kopeng-data:/app/data kopeng
+```
+
+Mount `/app/data` (and `/app/models` to avoid re-downloading the embedding model on every
+container recreate) as volumes; treat everything else in §7 (Neo4j/MinIO/Redis Compose files)
+as this container's peers, not its parent.
 
 ---
 
@@ -375,7 +479,7 @@ The hooks handle automatic recall/capture, but Claude uses the MCP tools *well* 
 
 MCP memory tools (`mcp__kopeng__*`) backed by a local KOPENG server; hooks handle automatic recall.
 
-- **Scopes:** `global` | `project:<basename-of-repo-root>` | `client:<name>` — scope tightly; default to the project scope.
+- **Scopes:** `global` | `project:<owner>-<repo>` (derived from the git remote, marker-overridable via `.kopeng.json`, `basename(cwd)` fallback when there's no usable remote) | `client:<name>` — scope tightly; default to the project scope.
 - **Types:** `user` (who I am, preferences) | `feedback` (corrections — always include the why) | `project` (ongoing work, decisions) | `reference` (pointers to docs/URLs/paths).
 - **Search:** default `hybrid` mode; `rerank: true` when comparing 3+ results; scope filters over broad queries.
 - **Before storing:** `search_memories` for duplicates → prefer `update_memory` over creating a near-duplicate. On conflict, prefer the recent fact and archive the stale one.
@@ -450,7 +554,7 @@ Docker Compose files for each service are in the repo root (`docker-compose.neo4
 
 ### PostgreSQL
 
-The alternative Postgres backend is supported for the maintainer only and is not part of the 0.x preview path — see [docs/postgres-maintainer.md](./docs/postgres-maintainer.md).
+The alternative Postgres backend is supported for the maintainer only and is not part of the preview path — see [docs/postgres-maintainer.md](./docs/postgres-maintainer.md).
 
 ---
 
@@ -490,20 +594,21 @@ update_memory(id=XXXX, tags=[...existing..., "staple"], metadata={"trigger_terms
 
 ### Decay / archival protection
 
-Staples must be stored with **`confidence: 1.0` passed explicitly** (the server default for an omitted confidence is `0.9`, which is decay-eligible). `1.0` is the Hard Anchor: the decay pipeline, the dream auto-apply path, and the promotion pipeline all skip memories with `confidence >= 1.0` or `is_locked = 1`.
+Staples must be **locked** (`is_locked = true`) — the Hard Anchor: the decay pipeline, the dream auto-apply path, and the promotion pipeline all skip a locked memory outright, regardless of confidence. Store the memory, then lock it via MCP `update_memory`:
 
 ```
-store_memory(content="...", confidence=1.0, metadata={"trigger_terms": [...]})
+store_memory(content="...", metadata={"trigger_terms": [...]})
+update_memory(id=XXXX, locked=true)
 ```
 
-To promote an existing memory (imported, migrated, or stored without the override) to a Hard Anchor, use the REST update path with the admin key:
+Or via REST with the admin key:
 
 ```bash
 curl -X PUT http://localhost:3200/api/memories/<id> -H "Content-Type: application/json" \
-  -H "X-API-Key: $ADMIN_API_KEY" -d '{"confidence": 1.0}'
+  -H "X-API-Key: $ADMIN_API_KEY" -d '{"is_locked": true}'
 ```
 
-(The MCP `update_memory` tool edits content/metadata only — it does not change confidence.)
+**Deprecation window:** `confidence >= 1.0` and `metadata.pinned === true` are still honored as Hard Anchors this release — a staple anchored the old way keeps working — but they are DEPRECATED spellings. `doctor` warns when the corpus still holds any (`legacy_anchor_count`), and `npm run migrate:anchors` moves them to `is_locked`. New staples should use `locked=true`, not `confidence=1.0`.
 
 ### Verification after adding a staple
 
@@ -613,7 +718,9 @@ First stop: `curl http://localhost:3200/api/health` — it reports embedding-ind
 **Embedding model never loads (`ERR_DLOPEN_FAILED` on `onnxruntime_binding.node`).** The ONNX runtime is a native
 module and needs the Microsoft Visual C++ Redistributable on Windows (see [Prerequisites](#prerequisites)); install it
 and restart. The server is *designed* to survive this — it logs `Continuing with keyword-only search` and keeps serving
-FTS/keyword results, so `/api/memories/search` still works while `/api/memories/recall` (semantic-only) returns empty.
+FTS/keyword results: both `/api/memories/search` and `/api/memories/recall` fall back to keyword-only matches, and
+`/api/health` reports the terminal state honestly (`status: "degraded"`, `embedding: "error"`, `search: "keyword_only"`)
+rather than looking like a cold start forever.
 Until 2026-08-26 it logged that line and then died anyway on Node <= 20, because a failing ESM import of a throwing
 CommonJS dependency surfaces the same error twice and the second one is unreachable; that is fixed, and pinned by
 `tests/unit/import-duplicate-rejection.test.ts`.

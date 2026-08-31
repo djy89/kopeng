@@ -11,7 +11,7 @@
  *     recall request body, so "the scopes actually reach the request" is a fact,
  *     not an inference, and the no-marker request is byte-identical to pre-P4.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer, type Server } from 'node:http';
@@ -19,6 +19,20 @@ import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve, dirname, parse as parsePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
+import { deriveProjectScope, readMarkerChain } from '../../scripts/hooks/project-scope.mjs';
+
+// Marker-walk instrumentation for the single-walk test at the bottom of this file.
+// vi.spyOn can't touch a builtin's ESM namespace (frozen), so node:fs is mocked as a
+// pass-through that merely TALLIES `.kopeng.json` opens — no behaviour is replaced.
+const walkCounter = vi.hoisted(() => ({ markerReads: 0 }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  const readFileSync = (path: unknown, ...rest: unknown[]) => {
+    if (typeof path === 'string' && path.endsWith('.kopeng.json')) walkCounter.markerReads++;
+    return (actual.readFileSync as (...a: unknown[]) => unknown)(path, ...rest);
+  };
+  return { ...actual, default: { ...actual, readFileSync }, readFileSync };
+});
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = resolve(HERE, '../../scripts/hooks/memory-prompt-search.mjs');
@@ -344,5 +358,100 @@ describe('Task 9: anchor scopes to /api/surface + expand=aliases on the trigger-
       expect(u).toContain('fields=lite');
       expect(u).toContain('limit=500');
     }
+  });
+});
+
+/**
+ * The ONE walk (readMarkerChain in project-scope.mjs).
+ *
+ * `.kopeng.json` has two independent readers with two different stop rules —
+ * deriveProjectScope takes the NEAREST `project` field and stops; readAnchorScopes
+ * keeps collecting `scopes` up to its bounds. They used to walk the same 12 ancestor
+ * levels separately, twice per prompt. The walk is now shared; the stop rules are not.
+ *
+ * These pin the merge as EQUIVALENT, not merely working: every consumer fed the shared
+ * chain must return exactly what its own walk returned — including the no-marker case
+ * (byte-identical to pre-P4) and the fail-open case where a malformed child marker sits
+ * above a valid parent one.
+ */
+describe('single shared walk — equivalence with the two separate walks', () => {
+  /** readFileSync calls against a `.kopeng.json`, i.e. marker-walk reads only. */
+  function countMarkerReads(run: () => void): number {
+    const before = walkCounter.markerReads;
+    run();
+    return walkCounter.markerReads - before;
+  }
+
+  /** Both consumers, shared chain vs own walk, must agree exactly. */
+  function expectEquivalent(dir: string) {
+    const markers = readMarkerChain(dir);
+    expect(hook.readAnchorScopes(dir, { markers })).toEqual(hook.readAnchorScopes(dir));
+    expect(deriveProjectScope(dir, { markers })).toEqual(deriveProjectScope(dir));
+  }
+
+  it('agrees with the separate walks: marker in cwd, carrying BOTH keys', () => {
+    const dir = makeDir('one-walk', 'both-keys');
+    writeMarker(dir, JSON.stringify({ project: 'client:acme-supply', scopes: ['client:acme-supply', 'project:fuel-dashboard'] }));
+
+    expectEquivalent(dir);
+    expect(hook.readAnchorScopes(dir)).toEqual(['client:acme-supply', 'project:fuel-dashboard']);
+    expect(deriveProjectScope(dir)).toEqual({ scope: 'client:acme-supply', source: 'marker' });
+  });
+
+  it('agrees when the two keys live on markers at DIFFERENT levels', () => {
+    // The case a naive merge breaks: the `project` reader must stop at the nearest
+    // hit while the `scopes` reader keeps climbing past it, off ONE full-depth walk.
+    const parent = makeDir('one-walk', 'split');
+    writeMarker(parent, JSON.stringify({ project: 'client:parent-co', scopes: ['client:parent-co'] }));
+    const child = makeDir('one-walk', 'split', 'nested');
+    writeMarker(child, JSON.stringify({ project: 'project:nearest-wins', scopes: ['project:child-only'] }));
+
+    expectEquivalent(child);
+    expect(deriveProjectScope(child)).toEqual({ scope: 'project:nearest-wins', source: 'marker' });
+    expect(hook.readAnchorScopes(child)).toEqual(['project:child-only', 'client:parent-co']);
+  });
+
+  it('agrees with no marker anywhere — the byte-identical base case', () => {
+    const dir = makeDir('one-walk', 'bare', 'x', 'y');
+
+    expectEquivalent(dir);
+    expect(hook.readAnchorScopes(dir)).toEqual([]);
+    expect(deriveProjectScope(dir).source).toBe('basename');
+  });
+
+  it('agrees fail-open: a malformed child marker never hides the valid parent', () => {
+    const parent = makeDir('one-walk', 'failopen');
+    writeMarker(parent, JSON.stringify({ project: 'client:still-found', scopes: ['client:still-found'] }));
+    const child = makeDir('one-walk', 'failopen', 'broken');
+    writeMarker(child, '{ "scopes": ["client:truncated"'); // unparseable
+
+    expectEquivalent(child);
+    // The broken child is skipped by BOTH readers and the walk CONTINUES upward.
+    expect(hook.readAnchorScopes(child)).toEqual(['client:still-found']);
+    expect(deriveProjectScope(child)).toEqual({ scope: 'client:still-found', source: 'marker' });
+  });
+
+  it('reads the chain ONCE for both consumers — the redundant-walk regression', () => {
+    const root = makeDir('one-walk', 'count');
+    writeMarker(root, JSON.stringify({ project: 'client:counted', scopes: ['client:counted'] }));
+    const deep = makeDir('one-walk', 'count', 'a', 'b', 'c');
+
+    // Depth is environment-dependent (tmpdir sits at different depths per OS), so
+    // measure against the walk itself rather than a hardcoded read count.
+    const oneWalk = countMarkerReads(() => { readMarkerChain(deep); });
+    expect(oneWalk).toBeGreaterThan(1); // the walk is real, not short-circuited
+
+    const shared = countMarkerReads(() => {
+      const markers = readMarkerChain(deep);
+      deriveProjectScope(deep, { markers });
+      hook.readAnchorScopes(deep, { markers });
+    });
+    const separate = countMarkerReads(() => {
+      deriveProjectScope(deep);
+      hook.readAnchorScopes(deep);
+    });
+
+    expect(shared).toBe(oneWalk);        // the consumers add ZERO marker reads
+    expect(separate).toBe(oneWalk * 2);  // ...and the old shape really did walk twice
   });
 });

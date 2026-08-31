@@ -222,6 +222,54 @@ describe('DreamQueries (D0.2, SQLite)', () => {
       await dreams.setMemoryLock(id, false);
       expect((db.prepare('SELECT is_locked FROM memories WHERE id = ?').get(id) as { is_locked: number }).is_locked).toBe(0);
     });
+
+    // WS0 anti-drift net. `setMemoryLock` is a DEPRECATED second name for
+    // `IMemoryStore.updateLocked`, and it had already drifted from it — the old
+    // implementation skipped `updated_at`, so the two "same" writes left
+    // different rows. It now FORWARDS to updateLocked, and this asserts the
+    // forwarding rather than trusting it: two memories, one written by each path,
+    // must end up byte-identical across the WHOLE row. If someone re-implements
+    // setMemoryLock, or changes updateLocked without the forwarder tracking it,
+    // this fails. (Pattern borrowed from decay-predicate-composition.test.ts:
+    // pin the AGREEMENT between spellings, not each spelling separately.)
+    it('setMemoryLock and updateLocked leave byte-identical row state (one write path, not two)', async () => {
+      const viaDreamStore = await newMemory('locked via the deprecated dream-store spelling');
+      const viaMemoryStore = await newMemory('locked via the canonical memory-store spelling');
+
+      // Freeze the clock column so a sub-second boundary between the two writes
+      // cannot masquerade as drift — updated_at is the exact column the old
+      // implementation got wrong, so it must be COMPARED, not excluded.
+      const pin = (id: number) =>
+        db.prepare("UPDATE memories SET updated_at = '2000-01-01 00:00:00' WHERE id = ?").run(id);
+      pin(viaDreamStore);
+      pin(viaMemoryStore);
+
+      await dreams.setMemoryLock(viaDreamStore, true);
+      await queries.updateLocked(viaMemoryStore, true);
+
+      // Compare every column except the ones that are identity/content by
+      // construction (id, content, content_hash, summary).
+      const cols = (db.prepare('PRAGMA table_info(memories)').all() as { name: string }[])
+        .map(c => c.name)
+        .filter(c => !['id', 'content', 'content_hash', 'summary'].includes(c));
+      const readRow = (id: number) =>
+        db.prepare(`SELECT ${cols.join(', ')} FROM memories WHERE id = ?`).get(id);
+
+      expect(cols).toContain('is_locked');
+      expect(cols).toContain('updated_at');
+      expect(readRow(viaDreamStore)).toEqual(readRow(viaMemoryStore));
+      // …and both actually performed the write (a pair of no-ops would also be equal).
+      expect((readRow(viaDreamStore) as { is_locked: number }).is_locked).toBe(1);
+      expect((readRow(viaDreamStore) as { updated_at: string }).updated_at).not.toBe('2000-01-01 00:00:00');
+
+      // Unlock direction too.
+      pin(viaDreamStore);
+      pin(viaMemoryStore);
+      await dreams.setMemoryLock(viaDreamStore, false);
+      await queries.updateLocked(viaMemoryStore, false);
+      expect(readRow(viaDreamStore)).toEqual(readRow(viaMemoryStore));
+      expect((readRow(viaDreamStore) as { is_locked: number }).is_locked).toBe(0);
+    });
   });
 
   describe('operator_config', () => {

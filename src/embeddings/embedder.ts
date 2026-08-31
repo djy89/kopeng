@@ -29,28 +29,49 @@ function setCachedEmbedding(text: string, embedding: Float32Array): void {
   embedCache.set(text, embedding);
 }
 
+/**
+ * T56: load-state beyond the boolean. `/api/health` needs to tell a cold start
+ * ("initializing", transient) apart from a load attempt that already finished
+ * and failed ("failed", terminal — the server is serving keyword-only search
+ * and will not recover without a restart). `idle` covers the pre-attempt
+ * window and processes (tests, MCP client) that never call initEmbedder.
+ */
+export type EmbedderLoadState = 'idle' | 'loading' | 'ready' | 'failed';
+let loadState: EmbedderLoadState = 'idle';
+
+export function getEmbedderLoadState(): EmbedderLoadState {
+  return loadState;
+}
+
 export async function initEmbedder(): Promise<void> {
   const startTime = Date.now();
   logger.info(`Loading embedding model: ${config.embedding.model}`);
+  loadState = 'loading';
 
-  // Guarded: a native-binding load failure here must degrade to keyword-only
-  // search, not kill the process on an unreachable duplicate rejection.
-  const { pipeline: pipelineFn, env } = await importWithoutDuplicateRejection(
-    () => import('@xenova/transformers')
-  );
-  pipeline = pipelineFn;
+  try {
+    // Guarded: a native-binding load failure here must degrade to keyword-only
+    // search, not kill the process on an unreachable duplicate rejection.
+    const { pipeline: pipelineFn, env } = await importWithoutDuplicateRejection(
+      () => import('@xenova/transformers')
+    );
+    pipeline = pipelineFn;
 
-  // Set cache directory for model downloads
-  env.cacheDir = config.embedding.cacheDir;
-  // Disable remote model checks after first download
-  env.allowRemoteModels = true;
+    // Set cache directory for model downloads
+    env.cacheDir = config.embedding.cacheDir;
+    // Disable remote model checks after first download
+    env.allowRemoteModels = true;
 
-  extractor = await pipeline('feature-extraction', config.embedding.model, {
-    quantized: true,
-  });
+    extractor = await pipeline('feature-extraction', config.embedding.model, {
+      quantized: true,
+    });
 
-  // Warmup
-  await embed('warmup');
+    // Warmup
+    await embed('warmup');
+    loadState = 'ready';
+  } catch (err) {
+    loadState = 'failed';
+    throw err;
+  }
 
   const elapsed = Date.now() - startTime;
   logger.info(`Embedding model loaded in ${elapsed}ms`);

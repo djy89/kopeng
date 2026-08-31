@@ -5,6 +5,12 @@ import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 
+// Both pure/side-effect-free (no config.ts eager validation) — safe to import
+// statically, unlike ensure.ts/config.ts. See env-resolution.ts's own header.
+import { resolveEnvFile } from '../config/env-resolution.js';
+import { ENV_FILE as PACKAGED_ENV_FILE } from './paths.js';
+import { isEntrypoint } from '../utils/entrypoint.js';
+
 type JsonObject = Record<string, unknown>;
 export type WireProfile = 'minimal' | 'recommended' | 'everything';
 
@@ -17,6 +23,17 @@ export interface WireOptions {
   apply?: boolean;
   now?: Date;
   log?: (line: string) => void;
+  /**
+   * Task 2.2 fix round 1 (finding 1): the target .env for the profile-flag
+   * write. Explicit wins outright. Defaults to `resolveEnvFile` (Ruling 7/8)
+   * over `env` — so a packaged install's repoRoot (inside node_modules)
+   * resolves to `~/.kopeng/.env` instead of silently shadowing it with a
+   * second .env under node_modules/kopeng. A from-source repoRoot is
+   * unaffected (resolveEnvFile returns `<repoRoot>/.env` either way).
+   */
+  envFile?: string;
+  /** Launch environment consulted for the envFile default (KOPENG_ENV_FILE). Defaults to process.env. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface WireResult {
@@ -65,7 +82,7 @@ const PROFILE_FLAGS = [
 ] as const;
 type ProfileFlag = (typeof PROFILE_FLAGS)[number];
 
-const PROFILE_DESCRIPTIONS: Record<WireProfile, string> = {
+export const PROFILE_DESCRIPTIONS: Record<WireProfile, string> = {
   minimal: 'Adds no learning flags; fresh installs use manual memory only.',
   recommended: 'Adds passive-learning flags; does not add consolidation.',
   everything: 'Adds passive learning plus nightly consolidation; never arms auto-apply.',
@@ -236,10 +253,11 @@ function appendEnvValues(source: string, additions: Array<[ProfileFlag, string]>
   return proposed;
 }
 
-function planProfileEnv(repoRoot: string, profile: WireProfile): EnvPlan {
-  const envPath = path.join(repoRoot, '.env');
-  const exists = fs.existsSync(envPath);
-  const source = exists ? fs.readFileSync(envPath, 'utf8') : '';
+// Task 2.2 (init): split into a pure core taking the target env PATH directly
+// (init writes ~/.kopeng/.env, not a repo-relative one) plus a thin wrapper
+// that reads the file for wireClient's own repo-.env use — same shape as the
+// autostart.ts/doctor.ts plan/apply idiom elsewhere in this file.
+export function planProfileEnvFromSource(envPath: string, exists: boolean, source: string, profile: WireProfile): EnvPlan {
   const assigned = assignedEnvKeys(source);
   const parsed = dotenv.parse(source);
   const desired = PROFILE_VALUES[profile];
@@ -263,6 +281,12 @@ function planProfileEnv(repoRoot: string, profile: WireProfile): EnvPlan {
     flags,
     changes: additions.map(([name, value]) => `add .env ${name}=${value}`),
   };
+}
+
+export function planProfileEnv(envPath: string, profile: WireProfile): EnvPlan {
+  const exists = fs.existsSync(envPath);
+  const source = exists ? fs.readFileSync(envPath, 'utf8') : '';
+  return planProfileEnvFromSource(envPath, exists, source, profile);
 }
 
 function logProfileReport(log: (line: string) => void, profile: WireProfile, plan: EnvPlan): void {
@@ -452,6 +476,146 @@ function mergeConfigs(
   return { claudeConfig: nextClaude, settings: nextSettings, changes };
 }
 
+// Task 2.4.2 — the symmetric reversal of mergeHook: strips every hook whose
+// command matches this definition's script (the SAME commandUsesScript
+// predicate mergeHook uses to find matches — never a string-guess), then
+// collapses whatever that removal leaves behind: a group that held nothing
+// but kopeng's hook is dropped entirely (mergeHook creates exactly such a
+// group when there was nothing to merge into); a mixed group keeps every
+// other hook, in its original order and position.
+function removeHookScript(
+  hooks: JsonObject,
+  definition: (typeof HOOK_DEFINITIONS)[number],
+  changes: string[]
+): void {
+  const current = hooks[definition.event];
+  if (!Array.isArray(current)) return;
+
+  let removedCount = 0;
+  const nextEntries: unknown[] = [];
+  for (const entry of current) {
+    if (!isObject(entry) || !Array.isArray(entry.hooks)) {
+      nextEntries.push(entry);
+      continue;
+    }
+    const remainingHooks = entry.hooks.filter((hook) => {
+      const matches = commandUsesScript(hook, definition.script);
+      if (matches) removedCount++;
+      return !matches;
+    });
+    if (remainingHooks.length === 0) continue; // the group held nothing else — drop it
+    nextEntries.push(remainingHooks.length === entry.hooks.length ? entry : { ...entry, hooks: remainingHooks });
+  }
+
+  if (removedCount === 0) return;
+  changes.push(`remove hooks.${definition.event} (${definition.script})`);
+  if (nextEntries.length > 0) hooks[definition.event] = nextEntries;
+  else delete hooks[definition.event];
+}
+
+/**
+ * Pure reversal of mergeConfigs: strips mcpServers.kopeng, env.KOPENG_API_URL,
+ * and every kopeng-owned hook entry (same ownership predicates mergeConfigs
+ * itself uses), then drops any container left empty by that removal so the
+ * result matches what the file looked like before kopeng ever touched it —
+ * not an empty `{}` husk where a key used to be absent. Entries kopeng does
+ * not own are untouched, byte-for-byte, wherever they live.
+ */
+export function removeConfigs(
+  claudeConfig: JsonObject,
+  settings: JsonObject
+): { claudeConfig: JsonObject; settings: JsonObject; changes: string[] } {
+  const nextClaude = clone(claudeConfig);
+  const nextSettings = clone(settings);
+  const changes: string[] = [];
+
+  const mcpServers = isObject(nextClaude.mcpServers) ? nextClaude.mcpServers : undefined;
+  if (mcpServers && Object.prototype.hasOwnProperty.call(mcpServers, 'kopeng')) {
+    delete mcpServers.kopeng;
+    changes.push('remove mcpServers.kopeng');
+    if (Object.keys(mcpServers).length === 0) delete nextClaude.mcpServers;
+  }
+
+  const settingsEnv = isObject(nextSettings.env) ? nextSettings.env : undefined;
+  if (settingsEnv && Object.prototype.hasOwnProperty.call(settingsEnv, 'KOPENG_API_URL')) {
+    delete settingsEnv.KOPENG_API_URL;
+    changes.push('remove env.KOPENG_API_URL');
+    if (Object.keys(settingsEnv).length === 0) delete nextSettings.env;
+  }
+
+  const hooks = isObject(nextSettings.hooks) ? nextSettings.hooks : undefined;
+  if (hooks) {
+    for (const definition of HOOK_DEFINITIONS) removeHookScript(hooks, definition, changes);
+    if (Object.keys(hooks).length === 0) delete nextSettings.hooks;
+  }
+
+  return { claudeConfig: nextClaude, settings: nextSettings, changes };
+}
+
+export interface WireRemoveOptions {
+  homeDir?: string;
+  apply?: boolean;
+  now?: Date;
+  log?: (line: string) => void;
+}
+
+export interface WireRemoveResult {
+  changed: boolean;
+  applied: boolean;
+  changes: string[];
+  backups: string[];
+  claudeConfigPath: string;
+  settingsPath: string;
+}
+
+/**
+ * `kopeng uninstall`'s config-reversal step (Task 2.4.3 calls this). Mirrors
+ * wireClient's own shape (dry-run by default, backup-first, atomic writes)
+ * but never touches the .env — uninstall's manifest keeps learning-profile
+ * flags unless --purge, which removes the whole KOPENG_HOME instead.
+ */
+export function removeClient(options: WireRemoveOptions = {}): WireRemoveResult {
+  const homeDir = path.resolve(options.homeDir ?? os.homedir());
+  const log = options.log ?? console.log;
+  const claudeConfigPath = path.join(homeDir, '.claude.json');
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+
+  const claudeFile = readJsonFile(claudeConfigPath);
+  const settingsFile = readJsonFile(settingsPath);
+  const removed = removeConfigs(claudeFile.value, settingsFile.value);
+  const claudeChanged = JSON.stringify(claudeFile.value) !== JSON.stringify(removed.claudeConfig);
+  const settingsChanged = JSON.stringify(settingsFile.value) !== JSON.stringify(removed.settings);
+  const changed = claudeChanged || settingsChanged;
+
+  if (!changed) {
+    log('No KOPENG entries found in the Claude Code config — nothing to remove.');
+    return { changed: false, applied: false, changes: [], backups: [], claudeConfigPath, settingsPath };
+  }
+
+  log(`KOPENG entries to remove: ${removed.changes.join(', ')}`);
+
+  if (!options.apply) {
+    log('DRY RUN — no files were written.');
+    return { changed: true, applied: false, changes: removed.changes, backups: [], claudeConfigPath, settingsPath };
+  }
+
+  const stamp = (options.now ?? new Date()).toISOString().replace(/[:.]/g, '-');
+  const backups: string[] = [];
+  for (const file of [claudeFile, settingsFile]) {
+    if (!file.exists) continue;
+    const destination = backupPath(file.path, stamp);
+    fs.copyFileSync(file.path, destination, fs.constants.COPYFILE_EXCL);
+    backups.push(destination);
+    log(`Backup: ${destination}`);
+  }
+
+  if (claudeChanged) writeJsonAtomic(claudeConfigPath, removed.claudeConfig);
+  if (settingsChanged) writeJsonAtomic(settingsPath, removed.settings);
+  log(`KOPENG client wiring removed (${removed.changes.length} change${removed.changes.length === 1 ? '' : 's'}).`);
+
+  return { changed: true, applied: true, changes: removed.changes, backups, claudeConfigPath, settingsPath };
+}
+
 function redactInlineSecrets(value: string): string {
   return value.replace(
     /((?:[A-Z][A-Z0-9_]*_)?(?:KEY|TOKEN|SECRET|PASSWORD)\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
@@ -586,9 +750,17 @@ function backupPath(filePath: string, stamp: string): string {
 function writeJsonAtomic(filePath: string, value: JsonObject): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const temporary = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  // Fix round 2 (Finding 4): carry the target's existing mode across the
+  // write-temp-then-rename, exactly as writeTextAtomic below already does —
+  // the asymmetry was silent and lossy. ~/.claude.json holds `mcpServers.*.env`
+  // API tokens for other services, so an operator who hardened it to 0600 on a
+  // shared host must not get it handed back at the umask default (0644) by a
+  // routine `kopeng wire --apply` or `kopeng uninstall`.
+  const mode = fs.existsSync(filePath) ? fs.statSync(filePath).mode : 0o600;
   try {
-    fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+    fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode });
     fs.renameSync(temporary, filePath);
+    try { fs.chmodSync(filePath, mode); } catch { /* Windows / restrictive filesystem */ }
   } catch (error) {
     try { fs.unlinkSync(temporary); } catch { /* no temporary file to clean up */ }
     throw error;
@@ -596,6 +768,10 @@ function writeJsonAtomic(filePath: string, value: JsonObject): void {
 }
 
 function writeTextAtomic(filePath: string, source: string): void {
+  // Task 2.2 fix round 1 (finding 1): envFile can now be an arbitrary path
+  // (e.g. ~/.kopeng/.env) rather than always `<repoRoot>/.env` with repoRoot
+  // already validated to exist — mirror writeJsonAtomic's own mkdir.
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const temporary = `${filePath}.tmp-${process.pid}-${Date.now()}`;
   const mode = fs.existsSync(filePath) ? fs.statSync(filePath).mode : 0o600;
   try {
@@ -632,7 +808,12 @@ export function wireClient(options: WireOptions = {}): WireResult {
   const settingsFile = readJsonFile(settingsPath);
   const apiUrl = resolveApiUrl(claudeFile.value, settingsFile.value, options.apiUrl);
   const merged = mergeConfigs(claudeFile.value, settingsFile.value, repoRoot, apiUrl);
-  const envPlan = planProfileEnv(repoRoot, profile);
+  const envFile = options.envFile ?? resolveEnvFile({
+    env: options.env ?? process.env,
+    projectRoot: repoRoot,
+    packagedEnvFile: PACKAGED_ENV_FILE,
+  });
+  const envPlan = planProfileEnv(envFile, profile);
   const claudeChanged = JSON.stringify(claudeFile.value) !== JSON.stringify(merged.claudeConfig);
   const settingsChanged = JSON.stringify(settingsFile.value) !== JSON.stringify(merged.settings);
   const envChanged = envPlan.source !== envPlan.proposed;
@@ -752,7 +933,9 @@ function refuseImplicitWorktreeCliApply(options: CliOptions): void {
   throw new Error('Refusing to wire from a linked worktree — these paths may be temporary. No files were changed.');
 }
 
-async function chooseProfile(explicit?: WireProfile): Promise<WireProfile> {
+// Exported for `kopeng init` (Task 2.2), which reuses this exact chooser
+// rather than duplicating the interactive prompt / non-TTY default.
+export async function chooseProfile(explicit?: WireProfile): Promise<WireProfile> {
   if (explicit) return explicit;
   if (!process.stdin.isTTY) {
     console.log('Non-interactive stdin detected; using the minimal profile. Pass --profile to choose explicitly.');
@@ -778,8 +961,9 @@ async function chooseProfile(explicit?: WireProfile): Promise<WireProfile> {
 }
 
 function isDirectRun(): boolean {
-  const entry = process.argv[1] ? path.resolve(process.argv[1]) : '';
-  return entry.toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
+  // Symlink-safe (T72). The obvious argv[1]-vs-import.meta.url comparison
+  // reads false through a symlink and this module silently does nothing.
+  return isEntrypoint(import.meta.url);
 }
 
 if (isDirectRun()) {

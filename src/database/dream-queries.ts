@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import type { IDreamStore, IOperatorConfigStore } from './interfaces.js';
+import { MemoryQueries } from './queries.js';
 import {
   PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON, REVISION_KEEP_PER_MEMORY,
   type Dream, type DreamDiff, type MemoryRevision, type DreamAuditEntry, type OperatorConfig,
@@ -9,6 +10,18 @@ import {
 /** SQLite implementation of the dreaming-layer stores (D0.2). */
 export class DreamQueries implements IDreamStore, IOperatorConfigStore {
   constructor(private db: Database.Database) {}
+
+  /**
+   * Lazily-built handle to the canonical memory store over the SAME db, so the
+   * deprecated `setMemoryLock` can forward instead of re-spelling the write.
+   * Lazy because MemoryQueries' constructor prepares ~16 statements and no
+   * production caller reaches setMemoryLock — a DreamQueries that never calls it
+   * pays nothing. No import cycle: queries.ts pulls only types + a tag constant.
+   */
+  private memoryStore?: MemoryQueries;
+  private get memories(): MemoryQueries {
+    return (this.memoryStore ??= new MemoryQueries(this.db));
+  }
 
   // ─────────────────────────── dreams ───────────────────────────
 
@@ -133,14 +146,17 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
         .all(memoryId) as { tag: string }[]).map(t => t.tag);
 
       // Copy the live row into a revision; embedding BLOB is copied in-DB via SELECT.
+      // is_locked is snapshotted (v10) because the lock is THE Hard Anchor and is
+      // model-writable through update_memory {locked} — without it an unlock left
+      // no record and no way back.
       const info = this.db.prepare(
         `INSERT INTO memory_revisions
           (memory_id, revision, content, content_hash, summary, embedding, embedding_model,
            confidence, observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
-           scope, type, updated_at, last_seen, created_by_dream_id)
+           scope, type, updated_at, last_seen, is_locked, created_by_dream_id)
          SELECT id, @revision, content, content_hash, summary, embedding, embedding_model,
            confidence, observation_count, metadata, @tags, last_contradicted, deprecated_at, valid_from,
-           scope, type, updated_at, last_seen, @dreamId
+           scope, type, updated_at, last_seen, is_locked, @dreamId
          FROM memories WHERE id = @id`
       ).run({ revision: next, tags: JSON.stringify(tags), dreamId: createdByDreamId ?? null, id: memoryId });
 
@@ -185,7 +201,7 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
     const rows = this.db.prepare(
       `SELECT id, memory_id, revision, content, content_hash, summary, confidence,
         observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
-        scope, type, updated_at, last_seen, created_by_dream_id, created_at
+        scope, type, updated_at, last_seen, is_locked, created_by_dream_id, created_at
        FROM memory_revisions WHERE memory_id = ? ORDER BY revision DESC`
     ).all(memoryId) as Record<string, unknown>[];
     return rows.map(rowToRevision);
@@ -195,7 +211,7 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
     const row = this.db.prepare(
       `SELECT id, memory_id, revision, content, content_hash, summary, confidence,
         observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
-        scope, type, updated_at, last_seen, created_by_dream_id, created_at
+        scope, type, updated_at, last_seen, is_locked, created_by_dream_id, created_at
        FROM memory_revisions WHERE memory_id = ? AND revision = ?`
     ).get(memoryId, revision) as Record<string, unknown> | undefined;
     return row ? rowToRevision(row) : null;
@@ -218,16 +234,19 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
         `INSERT INTO memory_revisions
           (memory_id, revision, content, content_hash, summary, embedding, embedding_model,
            confidence, observation_count, metadata, tags, last_contradicted, deprecated_at, valid_from,
-           scope, type, updated_at, last_seen, created_by_dream_id)
+           scope, type, updated_at, last_seen, is_locked, created_by_dream_id)
          SELECT id, @revision, content, content_hash, summary, embedding, embedding_model,
            confidence, observation_count, metadata, @tags, last_contradicted, deprecated_at, valid_from,
-           scope, type, updated_at, last_seen, NULL
+           scope, type, updated_at, last_seen, is_locked, NULL
          FROM memories WHERE id = @id`
       ).run({ revision: next, tags: JSON.stringify(tags), id: memoryId });
 
       // Copy the revision back over the live row (FTS stays synced via the UPDATE trigger).
-      // scope/type/last_seen are NULL-safe COALESCEs: a legacy (pre-v8) revision has
-      // NULL in these columns and must never clobber the live values (ruling 7).
+      // scope/type/last_seen/is_locked are NULL-safe COALESCEs: a legacy revision has
+      // NULL in these columns (pre-v8 for the first three, pre-v10 for is_locked) and
+      // must never clobber the live values (ruling 7). For is_locked that guard is
+      // the difference between "rollback restores the anchor" and "rollback strips
+      // the anchor off a live locked row".
       // updated_at is NOT restored from the revision — it always gets the restore's own
       // stamp, since it is the correction clock, not part of what's being reverted.
       this.db.prepare(
@@ -237,6 +256,7 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
           last_contradicted = @last_contradicted, deprecated_at = @deprecated_at, valid_from = @valid_from,
           scope = COALESCE(@scope, scope), type = COALESCE(@type, type),
           last_seen = COALESCE(@last_seen, last_seen),
+          is_locked = COALESCE(@is_locked, is_locked),
           updated_at = datetime('now')
          WHERE id = @id`
       ).run({
@@ -246,6 +266,7 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
         last_contradicted: r.last_contradicted ?? null, deprecated_at: r.deprecated_at ?? null,
         valid_from: r.valid_from ?? null,
         scope: r.scope ?? null, type: r.type ?? null, last_seen: r.last_seen ?? null,
+        is_locked: r.is_locked ?? null,
         id: memoryId,
       });
 
@@ -311,8 +332,21 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
     }
   }
 
+  /**
+   * DEPRECATED — kept only because it is an exported store method that may have
+   * out-of-repo callers. It now FORWARDS to `IMemoryStore.updateLocked`, the
+   * canonical lock write, so there is exactly ONE implementation of "write
+   * is_locked" per backend rather than two that can drift.
+   *
+   * It used to drift already: this spelling skipped `updated_at`. Two
+   * independently-correct copies are still two copies — the repo's recurring bug
+   * class — so the fix is delegation, not alignment. `tests/unit/dream-queries.test.ts`
+   * pins it: both write paths must leave byte-identical row state.
+   *
+   * Prefer `IMemoryStore.updateLocked` directly in new code.
+   */
   async setMemoryLock(memoryId: number, locked: boolean): Promise<void> {
-    this.db.prepare(`UPDATE memories SET is_locked = ? WHERE id = ?`).run(locked ? 1 : 0, memoryId);
+    return this.memories.updateLocked(memoryId, locked);
   }
 
   // ───────────────────── consolidation lock ─────────────────────
@@ -416,6 +450,10 @@ function rowToRevision(row: Record<string, unknown>): MemoryRevision {
     type: (row.type as string | null) ?? null,
     updated_at: (row.updated_at as string | null) ?? null,
     last_seen: (row.last_seen as string | null) ?? null,
+    // SQLite stores 0/1; normalize to the boolean the revision surface exposes.
+    // `== null` (not `=== null`) so a pre-v10 row, where the column is absent
+    // entirely rather than NULL, also reads as "this revision predates the column".
+    is_locked: row.is_locked == null ? null : !!row.is_locked,
     created_by_dream_id: (row.created_by_dream_id as number | null) ?? null,
     created_at: row.created_at as string,
   };

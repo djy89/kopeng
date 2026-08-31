@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { parseWireArgs, wireClient } from '../../scripts/ops/wire-client.js';
+import { parseWireArgs, wireClient } from '../../src/cli/wire-client.js';
 
 let homeDir: string;
 let repoRoot: string;
@@ -66,13 +66,25 @@ function reportedValue(
   return event ? (settings.hooks as Record<string, unknown> | undefined)?.[event] : undefined;
 }
 
+// Task 2.2 fix round 1 (finding 1): wireClient's envFile now defaults via
+// resolveEnvFile, which checks env.KOPENG_ENV_FILE FIRST, unconditionally.
+// vitest.config.ts pins KOPENG_ENV_FILE globally to a harmless nonexistent
+// path for every test (documented there as "tests that specifically exercise
+// resolution override or delete this var for their own scope") — this suite
+// relies on the pre-existing <repoRoot>/.env placement throughout, so it
+// clears the var for its own scope, same convention first-run.test.ts uses.
+const ORIGINAL_KOPENG_ENV_FILE = process.env.KOPENG_ENV_FILE;
+
 beforeEach(() => {
+  delete process.env.KOPENG_ENV_FILE;
   homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kopeng-wire-home-'));
   repoRoot = path.join(homeDir, 'clone with space');
   createRepo(repoRoot);
 });
 
 afterEach(() => {
+  if (ORIGINAL_KOPENG_ENV_FILE === undefined) delete process.env.KOPENG_ENV_FILE;
+  else process.env.KOPENG_ENV_FILE = ORIGINAL_KOPENG_ENV_FILE;
   fs.rmSync(homeDir, { recursive: true, force: true });
 });
 
@@ -415,6 +427,53 @@ describe('wireClient', () => {
     expect(messages.join('\n')).toContain('--profile recommended');
   });
 
+  // Task 2.2 fix round 1, finding 1: a packaged install's repoRoot is
+  // `<appDir>/node_modules/kopeng`, which never ships its own .env — writing
+  // profile flags to `<repoRoot>/.env` (the old hardcoded behavior) silently
+  // shadows the REAL config at ~/.kopeng/.env. envFile/env now let a caller
+  // (kopeng init) redirect the write to the correct target.
+  describe('envFile threading (finding 1)', () => {
+    it('an explicit envFile wins outright, even though it differs from <repoRoot>/.env', () => {
+      const realEnvFile = path.join(homeDir, 'real-kopeng-home', '.env');
+
+      const result = wireClient({
+        homeDir,
+        repoRoot,
+        profile: 'recommended',
+        apply: true,
+        envFile: realEnvFile,
+        log: () => undefined,
+      });
+
+      expect(result.applied).toBe(true);
+      expect(fs.existsSync(envPath())).toBe(false); // nothing written under repoRoot
+      const env = fs.readFileSync(realEnvFile, 'utf8');
+      expect(env).toContain('OBSERVATION_INGESTION_ENABLED=true');
+    });
+
+    it('with no explicit envFile, an injected env.KOPENG_ENV_FILE is honored (the standalone `wire` default path)', () => {
+      const explicitFromEnv = path.join(homeDir, 'from-env-var', '.env');
+
+      wireClient({
+        homeDir,
+        repoRoot,
+        profile: 'recommended',
+        apply: true,
+        env: { KOPENG_ENV_FILE: explicitFromEnv },
+        log: () => undefined,
+      });
+
+      expect(fs.existsSync(envPath())).toBe(false);
+      const env = fs.readFileSync(explicitFromEnv, 'utf8');
+      expect(env).toContain('DISCOVERY_DETECTION_ENABLED=true');
+    });
+
+    it('with neither override and a from-source (non-node_modules) repoRoot, still resolves to <repoRoot>/.env — byte-identical to pre-fix behavior', () => {
+      wireClient({ homeDir, repoRoot, profile: 'recommended', apply: true, env: {}, log: () => undefined });
+      expect(fs.existsSync(envPath())).toBe(true);
+    });
+  });
+
   it('refuses an implicit linked-worktree apply before touching either config', () => {
     const linkedRoot = path.join(homeDir, 'temporary-worktree');
     const canonicalRoot = path.join(homeDir, 'canonical-checkout');
@@ -594,7 +653,7 @@ describe('wire CLI', () => {
       process.execPath,
       [
         path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'),
-        path.join(process.cwd(), 'scripts', 'ops', 'wire-client.ts'),
+        path.join(process.cwd(), 'src', 'cli', 'wire-client.ts'),
       ],
       {
         cwd: process.cwd(),
@@ -617,7 +676,7 @@ describe('wire CLI', () => {
       process.execPath,
       [
         path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'),
-        path.join(process.cwd(), 'scripts', 'ops', 'wire-client.ts'),
+        path.join(process.cwd(), 'src', 'cli', 'wire-client.ts'),
         '--apply',
         '--repo-root',
         repoRoot,
@@ -642,7 +701,7 @@ describe('wire CLI', () => {
       process.execPath,
       [
         path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'),
-        path.join(process.cwd(), 'scripts', 'ops', 'wire-client.ts'),
+        path.join(process.cwd(), 'src', 'cli', 'wire-client.ts'),
         '--apply',
         '--repo-root',
         repoRoot,

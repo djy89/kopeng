@@ -35,10 +35,21 @@ import { KOPENG_VERSION } from './version.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
+// Review finding 4: this stdio entry used to hardcode <projectRoot>/.env,
+// so a packaged `kopeng mcp` (projectRoot = .../node_modules/kopeng, which
+// never carries a .env) loaded no ADMIN_API_KEY and every write tool 401'd.
+// Route through the SAME Ruling 8 resolution src/config/config.ts uses — via
+// the pure, dependency-light env-resolution module (not config.ts itself,
+// which eagerly validates every env var; this entry must still answer
+// --version/tool-listing even with a poisoned launch environment).
+import { resolveEnvFile } from './config/env-resolution.js';
+import { ENV_FILE as PACKAGED_ENV_FILE } from './cli/paths.js';
+
+const projectRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 // Non-overriding .env fallback (launch env always wins): gives the stdio
 // client MEMORY_API_URL and the T27 ADMIN_API_KEY without every MCP client
 // config having to plumb them through its env block.
-dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.env') });
+dotenv.config({ path: resolveEnvFile({ env: process.env, projectRoot, packagedEnvFile: PACKAGED_ENV_FILE }) });
 
 const API_URL = process.env.MEMORY_API_URL || 'http://localhost:3200';
 

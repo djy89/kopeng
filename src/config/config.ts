@@ -2,12 +2,29 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { KOPENG_VERSION } from '../version.js';
+// No cycle: src/cli/paths.ts is pure (only node:os/node:path), so importing it
+// here is safe. It already honors the KOPENG_HOME env override for us.
+import { ENV_FILE as PACKAGED_ENV_FILE } from '../cli/paths.js';
+// Review finding 4: the resolution logic itself lives in its own tiny,
+// dependency-light module so src/index.ts (the MCP stdio entry) can consult
+// the SAME resolution without importing this whole module (which eagerly
+// validates every env var — see env-resolution.ts's own header comment).
+// Re-exported for existing consumers (first-run.ts's tests import it here).
+import { resolveEnvFile, type EnvFileResolutionInputs } from './env-resolution.js';
+export { resolveEnvFile, type EnvFileResolutionInputs };
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const projectRoot = path.resolve(__dirname, '../../');
-dotenv.config({ path: path.join(projectRoot, '.env') });
+
+/** The .env path actually loaded — exported so first-run.ts and the CLI can name it. */
+export const RESOLVED_ENV_FILE = resolveEnvFile({
+  env: process.env,
+  projectRoot,
+  packagedEnvFile: PACKAGED_ENV_FILE,
+});
+dotenv.config({ path: RESOLVED_ENV_FILE });
 
 function getEnvVar(name: string, defaultValue?: string): string {
   const value = process.env[name];

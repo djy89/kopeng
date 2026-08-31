@@ -69,6 +69,8 @@ import { createTestDatabase, createTestMemory } from '../fixtures/test-helpers.j
 //  locked       | project, is_locked=1   | 0.9  | 300d  | 45d       | 0.009      | anchored (lock) — raw at-risk, so the anchor gate is load-bearing
 //  operator     | project                | 1.0  | 300d  | —         | 1.0        | anchored (>=1.0 short-circuit)
 //  pinned       | project, pinned meta   | 0.5  | 300d  | 45d       | 0.005      | anchored (CR-1 pin) — raw at-risk
+//  lockedLow    | discovery+error:runtime, is_locked=1 | 0.3 | 300d | 11d | frozen 0.3 (WS7.4 B2 — raw would be ~0, the fastest class) | anchored (lock)
+//  confirmedFast| discovery+error:build  | 1.0  | 300d  | 11d       | 1.0 (>=1.0 short-circuit immune to the fast class too) | anchored (>=1.0)
 //  liveScope    | discovery              | 0.6  | 300d  | 25d       | 0.6·2^-12 ≈ 0.00015 | AT RISK everywhere; §2 archives (scope active)
 //  dormantAlias | discovery              | 0.6  | 300d  | 25d       | ≈ 0.00015  | AT RISK for promotion/panel/dream; §2 FROZEN (alias group dormant, R4-B)
 //  structural   | reference + structural | 0.6  | 300d  | 38d       | floor 0.4  | never at risk (STRUCTURAL_FLOOR)
@@ -89,10 +91,20 @@ import { createTestDatabase, createTestMemory } from '../fixtures/test-helpers.j
 // structural still enters alone — drifted 4 ≠ true 5, and assertion 2 fails.
 type RowKey =
   | 'locked' | 'operator' | 'pinned' | 'liveScope' | 'dormantAlias' | 'structural'
-  | 'errorFast' | 'errorFast2' | 'feedbackSlow' | 'decayedTwin' | 'freshTwin' | 'fresh';
+  | 'errorFast' | 'errorFast2' | 'feedbackSlow' | 'decayedTwin' | 'freshTwin' | 'fresh'
+  | 'lockedLow' | 'confirmedFast';
 
 const AT_RISK_ROWS: readonly RowKey[] = ['liveScope', 'dormantAlias', 'errorFast', 'errorFast2', 'decayedTwin'];
-const ANCHORED_ROWS: readonly RowKey[] = ['locked', 'operator', 'pinned'];
+// WS7.4 B2: lockedLow/confirmedFast are seeded under the FASTEST decay class
+// (error:*, 11d half-life) — the class under which their raw (unfrozen)
+// effective confidence would clearly read at-risk — to re-pin the ANCHOR GATE
+// (`!isAnchored(m)`, below) under a harder case than the existing locked/
+// operator rows. Every consumer here excludes them via that gate BEFORE
+// isDecayedAtRisk is ever called, same as the pre-existing anchored rows; the
+// freeze itself (computeEffectiveConfidence's `locked` short-circuit, called
+// directly on an anchored row with no prior gate) is pinned separately by
+// tests/unit/anchor-contract.test.ts.
+const ANCHORED_ROWS: readonly RowKey[] = ['locked', 'operator', 'pinned', 'lockedLow', 'confirmedFast'];
 
 interface SeededCorpus {
   db: Database.Database;
@@ -131,6 +143,17 @@ async function seedCorpus(): Promise<SeededCorpus> {
     { content: 'operator-confirmed fact held at full confidence', type: 'project', scope: 'project:anchors', confidence: 1.0 }, 300);
   await seed('pinned',
     { content: 'pinned working note kept on purpose', type: 'project', scope: 'project:anchors', confidence: 0.5, metadata: '{"pinned":true}' }, 300);
+  // WS7.4 B2: re-pins the shared !isAnchored gate under the fastest decay
+  // class (error:runtime, 11d half-life) — a harder case than the 'locked'
+  // row above, whose 45d half-life leaves more room for a gating mistake to
+  // hide. Does NOT exercise the freeze itself (computeEffectiveConfidence's
+  // `locked` short-circuit) — that is pinned directly, gate-free, by
+  // tests/unit/anchor-contract.test.ts.
+  const lockedLowId = await seed('lockedLow',
+    { content: 'locked low-confidence note under the fastest decay class', type: 'discovery', scope: 'project:anchors', tags: ['error:runtime'], confidence: 0.3 }, 300);
+  db.prepare('UPDATE memories SET is_locked = 1 WHERE id = ?').run(lockedLowId);
+  await seed('confirmedFast',
+    { content: 'operator-confirmed note also under the fastest decay class', type: 'discovery', scope: 'project:anchors', tags: ['error:build'], confidence: 1.0 }, 300);
   await seed('liveScope',
     { content: 'stale discovery sitting under an actively-observed scope', type: 'discovery', scope: 'project:live-scope', confidence: 0.6 }, 300);
   await seed('dormantAlias',
@@ -158,7 +181,7 @@ async function seedCorpus(): Promise<SeededCorpus> {
 
 function strengthInputs(m: {
   confidence: number; observation_count: number | null; last_seen: string | null;
-  updated_at: string; type: string; tags: string[];
+  updated_at: string; type: string; tags: string[]; is_locked?: boolean | number | null;
 }): StrengthInputs {
   return {
     confidence: m.confidence,
@@ -167,6 +190,11 @@ function strengthInputs(m: {
     updated_at: m.updated_at,
     type: m.type,
     tags: m.tags,
+    // WS7.4 B2: mirrors the shape every real consumer (selectDecayCandidates,
+    // the pipeline decay tier, maintenance §2) actually passes — the four-
+    // consumer set-equality above only means something if this helper's
+    // derivation matches theirs.
+    is_locked: m.is_locked,
   };
 }
 
@@ -198,7 +226,7 @@ describe('Phase 4: one archive-line predicate across every consumer', () => {
   beforeAll(async () => {
     c = await seedCorpus();
     const { memories } = await c.queries.list({ limit: 100, include_archived: false });
-    expect(memories).toHaveLength(12);
+    expect(memories).toHaveLength(14);
     expectedAtRiskIds = sortedIds(memories
       .filter(m => !isAnchored(m) && isDecayedAtRisk(strengthInputs(m), c.now))
       .map(m => m.id));
@@ -230,7 +258,7 @@ describe('Phase 4: one archive-line predicate across every consumer', () => {
       const res = await app.inject({ method: 'GET', url: '/api/ops/corpus-health?sample=100' });
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.payload);
-      expect(body.data.active_memory_count).toBe(12);
+      expect(body.data.active_memory_count).toBe(14);
       expect(body.meta.sampled).toBe(false);
       expect(body.data.decayed_at_risk_count).toBe(promotionIds.length);
     } finally {
@@ -279,7 +307,7 @@ describe('Phase 4: one archive-line predicate across every consumer', () => {
     }, { trigger: 'manual', reason: 'phase-4 composition suite', windowKey: 'phase4-composition' });
 
     expect(run.status).toBe('completed');
-    expect(run.memories_examined).toBe(12);
+    expect(run.memories_examined).toBe(14);
     expect(diff).not.toBeNull();
     const entries = diff!.entries;
 

@@ -238,6 +238,7 @@ export async function runDiscoveryMaintenance(
           updated_at: memory.updated_at,
           type: memory.type,
           tags: memory.tags,
+          is_locked: memory.is_locked,
         };
         const now = new Date();
         if (!isDecayedAtRisk(inputs, now, { dormant: await isScopeDormant(memory.scope) })) continue;

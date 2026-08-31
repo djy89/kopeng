@@ -58,6 +58,51 @@ describe('corpus-health store methods (SQLite)', () => {
       const stats = await queries.getCorpusHealthStats();
       expect(stats.contradiction_flagged_count).toBe(2); // archived one excluded
     });
+
+    describe('legacy_anchor_count (WS7.4 B3)', () => {
+      it('counts unlocked confidence>=1.0 and pinned-metadata rows', async () => {
+        await queries.store(createTestMemory({ content: 'legacy confirmed', confidence: 1.0 }));
+        await queries.store(createTestMemory({ content: 'legacy pinned', confidence: 0.5, metadata: JSON.stringify({ pinned: true }) }));
+        await queries.store(createTestMemory({ content: 'ordinary', confidence: 0.5 }));
+        const stats = await queries.getCorpusHealthStats();
+        expect(stats.legacy_anchor_count).toBe(2);
+      });
+
+      it('excludes rows already locked (not legacy — is_locked IS the current anchor)', async () => {
+        const { id } = await queries.store(createTestMemory({ content: 'locked and confirmed', confidence: 1.0 }));
+        db.prepare('UPDATE memories SET is_locked = 1 WHERE id = ?').run(id);
+        const stats = await queries.getCorpusHealthStats();
+        expect(stats.legacy_anchor_count).toBe(0);
+      });
+
+      it('excludes archived rows', async () => {
+        const { id } = await queries.store(createTestMemory({ content: 'archived legacy anchor', confidence: 1.0 }));
+        await queries.archive(id);
+        const stats = await queries.getCorpusHealthStats();
+        expect(stats.legacy_anchor_count).toBe(0);
+      });
+
+      it('does not count a non-boolean pinned value or malformed metadata as pinned', async () => {
+        await queries.store(createTestMemory({ content: 'pinned string, not boolean', confidence: 0.5, metadata: JSON.stringify({ pinned: 'yes' }) }));
+        const { id } = await queries.store(createTestMemory({ content: 'malformed metadata holder', confidence: 0.5 }));
+        db.prepare("UPDATE memories SET metadata = 'not json' WHERE id = ?").run(id);
+        const stats = await queries.getCorpusHealthStats();
+        expect(stats.legacy_anchor_count).toBe(0);
+      });
+
+      it('does not count a JSON number 1 as pinned (must be the real JSON boolean true, matching isPinnedMetadata/PG)', async () => {
+        // json_extract('{"pinned":1}', '$.pinned') = 1 would collide with JSON true under
+        // an equality-vs-1 check — json_type distinguishes them ('integer' vs 'true').
+        await queries.store(createTestMemory({ content: 'pinned as the number 1, not boolean true', confidence: 0.5, metadata: JSON.stringify({ pinned: 1 }) }));
+        const stats = await queries.getCorpusHealthStats();
+        expect(stats.legacy_anchor_count).toBe(0);
+      });
+
+      it('is zero on an empty corpus', async () => {
+        const stats = await queries.getCorpusHealthStats();
+        expect(stats.legacy_anchor_count).toBe(0);
+      });
+    });
   });
 
   describe('getCorpusHealthSample', () => {

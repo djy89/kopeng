@@ -369,6 +369,22 @@ const migrations: Migration[] = [
         CHECK (status IN ('running', 'completing', 'completed', 'failed', 'held'));
     `,
   },
+  {
+    version: 12,
+    name: 'ws0_memory_revisions_is_locked',
+    sql: `
+      -- WS0: the lock is now THE Hard Anchor and is model-writable via
+      -- update_memory {locked}, so an unlock has to leave a restorable record.
+      -- Plain additive ADD COLUMN, NULLABLE with NO DEFAULT: on PG 11+ that is
+      -- a catalog-only change (no table rewrite), safe against the live corpus.
+      -- The nullability is load-bearing, not incidental — a DEFAULT FALSE would
+      -- backfill every pre-v12 revision with "was unlocked", and
+      -- restoreRevision's COALESCE could then silently strip the anchor off a
+      -- live locked row when rolling back to an old revision. NULL means "this
+      -- revision predates the column" and the COALESCE keeps the live value.
+      ALTER TABLE memory_revisions ADD COLUMN IF NOT EXISTS is_locked BOOLEAN;
+    `,
+  },
 ];
 
 export async function runPgMigrations(pool: pg.Pool): Promise<void> {

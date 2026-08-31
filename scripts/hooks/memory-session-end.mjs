@@ -11,9 +11,12 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+// RULING-C (WS7.6): project:<basename(cwd)> is now project:<owner>-<repo>
+// derived from the git remote, marker-overridable — see project-scope.mjs.
+import { deriveProjectScope } from './project-scope.mjs';
 
 function emit(obj) {
   try { writeFileSync(1, JSON.stringify(obj)); } catch { /* ignore */ }
@@ -38,7 +41,16 @@ function main() {
 
   const cwd = String(input.cwd || '');
   if (!cwd) { emit({}); return; }
-  const project = basename(cwd);
+  // RULING-C (WS7.6): MUST derive `project` the SAME way as memory-session-start.mjs
+  // — a mismatch here orphans the breadcrumb permanently (it writes under a name
+  // the reader never looks for again). `project` is a filename only, never a scope:
+  // strip whichever prefix is present (`project:`/`client:` — a marker override can
+  // name either), then fold every other filesystem-unsafe character — same fold as
+  // the sibling caches (kopeng-observe.js's sequence cache, canonical-triggers.mjs)
+  // — so an oversized or `/`-bearing override can never produce an invalid or
+  // colliding path (a colon, uncaught, breaks this write on Windows).
+  const projectScope = deriveProjectScope(cwd).scope;
+  const project = projectScope.replace(/^(?:project|client):/, '').replace(/[^a-zA-Z0-9_-]/g, '_');
 
   const sessionDir = join(homedir(), '.claude', 'session-data');
   try { mkdirSync(sessionDir, { recursive: true }); } catch { /* ignore */ }

@@ -1,9 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { resolveAdminKey, ensureAdminKey, generateAdminKey, runFirstRunPreflight,
   KeyWriteError, BindRefusedError } from '../../src/config/first-run.js';
+import { resolveEnvFile } from '../../src/config/config.js';
 
 let dir: string; let envPath: string;
 beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kopeng-fr-')); envPath = path.join(dir, '.env'); });
@@ -59,8 +61,20 @@ describe('ensureAdminKey writes', () => {
     expect(r).toEqual({ key: 'already', generated: false });
     expect(fs.readFileSync(envPath, 'utf8')).toBe(before);
   });
-  it('unwritable path → KeyWriteError (boot refusal, never silent-keyless)', () => {
-    expect(() => ensureAdminKey(path.join(dir, 'no-such-dir', 'x', '.env'), env()))
+  // Review finding 3 (defense in depth): a missing PARENT directory is no
+  // longer a refusal — the resolved envPath can now legitimately be
+  // ~/.kopeng/.env, whose parent a from-source dev/test run has no other
+  // reason to have created yet.
+  it('creates the parent directory when it does not exist, then writes normally', () => {
+    const nestedPath = path.join(dir, 'no-such-dir', 'x', '.env');
+    const r = ensureAdminKey(nestedPath, env());
+    expect(r.generated).toBe(true);
+    expect(fs.readFileSync(nestedPath, 'utf8')).toContain(`ADMIN_API_KEY=${r.key}`);
+  });
+  it('unwritable path (a FILE occupies a directory segment) → KeyWriteError (boot refusal, never silent-keyless)', () => {
+    const blockerFile = path.join(dir, 'blocker');
+    fs.writeFileSync(blockerFile, 'not a directory');
+    expect(() => ensureAdminKey(path.join(blockerFile, '.env'), env()))
       .toThrow(KeyWriteError);
   });
   it('write is atomic: no .env.tmp survives a successful write', () => {
@@ -111,5 +125,126 @@ describe('runFirstRunPreflight', () => {
     } finally {
       if (prev === undefined) delete process.env.ADMIN_API_KEY; else process.env.ADMIN_API_KEY = prev;
     }
+  });
+});
+
+// Task 2.3 / Ruling 8 (refines Ruling 7): KOPENG_ENV_FILE (explicit) wins
+// outright. Otherwise tier 2 (<projectRoot>/.env) applies whenever that file
+// EXISTS **or** projectRoot is not node_modules-resident — so every
+// from-source checkout keeps pre-change behavior, .env or not. ~/.kopeng/.env
+// is reached ONLY when projectRoot is node_modules-resident (the packaged
+// shape, ~/.kopeng/app/node_modules/kopeng) AND has no local .env.
+describe('resolveEnvFile (Ruling 8 order)', () => {
+  let projectDir: string;
+  let packagedProjectDir: string;
+  beforeEach(() => {
+    projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kopeng-fr-project-'));
+    // Simulates the real packaged shape (~/.kopeng/app/node_modules/kopeng)
+    // without needing a real npm install — resolveEnvFile only cares whether
+    // a `node_modules` SEGMENT is present in the path string.
+    packagedProjectDir = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'kopeng-fr-home-')), 'app', 'node_modules', 'kopeng'
+    );
+    fs.mkdirSync(packagedProjectDir, { recursive: true });
+  });
+  afterEach(() => {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+    fs.rmSync(packagedProjectDir, { recursive: true, force: true });
+  });
+
+  it('explicit KOPENG_ENV_FILE wins even when <projectRoot>/.env also exists', () => {
+    fs.writeFileSync(path.join(projectDir, '.env'), 'X=1\n');
+    const explicit = path.join(dir, 'explicit.env');
+    expect(resolveEnvFile({
+      env: { KOPENG_ENV_FILE: explicit },
+      projectRoot: projectDir,
+      packagedEnvFile: path.join(dir, 'packaged.env'),
+    })).toBe(explicit);
+  });
+
+  it('<projectRoot>/.env wins over the packaged fallback when present, even for a node_modules-resident root', () => {
+    const projectEnv = path.join(packagedProjectDir, '.env');
+    fs.writeFileSync(projectEnv, 'X=1\n');
+    expect(resolveEnvFile({
+      env: {},
+      projectRoot: packagedProjectDir,
+      packagedEnvFile: path.join(dir, 'packaged.env'),
+    })).toBe(projectEnv);
+  });
+
+  it('a from-source checkout (not node_modules-resident) with NO local .env still resolves to <projectRoot>/.env — never the packaged fallback', () => {
+    expect(resolveEnvFile({
+      env: {},
+      projectRoot: projectDir, // no .env written here, and not inside node_modules
+      packagedEnvFile: path.join(dir, 'packaged.env'),
+    })).toBe(path.join(projectDir, '.env'));
+  });
+
+  it('a node_modules-resident root with NO local .env falls back to the packaged ~/.kopeng/.env', () => {
+    const packaged = path.join(dir, 'packaged.env');
+    expect(resolveEnvFile({
+      env: {},
+      projectRoot: packagedProjectDir, // no .env written here, and IS inside node_modules
+      packagedEnvFile: packaged,
+    })).toBe(packaged);
+  });
+});
+
+describe('config.ts wires RESOLVED_ENV_FILE end-to-end (module reload)', () => {
+  const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../');
+  const ORIGINAL_ENV_FILE = process.env.KOPENG_ENV_FILE;
+  const ORIGINAL_HOME = process.env.KOPENG_HOME;
+  let fakeHome: string;
+
+  beforeEach(() => { fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'kopeng-fr-home-')); });
+  afterEach(() => {
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+    if (ORIGINAL_ENV_FILE === undefined) delete process.env.KOPENG_ENV_FILE; else process.env.KOPENG_ENV_FILE = ORIGINAL_ENV_FILE;
+    if (ORIGINAL_HOME === undefined) delete process.env.KOPENG_HOME; else process.env.KOPENG_HOME = ORIGINAL_HOME;
+    vi.resetModules();
+  });
+
+  it('explicit KOPENG_ENV_FILE becomes RESOLVED_ENV_FILE regardless of KOPENG_HOME', async () => {
+    const explicit = path.join(fakeHome, 'explicit.env');
+    process.env.KOPENG_ENV_FILE = explicit;
+    process.env.KOPENG_HOME = fakeHome;
+    vi.resetModules();
+    const { RESOLVED_ENV_FILE } = await import('../../src/config/config.js');
+    expect(RESOLVED_ENV_FILE).toBe(explicit);
+  });
+
+  // Review finding 3 regression pin: this checkout's real projectRoot (this
+  // worktree) is NOT node_modules-resident, so under Ruling 8 it must resolve
+  // to its OWN .env regardless of KOPENG_HOME — never the packaged fallback,
+  // even though KOPENG_HOME is set here exactly as it would be on any machine
+  // that has ALSO installed the packaged `kopeng` CLI. The old Ruling-7-only
+  // logic regressed exactly this: a from-source checkout with no .env yet
+  // would target ~/.kopeng/.env (parent may not exist → boot refusal), and a
+  // later `cp .env.example .env` would then mint a SECOND admin key at the
+  // repo path instead of reusing the one already resolved.
+  it('a from-source checkout keeps resolving to its OWN .env even with KOPENG_HOME set (Ruling 8)', async () => {
+    // The only precondition this assertion actually needs: the checkout is not
+    // node_modules-resident, which is what makes `packaged` false and sends
+    // resolveEnvFile down the from-source branch.
+    //
+    // It used to ALSO assert the repo root carries no `.env`, on the grounds
+    // that .gitignore enforces it. It does not: .gitignore stops `.env` being
+    // COMMITTED, while every real from-source install has one (`cp .env.example
+    // .env` is the documented first step). So the suite passed only on fresh
+    // clones and CI runners and was red on any working checkout -- including the
+    // operator's own, which is precisely the from-source case under test.
+    //
+    // Dropping it costs no coverage: resolveEnvFile short-circuits on
+    // `!packaged` BEFORE it ever calls existsSync, so for a from-source root the
+    // answer is <projectRoot>/.env whether or not the file is there. The
+    // no-.env-yet regression this was gesturing at is covered deterministically
+    // against a synthetic temp root in the `resolveEnvFile (Ruling 8 order)`
+    // block above, which does not depend on the ambient checkout at all.
+    expect(REPO_ROOT.toLowerCase()).not.toContain('node_modules');
+    delete process.env.KOPENG_ENV_FILE;
+    process.env.KOPENG_HOME = fakeHome;
+    vi.resetModules();
+    const { RESOLVED_ENV_FILE } = await import('../../src/config/config.js');
+    expect(RESOLVED_ENV_FILE).toBe(path.join(REPO_ROOT, '.env'));
   });
 });

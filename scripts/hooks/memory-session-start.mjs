@@ -14,9 +14,12 @@
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+// RULING-C (WS7.6): project:<basename(cwd)> is now project:<owner>-<repo>
+// derived from the git remote, marker-overridable — see project-scope.mjs.
+import { deriveProjectScope } from './project-scope.mjs';
 
 const API_URL = process.env.KOPENG_API_URL || process.env.MEMORY_API_URL || 'http://localhost:3200';
 const RERANK_FLOOR = 0.3;
@@ -78,13 +81,94 @@ async function searchOne(query, scope) {
 
 const stripHash = (line) => line.replace(/^[a-f0-9]+ /, '');
 
+// Windows compares paths case-insensitively. `path.relative` already folds
+// case on win32, so only this equality check needs the fold spelled out.
+function samePath(a, b) {
+  const left = resolve(a);
+  const right = resolve(b);
+  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+// True when `child` is nested under `parent`. Both sides are resolved first,
+// so a `..` segment inside the knob cannot traverse out of KOPENG_HOME.
+function isInside(parent, child) {
+  const rel = relative(parent, child);
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+}
+
+// Review finding 3: the knob is an exec primitive. This hook spawns
+// `knob.node knob.script ensure` DETACHED with stdio discarded at every
+// session start, out of a file no other tooling inspects — so a malicious
+// postinstall in any npm package in ANY project can leave a durable,
+// low-visibility launcher behind by rewriting ~/.kopeng/ensure.json. It is
+// not a privilege crossing (whatever wrote that file already runs as the
+// operator), but it is cheap to deny: the knob `kopeng init` writes always
+// names THIS node binary and a script under KOPENG_HOME (see init.ts's
+// `cliEntry`, <home>/app/node_modules/kopeng/dist/cli/index.js), so anything
+// else is not our knob and we simply do not fire it.
+//
+// Fail-open to today's no-op on any mismatch or surprise — a session start
+// must never be blocked by this check. Known trade-off: a node upgrade that
+// moves the binary (nvm, a reinstall elsewhere) silently disarms ensure until
+// `kopeng init` rewrites the knob; the alternative is honoring an arbitrary
+// executable path forever, which is the thing being fixed.
+function knobIsTrusted(knob, kopengHome) {
+  try {
+    return samePath(knob.node, process.execPath) && isInside(resolve(kopengHome), resolve(knob.script));
+  } catch {
+    return false;
+  }
+}
+
+// Task 2.3.4: `kopeng ensure` self-heal — fires a fire-and-forget probe/spawn
+// so a packaged server that died (or was never started) comes back up before
+// the NEXT prompt, without this hook ever waiting on it. The knob
+// (~/.kopeng/ensure.json, written by `kopeng init` — Task 2.2) is entirely
+// optional: absent or malformed = today's behavior, byte-identical. Runs
+// before any network call so it never competes with the recall budget.
+function maybeFireEnsure() {
+  try {
+    const kopengHome = process.env.KOPENG_HOME || join(homedir(), '.kopeng');
+    const knob = JSON.parse(readFileSync(join(kopengHome, 'ensure.json'), 'utf-8'));
+    if (!knob?.enabled || typeof knob.node !== 'string' || typeof knob.script !== 'string') return;
+    if (!knobIsTrusted(knob, kopengHome)) return;
+    const child = spawn(knob.node, [knob.script, 'ensure'], { detached: true, stdio: 'ignore' });
+    // A stale knob (node path no longer exists, permissions changed, etc.) makes
+    // spawn fail ASYNCHRONOUSLY — the ENOENT arrives as an 'error' event on a
+    // later tick, after this function's sync try/catch has already returned.
+    // With no listener, Node treats an unhandled 'error' event as fatal and
+    // crashes the WHOLE hook (exit 1, stack trace) if anything downstream
+    // yields to the event loop before the process exits (e.g. the recall
+    // search's fetch — confirmed empirically: reproduces on a git-repo cwd,
+    // not on the fully-synchronous non-git fast path, since process.exit()
+    // there wins the race before the pending error ever fires). Silently
+    // discarding this fire-and-forget failure is exactly right.
+    child.on('error', () => {});
+    child.unref();
+  } catch {
+    /* no knob, unreadable, or malformed JSON — nothing to fire */
+  }
+}
+
 async function main() {
+  maybeFireEnsure();
+
   let input;
   try { input = JSON.parse(readFileSync(0, 'utf-8')); } catch { emit({}); return; }
 
   const cwd = String(input.cwd || '');
   if (!cwd) { emit({}); return; }
-  const project = basename(cwd);
+  // RULING-C (WS7.6): `projectScope` — not `project` — is what the search call
+  // below actually uses, passed verbatim, so a `.kopeng.json` `project` override
+  // naming `client:*` (not just `project:*`) reaches the search scope exactly as
+  // declared instead of being re-wrapped into a malformed `project:client:acme`.
+  // `project` itself is ONLY a filename/display name: strip whichever prefix is
+  // present, then fold every other filesystem-unsafe character — same fold as
+  // the sibling caches (kopeng-observe.js's sequence cache, canonical-triggers.mjs)
+  // — so an oversized or `/`-bearing override can never produce an invalid or
+  // colliding path (a colon, uncaught, breaks the breadcrumb write on Windows).
+  const projectScope = deriveProjectScope(cwd).scope;
+  const project = projectScope.replace(/^(?:project|client):/, '').replace(/[^a-zA-Z0-9_-]/g, '_');
 
   // ── Git context ──
   const isGit = git(cwd, ['rev-parse', '--is-inside-work-tree']) === 'true';
@@ -120,7 +204,7 @@ async function main() {
     }
     dynamicQuery = dynamicQuery.replace(/\s+/g, ' ').trim().slice(0, 500);
     if (dynamicQuery) {
-      const results = await searchOne(dynamicQuery, `project:${project}`);
+      const results = await searchOne(dynamicQuery, projectScope);
       const hit = results.find(r => typeof r.rerank_score === 'number' && r.rerank_score > RERANK_FLOOR && r.memory);
       if (hit) projectMem = `- [${hit.memory.type}] ${hit.memory.content}`;
     }

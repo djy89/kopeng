@@ -6,9 +6,21 @@ import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 
 import { HOOK_DEFINITIONS } from './wire-client.js';
+import { ENV_FILE as PACKAGED_ENV_FILE, KOPENG_HOME } from './paths.js';
+import { resolveEnvFile } from '../config/env-resolution.js';
+// RULING-C (WS7.6): the recall probe below must derive its scope the same way
+// the real hooks do — a plain path.basename would silently diverge the moment
+// repoRoot sits under a git remote.
+//
+// Task 2.1: this file lives two levels below the repo/package root in both
+// layouts (src/cli/ in the checkout, dist/cli/ once compiled, node_modules/
+// kopeng/dist/cli/ once installed), and scripts/hooks/ always sits at that
+// same root — so the same relative specifier resolves correctly everywhere.
+import { deriveProjectScope } from '../../scripts/hooks/project-scope.mjs';
+import { isEntrypoint } from '../utils/entrypoint.js';
 
 type JsonObject = Record<string, unknown>;
-type CheckState = 'pass' | 'fail' | 'skip';
+type CheckState = 'pass' | 'fail' | 'skip' | 'warn';
 
 export interface DoctorCheck {
   name: string;
@@ -28,6 +40,17 @@ export interface DoctorOptions {
   homeDir?: string;
   repoRoot?: string;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Task 2.2 (fix round: Finding 2): the resolved .env path for feature-
+   * posture reporting. Defaults to `resolveEnvFile` — the same
+   * KOPENG_ENV_FILE > from-source `<repoRoot>/.env` > packaged
+   * `~/.kopeng/.env` resolution `wire-client.ts` uses — so a standalone
+   * `kopeng doctor` on a packaged install reads the REAL .env instead of
+   * silently missing it at `<repoRoot>/.env` (which doesn't exist once
+   * repoRoot is inside node_modules). `kopeng init`/`update` still pass the
+   * resolved .env explicitly; this default only matters for a bare `doctor`.
+   */
+  envFile?: string;
   fetchImpl?: typeof fetch;
   log?: (line: string) => void;
 }
@@ -313,25 +336,140 @@ async function fetchJson(fetchImpl: typeof fetch, url: string, init?: RequestIni
   }
 }
 
-async function checkHealth(fetchImpl: typeof fetch, apiUrl: string): Promise<DoctorCheck> {
+async function checkHealth(fetchImpl: typeof fetch, apiUrl: string): Promise<{ check: DoctorCheck; data: JsonObject | null }> {
   const response = await fetchJson(fetchImpl, `${apiUrl}/api/health`);
   const fix = `start KOPENG with npm start and verify ${apiUrl}/api/health, then re-run npm run doctor`;
   if (!response.ok) {
-    return fail('Server', `not reachable at ${apiUrl} (${response.error ?? `HTTP ${response.status}`}).`, fix);
+    return { check: fail('Server', `not reachable at ${apiUrl} (${response.error ?? `HTTP ${response.status}`}).`, fix), data: null };
   }
   const data = isObject(response.json) && isObject(response.json.data) ? response.json.data : null;
-  if (!data) return fail('Server', '/api/health returned an unexpected response shape.', fix);
+  if (!data) return { check: fail('Server', '/api/health returned an unexpected response shape.', fix), data: null };
   if (data.embedding !== 'loaded') {
-    return fail(
-      'Server',
-      `reachable, but the embedding index is ${String(data.embedding ?? 'unknown')}.`,
-      'wait for the model to load; if it stays unready, check the server log, then re-run npm run doctor'
-    );
+    return {
+      check: fail(
+        'Server',
+        `reachable, but the embedding index is ${String(data.embedding ?? 'unknown')}.`,
+        'wait for the model to load; if it stays unready, check the server log, then re-run npm run doctor'
+      ),
+      data,
+    };
   }
   return {
-    name: 'Server',
-    state: 'pass',
-    detail: `reachable at ${apiUrl}; embedding index loaded (${String(data.memories ?? '?')} memories).`,
+    check: {
+      name: 'Server',
+      state: 'pass',
+      detail: `reachable at ${apiUrl}; embedding index loaded (${String(data.memories ?? '?')} memories).`,
+    },
+    data,
+  };
+}
+
+/**
+ * WS7.1: compares the server-reported version against the LOCAL checkout's
+ * package.json. A mismatch is expected whenever a running server hasn't
+ * picked up a newer checkout yet, so this warns rather than fails doctor.
+ */
+function checkVersion(healthData: JsonObject | null, repoRoot: string): DoctorCheck {
+  if (!healthData) {
+    return { name: 'Version', state: 'skip', detail: 'not checked — the server is unreachable.' };
+  }
+  const localRead = readJson(path.join(repoRoot, 'package.json'));
+  const localVersion = stringValue(localRead.value?.version);
+  if (!localVersion) {
+    return { name: 'Version', state: 'skip', detail: `${localRead.path} has no version field.` };
+  }
+  const serverVersion = stringValue(healthData.version);
+  if (!serverVersion) {
+    return {
+      name: 'Version',
+      state: 'warn',
+      detail: `server did not report a version (older server); local checkout is v${localVersion} — upgrade the server to get version reporting.`,
+    };
+  }
+  if (serverVersion !== localVersion) {
+    return {
+      name: 'Version',
+      state: 'warn',
+      detail: `server is v${serverVersion}, local checkout is v${localVersion} — restart the server after updating.`,
+    };
+  }
+  return { name: 'Version', state: 'pass', detail: `server and local checkout both report v${localVersion}.` };
+}
+
+/**
+ * True when this copy of KOPENG is an INSTALLED package (its root has a
+ * `node_modules` path segment, e.g. `~/.kopeng/app/node_modules/kopeng`)
+ * rather than a from-source checkout. Same heuristic `env-resolution.ts` uses
+ * to pick the packaged `.env`; duplicated as a one-liner rather than exported
+ * from there because that module's copy is private to the `.env` tiering.
+ *
+ * It exists so doctor never prescribes a command the operator cannot run: a
+ * packaged install has no `scripts/ops/` (not in package.json's `files`) and
+ * no `tsx` (a devDependency), so every `npm run <ops-script>` fix line is a
+ * dead end there.
+ */
+export function isPackagedInstall(repoRoot: string): boolean {
+  return repoRoot.split(/[/\\]+/).some(segment => segment.toLowerCase() === 'node_modules');
+}
+
+/**
+ * WS7.4 B3: is_locked is THE Hard Anchor now; confidence>=1.0 and
+ * metadata.pinned are deprecated spellings, still honored this release. Warns
+ * the operator toward the anchor migration when the corpus still holds any —
+ * naming the command that actually works for THIS install shape (`kopeng
+ * migrate-anchors` when packaged, `npm run migrate:anchors` from source;
+ * both drive `src/cli/migrate-anchors.ts`, dry-run unless `--apply`).
+ * Degrades like `checkVersion`: unreachable server or a pre-WS7.4 server
+ * that doesn't report the field skips silently rather than failing doctor.
+ */
+async function checkLegacyAnchors(fetchImpl: typeof fetch, apiUrl: string, repoRoot: string): Promise<DoctorCheck> {
+  const response = await fetchJson(fetchImpl, `${apiUrl}/api/ops/corpus-health`);
+  if (!response.ok || !isObject(response.json) || !isObject(response.json.data)) {
+    return { name: 'Legacy anchors', state: 'skip', detail: 'not checked — /api/ops/corpus-health is unreachable.' };
+  }
+  const count = response.json.data.legacy_anchor_count;
+  if (count === undefined) {
+    return { name: 'Legacy anchors', state: 'skip', detail: 'server did not report legacy_anchor_count (older server).' };
+  }
+  if (typeof count !== 'number' || count <= 0) {
+    return { name: 'Legacy anchors', state: 'pass', detail: 'no memories anchored by a deprecated spelling.' };
+  }
+  const [dry, write] = isPackagedInstall(repoRoot)
+    ? ['kopeng migrate-anchors', 'kopeng migrate-anchors --apply']
+    : ['npm run migrate:anchors', 'npm run migrate:anchors -- --apply'];
+  return {
+    name: 'Legacy anchors',
+    state: 'warn',
+    detail: `${count} memories anchored by deprecated confidence-1.0/pinned — run \`${dry}\` to preview, then \`${write}\`.`,
+  };
+}
+
+const ENSURE_CONFLICT_HINT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Finding 4 (fix round): `kopeng ensure` writes `ensure_conflict.json` (see
+ * ensure.ts) when it finds a foreign, non-KOPENG process already holding the
+ * port — this is the reader that makes that write actionable. Absent or
+ * stale (older than the ensure probe cadence — the operator has likely
+ * already resolved it, or it predates this check) reports nothing; only a
+ * hint still fresh enough to be worth acting on right now surfaces a WARN.
+ */
+function checkEnsureConflictHint(hintsDir: string, now: Date): DoctorCheck | null {
+  const hintPath = path.join(hintsDir, 'ensure_conflict.json');
+  if (!fs.existsSync(hintPath)) return null;
+  let hint: { port?: unknown; timestamp?: unknown };
+  try {
+    hint = JSON.parse(fs.readFileSync(hintPath, 'utf8'));
+  } catch {
+    return null; // malformed hint — nothing actionable to report
+  }
+  const timestampMs = typeof hint.timestamp === 'string' ? Date.parse(hint.timestamp) : NaN;
+  if (!Number.isFinite(timestampMs) || now.getTime() - timestampMs >= ENSURE_CONFLICT_HINT_MAX_AGE_MS) return null;
+  const port = typeof hint.port === 'number' ? hint.port : 'unknown';
+  return {
+    name: 'Ensure conflict hint',
+    state: 'warn',
+    detail: `a recent \`kopeng ensure\` run found port ${port} occupied by a non-KOPENG service.`,
   };
 }
 
@@ -409,7 +547,7 @@ async function checkRecall(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       query: prompt.slice(0, 200),
-      scopes: [`project:${path.basename(repoRoot)}`, 'global'],
+      scopes: [deriveProjectScope(repoRoot).scope, 'global'],
       threshold: 0.40,
       limit: 3,
     }),
@@ -463,9 +601,9 @@ async function checkRecall(
   };
 }
 
-export function featurePosture(repoRoot: string, env: NodeJS.ProcessEnv = process.env): string {
+export function featurePosture(repoRoot: string, env: NodeJS.ProcessEnv = process.env, envFile?: string): string {
   let fileEnv: Record<string, string> = {};
-  const envPath = path.join(repoRoot, '.env');
+  const envPath = envFile ?? resolveEnvFile({ env, projectRoot: repoRoot, packagedEnvFile: PACKAGED_ENV_FILE });
   try { fileEnv = dotenv.parse(fs.readFileSync(envPath)); } catch { /* missing .env means shipped defaults */ }
   const value = (name: string): string => env[name] ?? fileEnv[name] ?? 'false';
   const ingestion = value('OBSERVATION_INGESTION_ENABLED') === 'true';
@@ -504,13 +642,23 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     ));
   }
 
-  checks.push(await checkHealth(fetchImpl, resolvedUrl.apiUrl));
+  const healthResult = await checkHealth(fetchImpl, resolvedUrl.apiUrl);
+  checks.push(healthResult.check);
+  checks.push(checkVersion(healthResult.data, repoRoot));
+  checks.push(await checkLegacyAnchors(fetchImpl, resolvedUrl.apiUrl, repoRoot));
   checks.push(checkMcp(claudeRead, repoRoot));
   const hookResult = checkHooks(settingsRead, repoRoot);
   checks.push(...hookResult.checks);
   const effectiveHookEnv = hookEnvironment(settingsRead.value, env);
   const nodeCheck = checkNode(effectiveHookEnv);
   checks.push(nodeCheck);
+
+  // Finding 4: same KOPENG_HINTS_DIR override ensure.ts itself honors
+  // (currentEnsureDeps in ensure.ts), so a redirected hints dir is found
+  // the same way on both sides of the write/read.
+  const hintsDir = env.KOPENG_HINTS_DIR || path.join(KOPENG_HOME, 'hints');
+  const ensureConflictCheck = checkEnsureConflictHint(hintsDir, new Date());
+  if (ensureConflictCheck) checks.push(ensureConflictCheck);
 
   const serverReady = checks.some(check => check.name === 'Server' && check.state === 'pass');
   const promptReady = hookResult.checks.some(check => check.name === 'Hook UserPromptSubmit' && check.state === 'pass');
@@ -530,7 +678,7 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     });
   }
 
-  const posture = featurePosture(repoRoot, env);
+  const posture = featurePosture(repoRoot, env, options.envFile);
   for (const check of checks) {
     log(`[${check.state.toUpperCase()}] ${check.name}: ${check.detail}`);
     if (check.state === 'fail') log(`       Fix: ${check.fix}`);
@@ -543,8 +691,9 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
 }
 
 function isDirectRun(): boolean {
-  const entry = process.argv[1] ? path.resolve(process.argv[1]) : '';
-  return entry.toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
+  // Symlink-safe (T72). The obvious argv[1]-vs-import.meta.url comparison
+  // reads false through a symlink and this module silently does nothing.
+  return isEntrypoint(import.meta.url);
 }
 
 if (isDirectRun()) {

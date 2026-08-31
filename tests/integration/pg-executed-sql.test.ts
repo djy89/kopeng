@@ -9,13 +9,16 @@
  * statements: migrations, projections, and the Phase-2 revision round-trip.
  *
  * Gated on KOPENG_PG_TEST_URL — skipped when unset. NOTE: the repo `.env`
- * counts, not just the shell env: this file's imports pull config.ts, whose
- * module body runs dotenv before line 1 of this file executes. A stray
- * KOPENG_PG_TEST_URL line in `.env` arms this suite for every `npm test`,
- * which is why the guards below are state checks, not just naming ones.
- * CI provides a pgvector service container and sets the var (plus
- * KOPENG_PG_REQUIRED=1, so a broken env wiring FAILS the PG job instead of
- * green-skipping it).
+ * counts, not just the shell env — but NOT via config.ts's own dotenv call
+ * (fix round, Finding 3): vitest.config.ts pins KOPENG_ENV_FILE to a harmless
+ * nonexistent path for every test (isolation from a developer's real .env),
+ * which makes config.ts's dotenv a no-op for the repo .env. This file loads
+ * it directly instead (below, non-overriding — a real shell/CI env value
+ * still wins), so a stray KOPENG_PG_TEST_URL line in `.env` still arms this
+ * suite for every `npm test`, which is why the guards below are state checks,
+ * not just naming ones. CI provides a pgvector service container and sets
+ * the var (plus KOPENG_PG_REQUIRED=1, so a broken env wiring FAILS the PG job
+ * instead of green-skipping it).
  *
  * Two-layer destructive-suite guard (this suite TRUNCATEs tables):
  *   1. The database NAME must contain a standalone "test" token (kopeng_test
@@ -26,12 +29,20 @@
  *      repo's own copy-first doctrine tells the operator to create, sometimes
  *      under test-ish names) is not.
  */
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import dotenv from 'dotenv';
 import pg from 'pg';
 import { runPgMigrations } from '../../src/database/pg-migrations.js';
 import { PgQueries } from '../../src/database/pg-queries.js';
 import { PgDreamQueries } from '../../src/database/pg-dream-queries.js';
 import { PgScopeRegistryQueries } from '../../src/database/pg-scope-registry-queries.js';
 import { PgObservationQueries } from '../../src/database/pg-observation-queries.js';
+
+// The vitest.config.ts KOPENG_ENV_FILE pin (see above) makes config.ts's own
+// dotenv a no-op here, so this suite arms itself: non-overriding, so a real
+// shell/CI-set KOPENG_PG_TEST_URL still wins over whatever the repo .env says.
+dotenv.config({ path: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../.env') });
 
 const PG_URL = process.env.KOPENG_PG_TEST_URL;
 
@@ -165,6 +176,30 @@ describe.skipIf(!PG_URL)('PG executed-SQL (real Postgres via KOPENG_PG_TEST_URL)
     expect(afterGet.rows[0].n).toBeGreaterThan(0);
   });
 
+  describe('WS7.4 B3: getCorpusHealthStats.legacy_anchor_count (real jsonb ->> )', () => {
+    it('counts unlocked confidence>=1.0 and pinned-metadata rows, excludes locked/archived', async () => {
+      const confirmedId = await storeOne('legacy confirmed');
+      await pool.query('UPDATE memories SET confidence = 1.0 WHERE id = $1', [confirmedId]);
+
+      const pinnedId = await storeOne('legacy pinned');
+      await pool.query(
+        `UPDATE memories SET confidence = 0.5, metadata = '{"pinned": true}'::jsonb WHERE id = $1`,
+        [pinnedId],
+      );
+
+      const lockedId = await storeOne('locked and confirmed');
+      await pool.query('UPDATE memories SET confidence = 1.0, is_locked = true WHERE id = $1', [lockedId]);
+
+      const archivedId = await storeOne('archived legacy anchor');
+      await pool.query('UPDATE memories SET confidence = 1.0, is_archived = true WHERE id = $1', [archivedId]);
+
+      await storeOne('ordinary'); // default confidence, unlocked, unpinned
+
+      const stats = await queries.getCorpusHealthStats();
+      expect(stats.legacy_anchor_count).toBe(2);
+    });
+  });
+
   describe('Phase 8 Task 4: trimAccessLog retention (S7, CX-7)', () => {
     async function insertAccessAt(memoryId: number, interval: string): Promise<void> {
       await pool.query(
@@ -267,6 +302,118 @@ describe.skipIf(!PG_URL)('PG executed-SQL (real Postgres via KOPENG_PG_TEST_URL)
     expect(row!.scope).toBe('project:pg-test'); // COALESCE kept the live value
     expect(row!.type).toBe('reference');
     expect(new Date(row!.last_seen!).toISOString()).toBe('2026-03-01T00:00:00.000Z');
+  });
+
+  // ── WS0: memory_revisions.is_locked (PG v12) — THE Hard Anchor is restorable ──
+  // The lock is what protects a row from promotion/dream/maintenance archival AND
+  // it is model-writable through the MCP `update_memory {locked}` argument, so the
+  // snapshot column is the only thing standing between a model-issued unlock and
+  // an unrecoverable, unrecorded loss of protection. The SQLite twin is
+  // tests/unit/revision-lock-reversibility.test.ts.
+
+  it('WS0: PG v12 added memory_revisions.is_locked as a NULLABLE column with no default', async () => {
+    // The nullability is load-bearing, not incidental: a DEFAULT FALSE would
+    // backfill every pre-v12 revision on the LIVE corpus with "was unlocked",
+    // and the restore COALESCE would then strip real anchors on rollback.
+    const col = await pool.query(
+      `SELECT data_type, is_nullable, column_default
+         FROM information_schema.columns
+        WHERE table_name = 'memory_revisions' AND column_name = 'is_locked'`,
+    );
+    expect(col.rows).toHaveLength(1);
+    expect(col.rows[0].data_type).toBe('boolean');
+    expect(col.rows[0].is_nullable).toBe('YES');
+    expect(col.rows[0].column_default).toBeNull();
+  });
+
+  it('WS0: snapshot captures is_locked and restore brings the anchor back (real SQL)', async () => {
+    const id = await storeOne('Anchor reversibility probe.');
+    await queries.updateLocked(id, true);
+    expect((await queries.peek(id))!.is_locked).toBe(1); // peek maps is_locked to 1|0
+
+    // Snapshot the LOCKED row, then unlock — the model-issued-unlock shape.
+    const snap = await dreams.snapshotRevision(id);
+    const rev = await pool.query(
+      'SELECT is_locked FROM memory_revisions WHERE memory_id = $1 AND revision = $2',
+      [id, snap.revision],
+    );
+    expect(rev.rows[0].is_locked).toBe(true);
+
+    await queries.updateLocked(id, false);
+    expect((await queries.peek(id))!.is_locked).toBe(0);
+
+    expect(await dreams.restoreRevision(id, snap.revision)).toBe(true);
+    expect((await queries.peek(id))!.is_locked).toBe(1);
+
+    // restoreRevision's own pre-rollback snapshot recorded the live (unlocked)
+    // value, so the rollback is itself reversible for the lock.
+    const preRollback = await pool.query(
+      `SELECT revision, is_locked FROM memory_revisions
+        WHERE memory_id = $1 AND revision > $2 ORDER BY revision ASC LIMIT 1`,
+      [id, snap.revision],
+    );
+    expect(preRollback.rows[0].is_locked).toBe(false);
+  });
+
+  it('WS0: the PG revisions read surface exposes is_locked as boolean|null (mapper parity with SQLite)', async () => {
+    const id = await storeOne('PG revision read-surface probe.');
+    await queries.updateLocked(id, true);
+    const locked = await dreams.snapshotRevision(id);
+    await queries.updateLocked(id, false);
+    const unlocked = await dreams.snapshotRevision(id);
+
+    const revs = await dreams.listRevisions(id); // newest first
+    expect(revs[0].revision).toBe(unlocked.revision);
+    expect(revs[0].is_locked).toBe(false);
+    expect(revs[1].is_locked).toBe(true);
+    expect(typeof revs[0].is_locked).toBe('boolean');
+    expect((await dreams.getRevision(id, locked.revision))!.is_locked).toBe(true);
+
+    // Legacy rows must read null, not false — only null means "predates v12".
+    await pool.query(
+      'UPDATE memory_revisions SET is_locked = NULL WHERE memory_id = $1 AND revision = $2',
+      [id, locked.revision],
+    );
+    expect((await dreams.getRevision(id, locked.revision))!.is_locked).toBeNull();
+  });
+
+  it('WS0: the deprecated setMemoryLock FORWARDS to updateLocked (identical row state, real SQL)', async () => {
+    // Anti-drift twin of the SQLite case in tests/unit/dream-queries.test.ts:
+    // setMemoryLock is a second NAME for updateLocked, never a second write.
+    const viaDreamStore = await storeOne('PG lock via the deprecated spelling.');
+    const viaMemoryStore = await storeOne('PG lock via the canonical spelling.');
+    const pin = (id: number) =>
+      pool.query(`UPDATE memories SET updated_at = TIMESTAMPTZ '2000-01-01 00:00:00+00' WHERE id = $1`, [id]);
+    await pin(viaDreamStore);
+    await pin(viaMemoryStore);
+
+    await dreams.setMemoryLock(viaDreamStore, true);
+    await queries.updateLocked(viaMemoryStore, true);
+
+    const readRow = async (id: number) => {
+      const r = await pool.query(
+        'SELECT is_locked, is_archived, confidence, scope, type, observation_count FROM memories WHERE id = $1', [id]);
+      return r.rows[0];
+    };
+    expect(await readRow(viaDreamStore)).toEqual(await readRow(viaMemoryStore));
+    expect((await readRow(viaDreamStore)).is_locked).toBe(true);
+    // updated_at must have MOVED — that is the exact column the old spelling skipped.
+    const stamped = await pool.query('SELECT updated_at FROM memories WHERE id = $1', [viaDreamStore]);
+    expect(new Date(stamped.rows[0].updated_at).getUTCFullYear()).toBeGreaterThan(2000);
+  });
+
+  it('WS0: a legacy (pre-v12, NULL-is_locked) revision never strips the lock off a live locked row', async () => {
+    const id = await storeOne('Legacy-revision anchor COALESCE probe.');
+    const snap = await dreams.snapshotRevision(id); // taken while UNLOCKED
+    await pool.query(
+      'UPDATE memory_revisions SET is_locked = NULL WHERE memory_id = $1 AND revision = $2',
+      [id, snap.revision],
+    );
+    // Lock the live row AFTER that revision was written — the live-corpus shape.
+    await queries.updateLocked(id, true);
+
+    expect(await dreams.restoreRevision(id, snap.revision)).toBe(true);
+    expect((await queries.peek(id))!.is_locked).toBe(1); // COALESCE kept the anchor
   });
 
   it('dream_audit_log CHECK allows every permitted change class and rejects contested', async () => {

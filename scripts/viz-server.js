@@ -10,6 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Readable } from 'node:stream';
 import { gzipSync } from 'node:zlib';
 import dotenv from 'dotenv';
+import { isEntrypoint } from './hooks/entrypoint.mjs';
 
 const PORT = parseInt(process.env.VIZ_PORT || '8780', 10);
 const API = process.env.KOPENG_API_URL || 'http://localhost:3200';
@@ -294,7 +295,8 @@ const server = http.createServer((req, res) => {
 
 // Listen only when invoked directly (mirrors kopeng-observe.js / memory-prompt-search.mjs)
 // so the unit suite can import the pure bind-policy helpers without starting a server.
-const isMain = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+// Symlink-safe (T72) — see scripts/hooks/entrypoint.mjs.
+const isMain = isEntrypoint(import.meta.url);
 if (isMain) server.listen(PORT, HOST, () => {
   const shownHost = HOST === '0.0.0.0' || HOST === '::' ? 'localhost' : HOST;
   console.log(`KOPENG Viz → http://${shownHost}:${PORT}`);

@@ -27,7 +27,7 @@
  */
 
 import { readFileSync, writeFileSync, unlinkSync, appendFileSync, mkdirSync } from 'node:fs';
-import { join, basename, resolve, dirname } from 'node:path';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 // T32: the canonical/critical detection machinery (SOT_RE/ABS_PATH_RE/sotNearPath)
@@ -40,6 +40,10 @@ import {
   SOT_RE, ABS_PATH_RE, sotNearPath,
   buildTriggerEntries, writeTriggerCache, triggerCachePath, TRIGGER_CACHE_TTL_MS,
 } from './canonical-triggers.mjs';
+// RULING-C (WS7.6): project:<basename(cwd)> is now project:<owner>-<repo>
+// derived from the git remote, marker-overridable — see project-scope.mjs.
+import { deriveProjectScope, readMarkerChain } from './project-scope.mjs';
+import { isEntrypoint } from './entrypoint.mjs';
 
 // Re-export for the unit suite (turn-gate.test.ts imports sotNearPath from here).
 export { sotNearPath };
@@ -74,11 +78,11 @@ const HINT_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
 // P4 anchor marker: a `.kopeng.json` dropped in a directory declares the scopes
 // that directory belongs to (`{"scopes":["client:acme","project:fuel-dashboard"]}`).
 // The recall hook walks UP from the payload's cwd and ADDS every declared scope to
-// the recall request — `project:<basename(cwd)>` and `global` are never replaced, so
-// a tree with no marker recalls exactly as it did before. Format chosen by the P4
+// the recall request — the derived project scope (project-scope.mjs) and `global`
+// are never replaced, so a tree with no marker/remote recalls exactly as it did
+// before. Format chosen by the P4
 // survey (~/.kopeng/reports/p4-anchor-survey.md): a JSON file, not a fenced block in
 // CLAUDE.md/AGENTS.md, so the scope database is machine-readable and independent of prose.
-const ANCHOR_MARKER = '.kopeng.json';
 const ANCHOR_MAX_DEPTH = 12;  // bounded walk — a hook must never wander an unbounded tree
 const ANCHOR_MAX_SCOPES = 16; // bounded contribution — one stray marker can't bloat the request
 const ANCHOR_MAX_SCOPE_LEN = 128; // F-A: matches the server's sanitizer bound — oversized entries dropped at the source
@@ -286,30 +290,31 @@ export function armCriticalMemoriesHint(memories, projectScope, sessionId) {
  * scopes, ANCHOR_MAX_SCOPE_LEN chars per entry (the server's sanitizer bound, F-A) — so a
  * pathological tree can neither stall the hook nor bloat the recall request.
  * Runs BEFORE the request AbortSignal is armed, so the walk never eats the 3s budget.
+ *
+ * The walk itself is readMarkerChain (project-scope.mjs) — ONE pass over the ancestor
+ * chain serving both readers of `.kopeng.json`. This one keeps collecting to the depth
+ * bound; deriveProjectScope's `project` reader stops at its first hit, which is why the
+ * walk is shared but the stop rule is not. `markers` accepts an already-walked chain
+ * (main() passes one); omitted ⇒ this walks itself, so other callers and tests are
+ * unchanged.
  */
-export function readAnchorScopes(startDir, { maxDepth = ANCHOR_MAX_DEPTH, maxScopes = ANCHOR_MAX_SCOPES } = {}) {
+export function readAnchorScopes(startDir, { maxDepth = ANCHOR_MAX_DEPTH, maxScopes = ANCHOR_MAX_SCOPES, markers } = {}) {
   const scopes = [];
   const seen = new Set();
   try {
     if (!startDir) return scopes;
-    let dir = resolve(String(startDir));
-    for (let depth = 0; depth < maxDepth; depth++) {
+    for (const parsed of markers ?? readMarkerChain(startDir, { maxDepth })) {
       try {
-        const parsed = JSON.parse(readFileSync(join(dir, ANCHOR_MARKER), 'utf-8'));
-        if (Array.isArray(parsed?.scopes)) {
-          for (const raw of parsed.scopes) {
-            if (typeof raw !== 'string') continue;
-            const scope = raw.trim();
-            if (!scope || scope.length > ANCHOR_MAX_SCOPE_LEN || seen.has(scope)) continue;
-            seen.add(scope);
-            scopes.push(scope);
-            if (scopes.length >= maxScopes) return scopes;
-          }
+        if (!Array.isArray(parsed?.scopes)) continue;
+        for (const raw of parsed.scopes) {
+          if (typeof raw !== 'string') continue;
+          const scope = raw.trim();
+          if (!scope || scope.length > ANCHOR_MAX_SCOPE_LEN || seen.has(scope)) continue;
+          seen.add(scope);
+          scopes.push(scope);
+          if (scopes.length >= maxScopes) return scopes;
         }
-      } catch { /* missing or malformed marker — keep walking */ }
-      const parent = dirname(dir);
-      if (parent === dir) break; // filesystem root
-      dir = parent;
+      } catch { /* wrong-shaped marker — keep going up the chain */ }
     }
   } catch { /* never block recall on scope resolution */ }
   return scopes;
@@ -442,7 +447,12 @@ async function main() {
     return;
   }
 
-  const projectScope = `project:${basename(cwd)}`;
+  // ONE ancestor walk over `.kopeng.json` for both of its readers — the `project`
+  // override consumed by deriveProjectScope here, and the `scopes` list consumed by
+  // readAnchorScopes below. They used to walk the same 12 levels independently, which
+  // doubled the (almost entirely ENOENT) stat traffic on every prompt for no gain.
+  const markers = readMarkerChain(cwd);
+  const projectScope = deriveProjectScope(cwd, { markers }).scope;
 
   // ── Error hint ──
   let errorContext = '', errorCategory = '', hasHint = false;
@@ -476,7 +486,7 @@ async function main() {
   // reads, so the 3s recall ceiling is unaffected. Merged on top of the base pair, never
   // replacing it: no marker ⇒ [projectScope, 'global'], exactly the pre-P4 request.
   // T9: hoisted — the same walk result also rides the /api/surface body below.
-  const anchorScopes = readAnchorScopes(cwd);
+  const anchorScopes = readAnchorScopes(cwd, { markers });
   const recallScopes = [...new Set([projectScope, 'global', ...anchorScopes])];
 
   const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
@@ -628,5 +638,6 @@ async function main() {
 
 // T18 review: main() runs only when invoked as a script (mirrors
 // kopeng-observe.js) so the unit suite can import composeFlushWarning.
-const isMain = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+// Symlink-safe (T72) — see scripts/hooks/entrypoint.mjs.
+const isMain = isEntrypoint(import.meta.url);
 if (isMain) main().catch(() => { try { if (!CODEX) writeFileSync(1, '{}'); } catch { /* ignore */ } process.exit(0); });

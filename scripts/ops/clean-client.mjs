@@ -30,6 +30,14 @@ export const DELETABLE_CLASSES = [
   { dir: 'hints', pattern: /^canonical_path\.json$/,           ttlMs: 5 * 60_000 * 10 },
   { dir: 'hints', pattern: /^canonical_fallback_state\.json$/, ttlMs: 30 * 60_000 * 10 },
   { dir: 'hints', pattern: /^critical_[^/\\]+\.json$/,         ttlMs: 5 * 60_000 * 10 },
+  // doctor's freshness window (src/cli/doctor.ts) is 24h, not the 5/30-min
+  // hook windows above — same ×10 convention, scaled to hours.
+  { dir: 'hints', pattern: /^ensure_conflict\.json$/,          ttlMs: 24 * 60 * 60_000 * 10 },
+  // The ensure spawn cooldown marker (src/cli/ensure.ts) is a ~30s boot budget,
+  // so ×10 lands at 5 minutes. It is ~90 bytes rewritten in place and never
+  // grows, so this entry is for tidiness, not reclamation — and a stale marker
+  // is harmless either way: the reader fails open and simply does not suppress.
+  { dir: 'hints', pattern: /^ensure_spawn\.json$/,             ttlMs: 30 * 1_000 * 10 },
   { dir: 'cache', pattern: /^sequences_[^/\\]+\.json$/,        ttlMs: 10 * 60_000 * 10 },
   { dir: 'cache', pattern: /^canonical_triggers_[^/\\]+\.json$/, ttlMs: 10 * 60_000 * 10 },
 ];

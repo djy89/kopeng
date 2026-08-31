@@ -28,3 +28,6 @@ scratch/
 
 # Migration backups (may hold secrets)
 *.bak-tierB
+
+# SDD scratch workspaces (superpowers subagent-driven-development)
+.superpowers/

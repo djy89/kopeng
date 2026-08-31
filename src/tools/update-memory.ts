@@ -24,7 +24,12 @@ export const updateMemoryTool = {
           minimum: 0,
           maximum: 1,
           description:
-            'New confidence 0-1. Set 1.0 to confirm an auto-discovered memory as a Hard Anchor.',
+            'New confidence 0-1. Deprecated as an anchor spelling — use `locked` instead.',
+        },
+        locked: {
+          type: 'boolean',
+          description:
+            'Lock as a Hard Anchor: immune to decay, dreaming, promotion, and archival. Replaces the deprecated confidence-1.0 anchor.',
         },
       },
       required: ['id'],
@@ -40,6 +45,7 @@ export const updateMemoryTool = {
     if (args.metadata !== undefined) body.metadata = args.metadata;
     // Number(): see store-memory.ts — the same client-serialization quirk hits update.
     if (args.confidence !== undefined) body.confidence = Number(args.confidence);
+    if (args.locked !== undefined) body.is_locked = args.locked;
 
     const response = await fetch(`${apiUrl}/api/memories/${args.id}`, {
       method: 'PUT',

@@ -1,6 +1,6 @@
 # PostgreSQL Backend (Maintainer Doc)
 
-> **Supported for the maintainer, not part of the 0.x preview.** The preview
+> **Supported for the maintainer, not part of the preview.** The preview
 > path is SQLite (`DATABASE_TYPE=sqlite`, the default). The Postgres backend
 > works and is what the maintainer's own deployment runs, but it is not part
 > of the documented fresh-install path: its test coverage is asymmetric

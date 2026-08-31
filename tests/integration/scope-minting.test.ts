@@ -449,4 +449,36 @@ describe('Phase 3 done-when (spec §13)', () => {
       await ctx4.close();
     }
   });
+
+  // RULING-C (WS7.6): the hooks now mint project:<owner>-<repo> instead of
+  // project:<basename(cwd)> — a remote-derived shape needs no special server
+  // handling: it is just another raw scope string arriving at the same choke
+  // point as any operator-typed one.
+  it('a remote-derived scope (project:acme-api) mints and registers exactly like any raw scope', async () => {
+    const ctx5 = await buildApp();
+    try {
+      const res = await ctx5.app.inject({
+        method: 'POST',
+        url: '/api/memories',
+        payload: { content: 'a write on a remote-derived scope', type: 'reference', scope: 'project:acme-api' },
+      });
+      expect(res.statusCode).toBe(201);
+      const body = res.json();
+      expect(body.data.scope).toBe('project:acme-api');
+      expect(body.meta.scope_rerouted).toBeUndefined();
+
+      const rows = await ctx5.registryStore.listAll();
+      const minted = rows.find((r) => r.scope === 'project:acme-api');
+      expect(minted).toMatchObject({
+        slug: 'project:acme-api',
+        claimant_raw: 'project:acme-api',
+        status: 'provisional',
+        reserved: false,
+      });
+
+      expect(await memoriesInScope(ctx5, 'project:acme-api')).toHaveLength(1);
+    } finally {
+      await ctx5.close();
+    }
+  });
 });
