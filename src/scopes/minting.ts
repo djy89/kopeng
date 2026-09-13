@@ -24,6 +24,23 @@ export interface ScopeRegistryRow {
   first_seen: string;
   updated_at: string;
   ruled_at: string | null;
+  /** T76: set by the mark_distinct ruling. Read as a RELEASE by exactly three
+   *  consumers — the hold predicate, archive-ephemeral eligibility, and drift
+   *  coverage. NOT by `decideMint` in this file, despite the ruling releasing
+   *  minting too: the ephemeral short-circuit below is released by
+   *  REGISTRATION (the T77 guard — any row, as claimant or canonical), which
+   *  every ruling guarantees via register-then-rule. So a scope registered but
+   *  never ruled is already released here, while this column is still null. */
+  ruled_distinct_at: string | null;
+  /**
+   * Blocker 4: the operator has SEEN this scope and postponed the decision.
+   * Deliberately not a status value — every status asserts an identity
+   * judgment, and a deferral is the absence of one. Cleared by any real
+   * ruling (merge_into / mark_distinct), since the ruling IS the postponed
+   * decision. Read by the drift report only; the minting/hold path ignores it.
+   */
+  deferred_at: string | null;
+  deferred_note: string | null;
 }
 
 export interface RegisterRequest {
@@ -103,8 +120,19 @@ export function decideMint(raw: string, origin: string | null, ctx: MintContext)
   }
 
   // Rule 3: ephemerals never mint — the discovery path holds them upstream
-  // (Task 7); a direct API write passes through raw, unregistered.
-  if (ephemeralReason(raw) !== null) return { kind: 'pass', scope: raw };
+  // (Task 7); a direct API write passes through raw, unregistered. T77 guard
+  // (team review H2): a raw the registry ALREADY KNOWS — as a claimant or as
+  // a canonical — falls through to the normal resolution rules even when a
+  // widened ephemeral rule now matches it. Without this, widening
+  // EPHEMERAL_RULES silently splits an already-minted scope's write target:
+  // new rows land on the raw string while history sits on the slug canonical,
+  // the orphaned registry row stays provisional forever (rows are never
+  // deleted), and the split is invisible to the drift panel (both spellings
+  // read ephemeral and are skipped before clustering). Only UNKNOWN
+  // ephemeral-shaped scopes pass raw.
+  if (ephemeralReason(raw) !== null && !ctx.byClaimant.has(raw) && !ctx.byScope.has(raw)) {
+    return { kind: 'pass', scope: raw };
+  }
 
   // Rule 5 (exact pair, hoisted): a known claimant writing from its known
   // origin resolves straight to its registered scope — including a quarantined

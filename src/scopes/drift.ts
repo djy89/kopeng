@@ -46,7 +46,12 @@ export interface ScopeAggregate {
   total: number;
   active: number;
   archived: number;
+  /** Item 11: ACTIVE rows the Hard Anchor protects — what an archive refuses. */
+  anchored: number;
   by_type: Record<string, number>;
+  by_source: Record<string, number>;
+  /** Item 11 (review F3): the ACTIVE-only companion to `by_source`. */
+  by_source_active: Record<string, number>;
   first_write: string | null;
   last_write: string | null;
 }
@@ -60,8 +65,19 @@ export interface ScopeAggregate {
  * counts only ACTIVE rows — 178 archived rows stayed behind un-flagged.
  */
 export interface ScopeVariantEvidence extends ScopeAggregate {
+  /** Blocker 4: the operator postponed this variant's ruling (null = not deferred). */
+  deferred_at?: string | null;
+  deferred_note?: string | null;
   /** Non-null when the alias table already maps this variant away. */
   aliased_to: string | null;
+  /**
+   * T76 §5.3: this variant carries its OWN mark_distinct ruling. The cluster's
+   * `ruled_distinct` is an all-members aggregate, so it cannot tell a panel
+   * which member was ruled — and a bulk "alias the variants" action that
+   * includes a ruled member would alias away the very scope the operator just
+   * ruled separate. Per-variant, the panel can exclude exactly that one.
+   */
+  ruled_distinct: boolean;
 }
 
 export interface ScopeDriftCluster {
@@ -79,6 +95,21 @@ export interface ScopeDriftCluster {
   covered: boolean;
   /** Active rows sitting on variants the table does NOT cover — the actionable number. */
   active_rows_adrift: number;
+  /**
+   * T76 §5.3: every un-aliased variant is ruled distinct — excluded from the
+   * actionable counts (nothing left for the operator to do), but the cluster
+   * stays visible + labeled rather than disappearing from the report.
+   */
+  ruled_distinct: boolean;
+  /**
+   * Blocker 4: every unruled uncovered variant carries a deferral — the
+   * operator has seen this cluster and postponed it. Excluded from
+   * `clusters_actionable` and counted in `clusters_deferred`, but NOT from
+   * `clusters_uncovered` or `active_rows_adrift` (§1.2a: a deferral must not
+   * be able to silence the drift metric — silently vanishing rulings are how
+   * watchdogs go dark).
+   */
+  deferred: boolean;
 }
 
 export interface ScopeDriftReport {
@@ -100,6 +131,16 @@ export interface ScopeDriftReport {
     clusters_actionable: number;
     /** THE drift metric: active rows on un-aliased variants. Post-reconciliation this is 0. */
     active_rows_adrift: number;
+    /** T76 §5.3: clusters excluded from clusters_uncovered/actionable because every un-aliased variant is ruled distinct. */
+    clusters_ruled_distinct: number;
+    /**
+     * Blocker 4: clusters excluded from `clusters_actionable` because the
+     * operator deferred every unruled variant. ADDITIVE by design — the work
+     * is postponed, not gone, so it stays in `clusters_uncovered` and its rows
+     * stay in `active_rows_adrift`. A rising number here with a flat
+     * `active_rows_adrift` is a backlog, and both remain visible.
+     */
+    clusters_deferred: number;
     ephemeral_scopes: number;
     ephemeral_rows: number;
     near_miss_pairs: number;
@@ -114,26 +155,35 @@ export interface ScopeDriftReport {
     alias_table_version: string;
   };
   clusters: ScopeDriftCluster[];
-  ephemeral: { scope: string; count: number; reason: string }[];
+  /**
+   * Carries the FULL `ScopeVariantEvidence` a cluster variant carries — the
+   * aggregate (active/archived, by_type, by_source, first/last write) plus the
+   * release evidence `aliased_to` (non-null when the alias table already maps
+   * this scope away) and `ruled_distinct` (a mark_distinct ruling releases it
+   * as itself), which is what lets the ops panel hide the archive action.
+   *
+   * GATE L-A: this used to be `{scope, count, reason, aliased_to,
+   * ruled_distinct}` and nothing else, which inverted the evidence gradient —
+   * a variant whose only action is an alias carried a full aggregate, while
+   * these rows, the only ones carrying a DESTRUCTIVE archive button, carried
+   * none. The operator's report after the first live session was "I have
+   * absolutely no context at all what it is I am archiving."
+   *
+   * `count` is retained for back-compat and is by construction equal to
+   * `total` (both come from the same aggregate).
+   */
+  ephemeral: (ScopeVariantEvidence & { count: number; reason: string })[];
   near_miss: { a: string; b: string }[];
 }
 
-// ── Ephemeral shape detection (order matters — first match wins) ───────────
+// ── Ephemeral shape detection ──────────────────────────────────────────────
 
-const EPHEMERAL_RULES: { re: RegExp; reason: string }[] = [
-  { re: /^project:wf_[0-9a-f]/i, reason: 'workflow-run scope' },
-  { re: /^project:agent-[0-9a-f]{8,}/i, reason: 'subagent scope' },
-  { re: /^project:\d{8}([-_].*)?$/, reason: 'date-stamped sprint/dir scope' },
-  { re: /^project:\d{4}-\d{2}(-\d{2})?([ _-].*)?$/, reason: 'date-stamped sprint/dir scope' },
-  { re: /^project:\d{1,3}$/, reason: 'bare-number scope' },
-];
-
-export function ephemeralReason(scope: string): string | null {
-  for (const { re, reason } of EPHEMERAL_RULES) {
-    if (re.test(scope)) return reason;
-  }
-  return null;
-}
+// EPHEMERAL_RULES / ephemeralReason MOVED to ./ephemeral.ts (T77 team review,
+// the slugifyScope precedent below): the predicate has write-path consumers
+// (minting, the R-B hold, purge exemption), so its home should say so.
+// Re-exported so every existing import site is unaffected.
+export { ephemeralReason } from './ephemeral.js';
+import { ephemeralReason } from './ephemeral.js';
 
 // ── Pure clustering ────────────────────────────────────────────────────────
 
@@ -232,7 +282,8 @@ export function clusterScopes(byScope: Record<string, number>): ProposerReport {
 // ── Drift report ───────────────────────────────────────────────────────────
 
 const EMPTY_AGGREGATE = (scope: string): ScopeAggregate => ({
-  scope, total: 0, active: 0, archived: 0, by_type: {}, first_write: null, last_write: null,
+  scope, total: 0, active: 0, archived: 0, anchored: 0,
+  by_type: {}, by_source: {}, by_source_active: {}, first_write: null, last_write: null,
 });
 
 /**
@@ -254,6 +305,47 @@ export interface AliasCoverage {
 }
 
 /**
+ * T76 §5.3: the ruled-distinct coverage input. PRIVATE constructor — unlike
+ * AliasCoverage (structural, guarded only by the composition suite), this one
+ * is unforgeable by construction: the only producers are the registry snapshot
+ * and the explicit EMPTY. Fail-open to EMPTY = drift over-reported, the safe side.
+ */
+export class DistinctRulings {
+  private constructor(private readonly scopes: ReadonlySet<string>) {}
+  static readonly EMPTY = new DistinctRulings(new Set());
+  static fromRegistryRows(rows: readonly { scope: string; ruled_distinct_at: string | null }[]): DistinctRulings {
+    return new DistinctRulings(new Set(rows.filter(r => r.ruled_distinct_at !== null).map(r => r.scope)));
+  }
+  has(scope: string): boolean { return this.scopes.has(scope); }
+  get size(): number { return this.scopes.size; }
+}
+
+/**
+ * Blocker 4: the deferral coverage input. Same unforgeable-by-construction
+ * posture as DistinctRulings — private constructor, registry snapshot or
+ * EMPTY only, fail-open to EMPTY (deferral ignored ⇒ the cluster reads
+ * actionable, which is the safe over-reporting direction).
+ */
+export class DeferredMarks {
+  private constructor(
+    private readonly marks: ReadonlyMap<string, { at: string; note: string | null }>,
+  ) {}
+  static readonly EMPTY = new DeferredMarks(new Map());
+  static fromRegistryRows(
+    rows: readonly { scope: string; deferred_at: string | null; deferred_note: string | null }[],
+  ): DeferredMarks {
+    return new DeferredMarks(new Map(
+      rows.filter(r => r.deferred_at !== null)
+        .map(r => [r.scope, { at: r.deferred_at as string, note: r.deferred_note }]),
+    ));
+  }
+  has(scope: string): boolean { return this.marks.has(scope); }
+  at(scope: string): string | null { return this.marks.get(scope)?.at ?? null; }
+  note(scope: string): string | null { return this.marks.get(scope)?.note ?? null; }
+  get size(): number { return this.marks.size; }
+}
+
+/**
  * Builds the drift report from per-scope aggregates plus the live alias table.
  *
  * The alias table is what turns a raw cluster list into a signal: a cluster
@@ -271,6 +363,8 @@ export interface AliasCoverage {
 export function buildScopeDrift(
   aggregates: ScopeAggregate[],
   coverage: AliasCoverage = EMPTY_RESOLUTION,
+  distinct: DistinctRulings = DistinctRulings.EMPTY,
+  deferred: DeferredMarks = DeferredMarks.EMPTY,
 ): ScopeDriftReport {
   const byScope = new Map(aggregates.map(a => [a.scope, a]));
   const counts: Record<string, number> = {};
@@ -281,7 +375,17 @@ export function buildScopeDrift(
   const evidence = (scope: string): ScopeVariantEvidence => ({
     ...(byScope.get(scope) ?? EMPTY_AGGREGATE(scope)),
     aliased_to: coverage.table[scope] ?? null,
+    ruled_distinct: distinct.has(scope),
+    deferred_at: deferred.at(scope),
+    deferred_note: deferred.note(scope),
   });
+
+  // A cluster is deferred iff there IS outstanding work (an unruled uncovered
+  // member) and every bit of it is deferred. Mirrors `ruled_distinct`'s
+  // arithmetic, and the non-empty requirement is what keeps a fully-RULED
+  // cluster out of the deferred count — the two aggregates stay disjoint.
+  const isDeferredCluster = (unruled: ScopeVariantEvidence[]): boolean =>
+    unruled.length > 0 && unruled.every(v => deferred.has(v.scope));
 
   const clusters: ScopeDriftCluster[] = [];
 
@@ -291,13 +395,16 @@ export function buildScopeDrift(
     const scopes = [m.canonical, ...m.variants.map(v => v.scope)];
     const variants = [...new Set(scopes)].map(evidence);
     const uncovered = variants.filter(v => v.scope !== m.canonical && v.aliased_to === null);
+    const unruled = uncovered.filter(v => !distinct.has(v.scope));
     clusters.push({
       key: m.canonical,
       kind: 'casing',
       canonical: m.canonical,
       variants,
       covered: uncovered.length === 0,
-      active_rows_adrift: uncovered.reduce((n, v) => n + v.active, 0),
+      active_rows_adrift: unruled.reduce((n, v) => n + v.active, 0),
+      ruled_distinct: uncovered.length > 0 && unruled.length === 0,
+      deferred: isDeferredCluster(unruled),
     });
   }
 
@@ -306,28 +413,56 @@ export function buildScopeDrift(
     // No canonical is proposed, so "covered" means the table already routes all
     // but one of them somewhere — i.e. the operator has already ruled.
     const uncovered = variants.filter(v => v.aliased_to === null);
+    const unruled = uncovered.filter(v => !distinct.has(v.scope));
+    // The ruling arithmetic is deliberately NOT the "last one standing"
+    // shortcut that alias coverage uses. `covered` can stop at one survivor
+    // because an alias MOVES rows: once every other variant is mapped away,
+    // the survivor holds all of them and nothing is adrift. A mark_distinct
+    // ruling moves nothing — it says "this spelling is its own entity" — so a
+    // variant the operator has never touched keeps its rows on an un-ruled
+    // spelling and stays adrift no matter how many of its siblings were ruled.
+    // Hence: ruled only when EVERY uncovered member is ruled, and the adrift
+    // count is the un-ruled members' active rows (0 by construction once
+    // `unruled` is empty). Over-reporting is the safe direction here.
     clusters.push({
       key: c.slug,
       kind: 'cross_prefix',
       canonical: null,
       variants,
       covered: uncovered.length <= 1,
-      active_rows_adrift: uncovered.length <= 1 ? 0 : uncovered.reduce((n, v) => n + v.active, 0),
+      active_rows_adrift: uncovered.length <= 1 ? 0 : unruled.reduce((n, v) => n + v.active, 0),
+      ruled_distinct: uncovered.length > 1 && unruled.length === 0,
+      deferred: uncovered.length > 1 && isDeferredCluster(unruled),
     });
   }
 
   // Worst first: the clusters holding the most live, un-aliased rows.
   clusters.sort((a, b) => b.active_rows_adrift - a.active_rows_adrift || a.key.localeCompare(b.key));
 
+  // Built from the SAME `evidence()` helper the cluster variants use, so the
+  // two row kinds cannot drift apart in what they disclose (GATE L-A). `count`
+  // and `reason` are spread last: `count` is the retained back-compat spelling
+  // of `total`, `reason` is the only field with no cluster-variant analogue.
+  const ephemeral = clustered.ephemeral.map(e => ({
+    ...evidence(e.scope),
+    count: e.count,
+    reason: e.reason,
+  }));
   const ephemeralRows = clustered.ephemeral.reduce((n, e) => n + e.count, 0);
 
   return {
     summary: {
       scopes_total: aggregates.length,
       clusters_total: clusters.length,
-      clusters_uncovered: clusters.filter(c => !c.covered).length,
-      clusters_actionable: clusters.filter(c => !c.covered && c.active_rows_adrift > 0).length,
+      clusters_uncovered: clusters.filter(c => !c.covered && !c.ruled_distinct).length,
+      // `deferred` leaves ONLY this count (§1.2a). `clusters_uncovered` above
+      // and `active_rows_adrift` below deliberately still include deferred
+      // clusters: the work is postponed, not done, and the drift metric must
+      // stay un-silenceable.
+      clusters_actionable: clusters.filter(c => !c.covered && !c.ruled_distinct && !c.deferred && c.active_rows_adrift > 0).length,
       active_rows_adrift: clusters.reduce((n, c) => n + c.active_rows_adrift, 0),
+      clusters_ruled_distinct: clusters.filter(c => c.ruled_distinct).length,
+      clusters_deferred: clusters.filter(c => c.deferred).length,
       ephemeral_scopes: clustered.ephemeral.length,
       ephemeral_rows: ephemeralRows,
       near_miss_pairs: clustered.nearMiss.length,
@@ -335,7 +470,7 @@ export function buildScopeDrift(
       alias_table_version: coverage.version,
     },
     clusters,
-    ephemeral: clustered.ephemeral,
+    ephemeral,
     near_miss: clustered.nearMiss,
   };
 }

@@ -176,6 +176,65 @@ describe.skipIf(!PG_URL)('PG executed-SQL (real Postgres via KOPENG_PG_TEST_URL)
     expect(afterGet.rows[0].n).toBeGreaterThan(0);
   });
 
+  describe('T76 §5.1: getScopeAggregates by_source (real GROUP BY scope, type, source)', () => {
+    it('folds a NULL-source row and an auto-discovery row into by_source: { unknown, "auto-discovery" }', async () => {
+      const scope = 'project:pg-by-source-test';
+      const autoId = await storeOne('by_source probe: auto-discovery row.', scope);
+      await pool.query(`UPDATE memories SET source = 'auto-discovery' WHERE id = $1`, [autoId]);
+      const nullId = await storeOne('by_source probe: sourceless row.', scope);
+      await pool.query('UPDATE memories SET source = NULL WHERE id = $1', [nullId]);
+
+      try {
+        const aggregates = await queries.getScopeAggregates();
+        const row = aggregates.find(a => a.scope === scope);
+        expect(row?.by_source).toEqual({ 'auto-discovery': 1, unknown: 1 });
+      } finally {
+        // These two rows carry sources other than the suite's marker
+        // ('pg-executed-sql-test') — the beforeAll foreign-row guard expects
+        // every leftover row to carry that marker, so delete explicitly rather
+        // than rely on the next beforeEach TRUNCATE running before this suite
+        // is next invoked against a persistent (non-ephemeral) database.
+        await pool.query('DELETE FROM memories WHERE id = ANY($1)', [[autoId, nullId]]);
+      }
+    });
+
+    // Item 11 PG twin of tests/unit/anchored-aggregate.test.ts. The dialects
+    // genuinely differ (JSONB `->>` here vs json_valid/json_extract on
+    // SQLite), so the equivalence has to be proven against real Postgres —
+    // this is the half a mocked test cannot cover.
+    it('anchored counts ACTIVE Hard-Anchored rows per scope, across all three spellings, via real jsonb ->>', async () => {
+      const scope = 'project:pg-anchored-test';
+      const lockedId = await storeOne('anchored probe: locked row.', scope);
+      await pool.query('UPDATE memories SET is_locked = TRUE WHERE id = $1', [lockedId]);
+      const confId = await storeOne('anchored probe: confidence 1.0 row.', scope);
+      await pool.query('UPDATE memories SET confidence = 1.0 WHERE id = $1', [confId]);
+      const pinnedId = await storeOne('anchored probe: pinned metadata row.', scope);
+      await pool.query(`UPDATE memories SET metadata = '{"pinned": true}'::jsonb WHERE id = $1`, [pinnedId]);
+      const notPinnedId = await storeOne('anchored probe: pinned false row.', scope);
+      await pool.query(`UPDATE memories SET metadata = '{"pinned": false}'::jsonb WHERE id = $1`, [notPinnedId]);
+      // The PG-specific trap: `->>` unquotes, so the JSON STRING "true" would
+      // read as the text 'true' and count, while isAnchored requires === true.
+      const strPinnedId = await storeOne('anchored probe: pinned "true" string.', scope);
+      await pool.query(`UPDATE memories SET metadata = '{"pinned": "true"}'::jsonb WHERE id = $1`, [strPinnedId]);
+      const numPinnedId = await storeOne('anchored probe: pinned 1 number.', scope);
+      await pool.query(`UPDATE memories SET metadata = '{"pinned": 1}'::jsonb WHERE id = $1`, [numPinnedId]);
+      const plainId = await storeOne('anchored probe: plain row.', scope);
+      // An ARCHIVED anchored row must NOT count: it cannot be archived again.
+      const archivedAnchoredId = await storeOne('anchored probe: archived + locked.', scope);
+      await pool.query('UPDATE memories SET is_locked = TRUE, is_archived = TRUE WHERE id = $1', [archivedAnchoredId]);
+
+      const ids = [lockedId, confId, pinnedId, notPinnedId, strPinnedId, numPinnedId, plainId, archivedAnchoredId];
+      try {
+        const row = (await queries.getScopeAggregates()).find(a => a.scope === scope);
+        expect(row?.anchored).toBe(3);   // locked + confidence 1.0 + pinned:true ONLY
+        expect(row?.active).toBe(7);     // everything except the archived one
+        expect(row?.archived).toBe(1);
+      } finally {
+        await pool.query('DELETE FROM memories WHERE id = ANY($1)', [ids]);
+      }
+    });
+  });
+
   describe('WS7.4 B3: getCorpusHealthStats.legacy_anchor_count (real jsonb ->> )', () => {
     it('counts unlocked confidence>=1.0 and pinned-metadata rows, excludes locked/archived', async () => {
       const confirmedId = await storeOne('legacy confirmed');
@@ -419,10 +478,11 @@ describe.skipIf(!PG_URL)('PG executed-SQL (real Postgres via KOPENG_PG_TEST_URL)
   it('dream_audit_log CHECK allows every permitted change class and rejects contested', async () => {
     const id = await storeOne('Audit CHECK probe.');
     const dream = await dreams.createDream({ trigger_source: 'manual', reason: 'pg executed-sql test' });
-    // Every class the CHECK allows (SQLite v6/v7 ↔ PG v8/v9 parity) — the
-    // apply path writes seven of these; 'reinforce' is allowed by the CHECK
-    // but currently unwritten, covered here so a future writer has parity too.
-    const allowed = ['exact_dup', 'decay', 'merge', 'supersede', 'reinforce', 'promote_global', 'rollback', 'conditional'] as const;
+    // Every class the CHECK allows (SQLite v6/v7/v13 ↔ PG v8/v9/v15 parity) —
+    // the apply path writes seven of these; 'reinforce' is allowed by the
+    // CHECK but currently unwritten, covered here so a future writer has
+    // parity too. 'archive_ephemeral' (T76 F-2) is audit-only, like 'rollback'.
+    const allowed = ['exact_dup', 'decay', 'merge', 'supersede', 'reinforce', 'promote_global', 'rollback', 'conditional', 'archive_ephemeral'] as const;
     for (const changeClass of allowed) {
       const entry = await dreams.appendAudit({
         dream_id: dream.id,
@@ -448,6 +508,42 @@ describe.skipIf(!PG_URL)('PG executed-SQL (real Postgres via KOPENG_PG_TEST_URL)
         action: 'archive',
       }),
     ).rejects.toMatchObject({ code: '23514' });
+  });
+
+  describe('T76 (F-5): dreams.is_carrier (real Postgres)', () => {
+    it('createDream({is_carrier:true}) is excluded from getLastCompletedDream and listPendingDreams', async () => {
+      const carrier = await dreams.createDream({
+        mode: 'whole_corpus', trigger_source: 'scheduled', reason: 'pg is_carrier probe', is_carrier: true,
+      });
+      await dreams.updateDream(carrier.id, {
+        status: 'completed', completed_at: new Date().toISOString(), acceptance_status: 'pending',
+      });
+
+      expect(await dreams.getLastCompletedDream('default', null, 'whole_corpus')).toBeNull();
+      const pending = await dreams.listPendingDreams(20);
+      expect(pending.some(d => d.id === carrier.id)).toBe(false);
+    });
+
+    it('the v14 backfill UPDATE flips a legacy reason-string row to is_carrier = true', async () => {
+      // Insert a raw legacy-shaped row: is_carrier defaults to FALSE (the
+      // column's default, i.e. the pre-migration state) with reason set to
+      // one of the two historical carrier strings.
+      const inserted = await pool.query(
+        `INSERT INTO dreams (operator_id, mode, trigger_source, reason, status)
+         VALUES ('default', 'whole_corpus', 'scheduled', 'promotion decay archival (R14 audited path)', 'completed')
+         RETURNING id`,
+      );
+      const id = inserted.rows[0].id;
+      expect((await dreams.getDream(id))?.is_carrier).toBe(false);
+
+      // Replay the exact v14 backfill UPDATE.
+      await pool.query(
+        `UPDATE dreams SET is_carrier = TRUE WHERE reason IN
+          ('promotion decay archival (R14 audited path)', 'discovery-maintenance archival (Phase 2 audited path)')`,
+      );
+
+      expect((await dreams.getDream(id))?.is_carrier).toBe(true);
+    });
   });
 
   // ── Phase 3: scope registry + held runs + purge exemption (v11) ──────────
@@ -534,6 +630,112 @@ describe.skipIf(!PG_URL)('PG executed-SQL (real Postgres via KOPENG_PG_TEST_URL)
       // Nothing moved: both rows intact under their original keys.
       const scopes = (await registry.listAll()).map((r) => r.scope).sort();
       expect(scopes).toEqual(['project:alpha-scope', 'project:beta-scope']);
+    });
+
+    it('T76: markDistinct stamps ruled_distinct_at, flips status to confirmed, and round-trips the ISO string; a never-marked row reads null', async () => {
+      await registry.register({
+        scope: 'project:gamma-scope', slug: 'project:gamma-scope',
+        claimant_raw: 'project:gamma-scope', origin_cwd: null, status: 'provisional',
+      });
+      await registry.register({
+        scope: 'project:delta-scope', slug: 'project:delta-scope',
+        claimant_raw: 'project:delta-scope', origin_cwd: null, status: 'provisional',
+      });
+
+      await registry.markDistinct('project:gamma-scope', '2026-08-19T00:00:00.000Z');
+      const rows = await registry.listAll();
+      const marked = rows.find((r) => r.scope === 'project:gamma-scope');
+      const untouched = rows.find((r) => r.scope === 'project:delta-scope');
+
+      expect(marked).toMatchObject({
+        status: 'confirmed',
+        ruled_distinct_at: '2026-08-19T00:00:00.000Z',
+        ruled_at: '2026-08-19T00:00:00.000Z', // COALESCE stamps it too, same as updateStatus
+      });
+      expect(untouched).toMatchObject({
+        status: 'provisional',
+        ruled_distinct_at: null,
+      });
+    });
+
+    it('T76 (Codex round-2): clearDistinct nulls ruled_distinct_at, KEEPS status/ruled_at, and is a no-op on a never-marked row', async () => {
+      await registry.register({
+        scope: 'project:epsilon-scope', slug: 'project:epsilon-scope',
+        claimant_raw: 'project:epsilon-scope', origin_cwd: null, status: 'provisional',
+      });
+      await registry.register({
+        scope: 'project:zeta-scope', slug: 'project:zeta-scope',
+        claimant_raw: 'project:zeta-scope', origin_cwd: null, status: 'provisional',
+      });
+
+      await registry.markDistinct('project:epsilon-scope', '2026-08-19T00:00:00.000Z');
+      // What a merge_into ruling now does after its alias entry lands.
+      await registry.clearDistinct('project:epsilon-scope');
+      await registry.clearDistinct('project:zeta-scope'); // never marked — no-op
+
+      const rows = await registry.listAll();
+      expect(rows.find((r) => r.scope === 'project:epsilon-scope')).toMatchObject({
+        ruled_distinct_at: null,
+        status: 'confirmed',                 // markDistinct's confirm survives
+        ruled_at: '2026-08-19T00:00:00.000Z', // ruling history is kept
+      });
+      expect(rows.find((r) => r.scope === 'project:zeta-scope')).toMatchObject({
+        ruled_distinct_at: null,
+        status: 'provisional',
+        ruled_at: null,
+      });
+    });
+
+    it('blocker 4: setDeferred stamps deferred_at + note WITHOUT touching status/ruled_at; clearDeferred nulls both; a never-deferred row reads null', async () => {
+      await registry.register({
+        scope: 'project:eta-scope', slug: 'project:eta-scope',
+        claimant_raw: 'project:eta-scope', origin_cwd: null, status: 'provisional',
+      });
+      await registry.register({
+        scope: 'project:theta-scope', slug: 'project:theta-scope',
+        claimant_raw: 'project:theta-scope', origin_cwd: null, status: 'provisional',
+      });
+
+      await registry.setDeferred('project:eta-scope', '2026-09-03T00:00:00.000Z', 'Acme family — bulk pass later');
+      let rows = await registry.listAll();
+      expect(rows.find((r) => r.scope === 'project:eta-scope')).toMatchObject({
+        deferred_at: '2026-09-03T00:00:00.000Z',
+        deferred_note: 'Acme family — bulk pass later',
+        // A deferral POSTPONES the judgment — it must not make one.
+        status: 'provisional',
+        ruled_at: null,
+        ruled_distinct_at: null,
+      });
+      expect(rows.find((r) => r.scope === 'project:theta-scope')).toMatchObject({
+        deferred_at: null,
+        deferred_note: null,
+      });
+
+      await registry.clearDeferred('project:eta-scope');
+      await registry.clearDeferred('project:theta-scope'); // never deferred — no-op
+      rows = await registry.listAll();
+      expect(rows.find((r) => r.scope === 'project:eta-scope')).toMatchObject({
+        deferred_at: null,
+        deferred_note: null,
+        status: 'provisional',
+      });
+    });
+
+    it('blocker 4: markDistinct clears an existing deferral in the same statement — a row can never read both ruled and deferred', async () => {
+      await registry.register({
+        scope: 'project:iota-scope', slug: 'project:iota-scope',
+        claimant_raw: 'project:iota-scope', origin_cwd: null, status: 'provisional',
+      });
+      await registry.setDeferred('project:iota-scope', '2026-09-03T00:00:00.000Z', 'undecided');
+      await registry.markDistinct('project:iota-scope', '2026-09-04T00:00:00.000Z');
+
+      const row = (await registry.listAll()).find((r) => r.scope === 'project:iota-scope');
+      expect(row).toMatchObject({
+        ruled_distinct_at: '2026-09-04T00:00:00.000Z',
+        status: 'confirmed',
+        deferred_at: null,
+        deferred_note: null,
+      });
     });
   });
 

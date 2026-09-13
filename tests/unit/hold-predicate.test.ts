@@ -12,7 +12,7 @@
  * All referents synthetic (fixture hygiene).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { buildHoldPredicate } from '../../src/discovery/hold.js';
+import { buildHoldPredicate, buildStrictHoldPredicate } from '../../src/discovery/hold.js';
 import { runDiscovery } from '../../src/discovery/discovery-engine.js';
 import { createTestDatabase, createTestObservationsDb, createTestObservation } from '../fixtures/test-helpers.js';
 import { config } from '../../src/config/config.js';
@@ -39,6 +39,21 @@ describe('buildHoldPredicate (CO5)', () => {
     expect(await isHeld('client:acme-foods')).toBe(false);
   });
 
+  it('T77: an unruled trailing-date scope is held; an alias ruling releases it', async () => {
+    // The date-suffix convention flows through the SHARED predicate: a
+    // newly-matching scope stops minting and starts holding under R-B, exactly
+    // like a wf_ scope — and the alias entry remains the release. Referents
+    // synthetic per this file's header.
+    const unruled = buildHoldPredicate(async (s) => s);
+    expect(await unruled('project:Vendor Packs - 2026-08-21')).toBe(true);
+    expect(await unruled('project:300+')).toBe(true);
+    expect(await unruled('project:budget-2027')).toBe(false); // trailing bare year = real project
+
+    const ruled = buildHoldPredicate(async (s) =>
+      s === 'project:Vendor Packs - 2026-08-21' ? 'project:vendor-packs' : s);
+    expect(await ruled('project:Vendor Packs - 2026-08-21')).toBe(false);
+  });
+
   it('no canonicalize wired → shape-only back-compat', async () => {
     const isHeld = buildHoldPredicate();
     expect(await isHeld('project:wf_ab12cd34')).toBe(true);
@@ -49,6 +64,29 @@ describe('buildHoldPredicate (CO5)', () => {
     const isHeld = buildHoldPredicate(async () => { throw new Error('table down'); });
     expect(await isHeld('project:wf_ab12cd34')).toBe(true);
     expect(await isHeld('project:fuel-dashboard')).toBe(false); // shape gate first, no call
+  });
+});
+
+describe('T76 ruled-distinct release', () => {
+  const canonId = async (s: string) => s; // no alias mapping
+  it('a ruled-distinct ephemeral-shaped scope is NOT held', async () => {
+    const held = buildHoldPredicate(canonId, async (s) => s === 'project:20260901-demo');
+    expect(await held('project:20260901-demo')).toBe(false);
+    expect(await held('project:20260902-other')).toBe(true); // unruled sibling stays held
+  });
+  it('loose variant fails TOWARD holding on a ruled-distinct read failure', async () => {
+    const held = buildHoldPredicate(canonId, async () => { throw new Error('registry down'); });
+    expect(await held('project:20260901-demo')).toBe(true);
+  });
+  it('strict variant THROWS on a read failure instead of answering', async () => {
+    const strict = buildStrictHoldPredicate({ canonicalize: canonId, isRuledDistinct: async () => { throw new Error('registry down'); } });
+    await expect(strict('project:20260901-demo')).rejects.toThrow('registry down');
+  });
+  it('strict and loose agree on every clean input (one predicate, two fail directions)', async () => {
+    const inputs = { canonicalize: canonId, isRuledDistinct: async (s: string) => s === 'project:20260901-demo' };
+    for (const s of ['project:20260901-demo', 'project:20260902-other', 'project:real-name', 'global']) {
+      expect(await buildStrictHoldPredicate(inputs)(s)).toBe(await buildHoldPredicate(inputs.canonicalize, inputs.isRuledDistinct)(s));
+    }
   });
 });
 

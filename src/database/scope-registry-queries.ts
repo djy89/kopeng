@@ -18,6 +18,9 @@ export class ScopeRegistryQueries implements IScopeRegistryStore {
       first_seen: r.first_seen as string,
       updated_at: r.updated_at as string,
       ruled_at: (r.ruled_at as string | null) ?? null,
+      ruled_distinct_at: (r.ruled_distinct_at as string | null) ?? null,
+      deferred_at: (r.deferred_at as string | null) ?? null,
+      deferred_note: (r.deferred_note as string | null) ?? null,
     }));
   }
 
@@ -42,5 +45,41 @@ export class ScopeRegistryQueries implements IScopeRegistryStore {
     this.db.prepare(`
       UPDATE scope_registry SET scope = ?, slug = ?, updated_at = datetime('now') WHERE scope = ?
     `).run(newScope, newSlug, oldScope);
+  }
+
+  async markDistinct(scope: string, ruledAt: string): Promise<void> {
+    // The deferral is cleared in the SAME statement (blocker 4): the ruling is
+    // precisely the decision the deferral postponed, and a row reading both
+    // "deferred" and "ruled distinct" is contradictory residue — the same
+    // reasoning that makes merge_into clear ruled_distinct_at.
+    this.db.prepare(`
+      UPDATE scope_registry
+      SET status = 'confirmed', ruled_distinct_at = ?, ruled_at = COALESCE(ruled_at, ?),
+          deferred_at = NULL, deferred_note = NULL, updated_at = datetime('now')
+      WHERE scope = ?
+    `).run(ruledAt, ruledAt, scope);
+  }
+
+  async setDeferred(scope: string, deferredAt: string, note: string | null): Promise<void> {
+    // status/ruled_at deliberately untouched — see IScopeRegistryStore.
+    this.db.prepare(`
+      UPDATE scope_registry SET deferred_at = ?, deferred_note = ?, updated_at = datetime('now')
+      WHERE scope = ?
+    `).run(deferredAt, note, scope);
+  }
+
+  async clearDeferred(scope: string): Promise<void> {
+    this.db.prepare(`
+      UPDATE scope_registry SET deferred_at = NULL, deferred_note = NULL, updated_at = datetime('now')
+      WHERE scope = ?
+    `).run(scope);
+  }
+
+  async clearDistinct(scope: string): Promise<void> {
+    // `ruled_at` is deliberately kept: the row WAS ruled, twice — the merge is
+    // the current answer, and the earlier ruling's timestamp is still history.
+    this.db.prepare(`
+      UPDATE scope_registry SET ruled_distinct_at = NULL, updated_at = datetime('now') WHERE scope = ?
+    `).run(scope);
   }
 }

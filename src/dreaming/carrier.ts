@@ -7,7 +7,9 @@
  * shared-concept-copy failure mode the Phase 1 meta-finding warns about.
  *
  * Counter semantics (the single definition):
- *  - `memories_examined` = entries RECORDED (attempted), applied or not;
+ *  - `memories_examined` = entries RECORDED (attempted), applied or not, PLUS
+ *    audit-only records (T76: rows whose per-row record lives in
+ *    dream_audit_log and has no diff-entry spelling);
  *  - `changes_auto_applied` = entries that actually applied;
  *  - `acceptance_status` = 'auto_applied' iff anything applied, else 'empty'
  *    (a carrier is never operator-pending — its writers resolve every entry).
@@ -17,20 +19,35 @@
  */
 
 import type { IDreamStore } from '../database/interfaces.js';
-import type { Dream, DreamDiffEntry } from '../types/types.js';
+import type { Dream, DreamDiffEntry, DreamTrigger } from '../types/types.js';
 
 export class CarrierDream {
   private dream: Dream | null = null;
   readonly entries: DreamDiffEntry[] = [];
   private applied = 0;
+  private auditOnly = 0;
 
-  constructor(private dreamStore: IDreamStore, private reason: string) {}
+  constructor(
+    private dreamStore: IDreamStore,
+    private reason: string,
+    private opts: { trigger_source?: DreamTrigger; scope?: string | null } = {},
+  ) {}
 
   /** Create the carrier row on first call; idempotent thereafter. */
   async open(): Promise<Dream> {
     if (!this.dream) {
       this.dream = await this.dreamStore.createDream({
-        mode: 'whole_corpus', trigger_source: 'scheduled', reason: this.reason,
+        mode: 'whole_corpus',
+        trigger_source: this.opts.trigger_source ?? 'scheduled',
+        reason: this.reason,
+        // T76: the carrier's scope, when its writer works one scope (the
+        // archive-ephemeral action does). Omitted by the corpus-wide callers,
+        // where the row genuinely has no single scope.
+        scope: this.opts.scope ?? null,
+        // T-H3: the WRITE site is part of the contract — a carrier created
+        // through the helper is excluded from the scheduler/review queries by
+        // COLUMN, never by reason-string matching.
+        is_carrier: true,
       });
     }
     return this.dream;
@@ -55,6 +72,18 @@ export class CarrierDream {
     this.entries.push(entry);
   }
 
+  /**
+   * T76: count-only record for operations whose per-row record lives in
+   * dream_audit_log (archive_ephemeral is audit-only — tsc refuses it as a
+   * diff-entry class, deliberately). Keeps finalize()'s counters truthful
+   * while output_diff stays empty; dream-history falls back to the row
+   * counters for exactly this case.
+   */
+  recordAuditOnly(applied: boolean): void {
+    if (applied) this.applied++;
+    this.auditOnly++;
+  }
+
   /** Persist the diff + completion. No-op if the carrier was never opened. */
   async finalize(at: Date = new Date()): Promise<void> {
     if (!this.dream) return;
@@ -63,7 +92,7 @@ export class CarrierDream {
       status: 'completed',
       completed_at: at.toISOString(),
       acceptance_status: this.applied > 0 ? 'auto_applied' : 'empty',
-      memories_examined: this.entries.length,
+      memories_examined: this.entries.length + this.auditOnly,
       changes_auto_applied: this.applied,
       changes_queued: 0,
     });

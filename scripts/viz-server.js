@@ -71,6 +71,8 @@ const ADMIN_ROUTES = [
   { method: 'POST', re: /^\/api\/admin\/backup(?:\?|$)/ },
   { method: 'POST', re: /^\/api\/discover(?:\?|$)/ },
   { method: 'POST', re: /^\/api\/admin\/discovery\/maintain(?:\?|$)/ },
+  { method: 'POST', re: /^\/api\/admin\/scopes\/rule(?:\?|$)/ },
+  { method: 'POST', re: /^\/api\/admin\/scopes\/archive-ephemeral(?:\?|$)/ },
 ];
 function needsAdminKey(req) {
   return ADMIN_ROUTES.some((r) => r.method === req.method && r.re.test(req.url));

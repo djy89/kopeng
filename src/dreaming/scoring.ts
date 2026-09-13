@@ -65,6 +65,50 @@ export function isAnchored(m: AnchorInputs): boolean {
   return !!m.is_locked || m.confidence >= 1.0 || isPinnedMetadata(m.metadata);
 }
 
+/**
+ * The Hard Anchor in SQL, one dialect each — the `ARCHIVED_SQL_PREDICATE`
+ * precedent (src/utils/archived.ts). It lives HERE, beside `isAnchored`,
+ * because it is the same contract in another language: a per-backend spelling
+ * buried in queries.ts / pg-queries.ts would be a fourth and fifth definition
+ * of "anchored", and this file's whole reason for existing is that there is
+ * exactly one. `tests/unit/anchored-aggregate.test.ts` pins SQL ≡ TS over a
+ * corpus exercising all three spellings; the PG twin is in the executed-SQL
+ * suite.
+ *
+ * The dialects genuinely differ and cannot be one string: Postgres stores
+ * `metadata` as JSONB (so `->>` is exact and total), while SQLite stores TEXT
+ * and `json_extract` RAISES on malformed JSON — which would take down the
+ * whole aggregate query for every scope because of one bad row. Hence the
+ * `json_valid` CASE, which is lazily evaluated where a bare `AND` is not
+ * guaranteed to short-circuit.
+ */
+export const ANCHORED_SQL_PREDICATE = {
+  // `json_type(...) = 'true'`, NEVER `json_extract(...) = 1`: json_extract maps
+  // both JSON `true` and the integer 1 to the SQL value 1, so `{"pinned":1}`
+  // would count as anchored while `isPinnedMetadata`'s strict `=== true`
+  // rejects it — the panel would promise an archive refuses a row that
+  // `auditedArchiveMemory` then archives. json_type distinguishes 'true' from
+  // 'integer'. (This exact trap is documented at the `legacy_anchor_count`
+  // query in queries.ts; the first draft here reintroduced the spelling that
+  // comment exists to reject.)
+  //
+  // COALESCE, not a bare comparison: json_type yields NULL for a missing key —
+  // and `metadata` DEFAULTs to '{}' on both backends — so the raw predicate is
+  // three-valued. Both current call sites treat NULL as false, but this is an
+  // exported general-purpose constant, and the first caller to write
+  // `WHERE NOT (…)` would otherwise get zero rows for nearly the whole corpus.
+  sqlite:
+    "(is_locked = 1 OR confidence >= 1.0 OR COALESCE("
+    + "(CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.pinned') ELSE NULL END) = 'true'"
+    + ", 0))",
+  // `metadata->'pinned' = 'true'::jsonb` (jsonb equality), not
+  // `metadata->>'pinned' = 'true'` (text): `->>` unquotes scalars, so the JSON
+  // STRING "true" would also match while isAnchored rejects it. Same
+  // divergence class as the SQLite trap above, opposite backend.
+  postgres:
+    "(is_locked OR confidence >= 1.0 OR COALESCE(metadata->'pinned' = 'true'::jsonb, FALSE))",
+} as const;
+
 /** `metadata.pinned === true` — the operator pin promotion always honored and
  *  the dream/maintenance paths ignored until CR-1 unified them here. */
 export function isPinnedMetadata(metadata: string | null | undefined): boolean {

@@ -385,6 +385,48 @@ const migrations: Migration[] = [
       ALTER TABLE memory_revisions ADD COLUMN IF NOT EXISTS is_locked BOOLEAN;
     `,
   },
+  {
+    version: 13,
+    name: 't76_scope_registry_ruled_distinct',
+    sql: `
+      -- T76 Phase A: "distinct" is ONE fact with one home. A dedicated column,
+      -- not status: every ruling confirms (merge_into confirms the merged-away
+      -- row), so status cannot carry "distinct" (spec T-C1).
+      ALTER TABLE scope_registry ADD COLUMN IF NOT EXISTS ruled_distinct_at TIMESTAMPTZ;
+    `,
+  },
+  {
+    version: 14,
+    name: 't76_dreams_is_carrier',
+    sql: `
+      -- T76 (F-5): carrier identity is a column, not two hard-coded reason
+      -- strings matched in exclusion queries. Backfill covers the two writers
+      -- that existed before the column (values frozen here on purpose).
+      ALTER TABLE dreams ADD COLUMN IF NOT EXISTS is_carrier BOOLEAN NOT NULL DEFAULT FALSE;
+      UPDATE dreams SET is_carrier = TRUE WHERE reason IN ('promotion decay archival (R14 audited path)', 'discovery-maintenance archival (Phase 2 audited path)');
+    `,
+  },
+  {
+    version: 15,
+    name: 't76_audit_archive_ephemeral',
+    sql: `
+      -- T76 (F-2): truthful audit class for the ephemeral-scope bulk archive.
+      ALTER TABLE dream_audit_log DROP CONSTRAINT IF EXISTS dream_audit_log_change_class_check;
+      ALTER TABLE dream_audit_log ADD CONSTRAINT dream_audit_log_change_class_check
+        CHECK(change_class IN ('exact_dup', 'decay', 'merge', 'supersede', 'reinforce', 'promote_global', 'rollback', 'conditional', 'archive_ephemeral'));
+    `,
+  },
+  {
+    version: 16,
+    name: 'blocker4_scope_registry_deferral',
+    sql: `
+      -- Blocker 4 (deferral marking): dedicated columns mirroring
+      -- ruled_distinct_at (one fact, one home). NOT a status value: a deferral
+      -- POSTPONES the identity judgment while every status asserts one.
+      ALTER TABLE scope_registry ADD COLUMN IF NOT EXISTS deferred_at TIMESTAMPTZ;
+      ALTER TABLE scope_registry ADD COLUMN IF NOT EXISTS deferred_note TEXT;
+    `,
+  },
 ];
 
 export async function runPgMigrations(pool: pg.Pool): Promise<void> {

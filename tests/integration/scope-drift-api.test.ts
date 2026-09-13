@@ -37,9 +37,13 @@ function configStoreStub(blob: string): IOperatorConfigStore {
   } as unknown as IOperatorConfigStore;
 }
 
+/** Extra seed row: the fixture helper pins `source` to null, so tests that
+ *  care about the source column set it explicitly on the way past. */
+type ExtraRow = { scope: string; type: 'project' | 'reference' | 'discovery'; content: string; source: string | null };
+
 async function buildApp(
   configBlob: string | null,
-  opts: { withAliasService?: boolean } = {},
+  opts: { withAliasService?: boolean; extraRows?: ExtraRow[] } = {},
 ): Promise<{ app: FastifyInstance; db: Database.Database }> {
   const db = new Database(':memory:');
   db.pragma('journal_mode = WAL');
@@ -53,6 +57,13 @@ async function buildApp(
   await queries.store(createTestMemory({ scope: 'client:Acme-Foods', type: 'discovery', content: 'drifted one' }));
   await queries.store(createTestMemory({ scope: 'project:solo', type: 'project', content: 'unrelated' }));
   await queries.store(createTestMemory({ scope: 'project:wf_ab12cd', type: 'discovery', content: 'ephemeral' }));
+
+  for (const row of opts.extraRows ?? []) {
+    await queries.store({
+      ...createTestMemory({ scope: row.scope, type: row.type, content: row.content }),
+      source: row.source,
+    });
+  }
 
   const embeddingIndex = new EmbeddingIndex();
   await embeddingIndex.loadFromDatabase([]);
@@ -102,6 +113,37 @@ describe('GET /api/ops/scope-drift', () => {
 
     // Ephemeral scopes are reported separately, never as an alias proposal.
     expect(data.ephemeral.map((e: { scope: string }) => e.scope)).toContain('project:wf_ab12cd');
+
+    await app.close(); db.close();
+  });
+
+  // by_source is the evidence field that settled the cross-prefix rulings
+  // (a ~96%-auto-discovery side against a side with none), and it comes out of
+  // the real GROUP BY (scope, type, source) — the unit tests exercise the fold
+  // with hand-built rows, so only this one proves the SQL actually selects the
+  // column and that a NULL source lands under "unknown".
+  it('folds by_source out of the real SQL query, with a NULL source as "unknown"', async () => {
+    ({ app, db } = await buildApp('{}', {
+      extraRows: [
+        { scope: 'client:beta-corp', type: 'discovery', content: 'beta auto one', source: 'auto-discovery' },
+        { scope: 'client:beta-corp', type: 'discovery', content: 'beta auto two', source: 'auto-discovery' },
+        { scope: 'client:beta-corp', type: 'project', content: 'beta hand-written', source: null },
+        { scope: 'client:Beta-Corp', type: 'discovery', content: 'beta variant', source: 'auto-discovery' },
+      ],
+    }));
+    const res = await app.inject({ method: 'GET', url: '/api/ops/scope-drift' });
+    expect(res.statusCode).toBe(200);
+    const { data } = res.json();
+
+    type Variant = { scope: string; by_source: Record<string, number>; by_type: Record<string, number>; active: number };
+    const cluster = data.clusters.find((c: { key: string }) => c.key === 'client:beta-corp');
+    expect(cluster).toBeDefined();
+    const canonical = cluster.variants.find((v: Variant) => v.scope === 'client:beta-corp');
+    expect(canonical.by_source).toEqual({ 'auto-discovery': 2, unknown: 1 });
+    expect(canonical.by_type).toEqual({ discovery: 2, project: 1 });
+    expect(canonical.active).toBe(3);
+    const variant = cluster.variants.find((v: Variant) => v.scope === 'client:Beta-Corp');
+    expect(variant.by_source).toEqual({ 'auto-discovery': 1 });
 
     await app.close(); db.close();
   });

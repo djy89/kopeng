@@ -27,6 +27,44 @@ describe('decideMint', () => {
     expect(d).toEqual({ kind: 'pass', scope: 'project:wf_ab12cd34-e5f-1' });
   });
 
+  describe('T77 shapes at the minting consumer (team review H2)', () => {
+    it.each([
+      'project:Vendor Packs - 2026-08-21', // trailing date
+      'project:300+',                      // +-suffixed bare number
+      'project:Sprint 12',                 // sprint counter
+    ])('UNKNOWN ephemeral-shaped raw passes raw, unregistered (R-B upstream): %s', (raw) => {
+      expect(decideMint(raw, 'C:/dev/somewhere', ctx([]))).toEqual({ kind: 'pass', scope: raw });
+    });
+
+    it('a raw the registry ALREADY KNOWS as a claimant keeps resolving to its canonical — widening the ephemeral rules must not split an already-minted scope', () => {
+      // Pre-T77, 'project:Sprint 12' minted to its slug canonical. If the
+      // widened rules short-circuited it, new rows would land on the RAW
+      // string while history sits on the canonical, the registry row would
+      // orphan as provisional forever (rows are never deleted), and the split
+      // would be invisible to the drift panel (both spellings read ephemeral
+      // and are skipped before clustering). Continuity wins; the operator can
+      // still rule the scope away later.
+      const registered = row({
+        scope: 'project:sprint-12', slug: 'project:sprint-12',
+        claimant_raw: 'project:Sprint 12', origin_cwd: 'C:/dev/Sprint 12',
+      });
+      expect(decideMint('project:Sprint 12', 'C:/dev/Sprint 12', ctx([registered])))
+        .toEqual({ kind: 'resolve', scope: 'project:sprint-12' });
+      // Moved origin still lands home — the claimant string is primary identity.
+      expect(decideMint('project:Sprint 12', 'D:/moved/Sprint 12', ctx([registered])))
+        .toEqual({ kind: 'resolve', scope: 'project:sprint-12' });
+    });
+
+    it('a raw that IS a registered ephemeral-shaped canonical stays on it (explicit write)', () => {
+      const canonical = row({
+        scope: 'project:vendor-packs-2026-08-21', slug: 'project:vendor-packs-2026-08-21',
+        claimant_raw: 'project:Vendor Packs - 2026-08-21', origin_cwd: null,
+      });
+      expect(decideMint('project:vendor-packs-2026-08-21', null, ctx([canonical])))
+        .toEqual({ kind: 'pass', scope: 'project:vendor-packs-2026-08-21' });
+    });
+  });
+
   it('fresh mint slug-adopts and registers provisional (done-when install one)', () => {
     const d = decideMint('project:My Project', 'C:/dev/My Project', ctx([]));
     expect(d.kind).toBe('mint');
@@ -87,5 +125,15 @@ describe('decideMint', () => {
     const selfNamed = row({ scope: 'project:tools-x', slug: 'project:tools-x', claimant_raw: 'project:tools-x', origin_cwd: 'C:/a/tools-x' });
     expect(decideMint('project:tools-x', 'C:/b/tools-x', ctx([selfNamed])))
       .toEqual({ kind: 'pass', scope: 'project:tools-x' });
+  });
+
+  it('T76: a ruled-distinct (registered) ephemeral-shaped scope resolves like a real project — the T77 guard is the release, no new minting rule', () => {
+    const registered: ScopeRegistryRow = {
+      scope: 'project:20260901-demo', slug: 'project:20260901-demo', claimant_raw: 'project:20260901-demo',
+      origin_cwd: null, status: 'confirmed', reserved: false,
+      first_seen: '2026-09-01', updated_at: '2026-09-01', ruled_at: '2026-09-01', ruled_distinct_at: '2026-09-01',
+    };
+    const ctx2 = buildMintContext([registered], null);
+    expect(decideMint('project:20260901-demo', null, ctx2)).toEqual({ kind: 'pass', scope: 'project:20260901-demo' });
   });
 });

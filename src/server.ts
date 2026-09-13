@@ -252,10 +252,14 @@ export async function composeServer(deps: ComposeServerDeps = {}): Promise<Compo
       // Critical).
       async (raw: string, origin: string | null) =>
         (await resolveWriteThroughAliases(scopeAliases, scopeRegistry, raw, origin)).scope,
-      // Round-2 CO5: held iff ephemeral-shaped AND not alias-mapped — a ruled
-      // ephemeral scope's observations resolve to the target instead of being
-      // held forever.
-      buildHoldPredicate(scopeAliases ? (s: string) => scopeAliases.canonicalize(s) : undefined)
+      // Round-2 CO5, extended by T76 §5.3: held iff ephemeral-shaped AND not
+      // ruled-distinct AND not alias-mapped — a ruled (alias-mapped OR
+      // mark_distinct'd) ephemeral scope's observations resolve instead of
+      // being held forever.
+      buildHoldPredicate(
+        scopeAliases ? (s: string) => scopeAliases.canonicalize(s) : undefined,
+        (s: string) => scopeRegistry.isRuledDistinct(s),
+      )
     );
   }
 

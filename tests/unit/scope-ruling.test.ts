@@ -344,10 +344,10 @@ describe('POST /api/admin/scopes/rule (Phase 3 Task 11)', () => {
     expect(await storedAliases()).toEqual({ 'project:my-project': 'project:fuel-dashboard' });
   });
 
-  it('404 when the scope has no registry row', async () => {
-    const res = await rule({ scope: 'project:nope', action: 'confirm' });
+  it('404 for a non-scope-form string with no registry row (T76: scope-form strings register-then-rule instead)', async () => {
+    const res = await rule({ scope: 'not-a-scope', action: 'confirm' });
     expect(res.statusCode).toBe(404);
-    expect(res.json().error).toBe('No registry row for scope "project:nope"');
+    expect(res.json().error).toBe('No registry row for scope "not-a-scope" and it is not a registrable scope form');
   });
 
   it('a merge_into that would form an alias chain is refused 400 and leaves scope_aliases unchanged', async () => {
@@ -504,5 +504,141 @@ describe('POST /api/admin/scopes/rule (Phase 3 Task 11)', () => {
       { 'x-api-key': 'test-admin-key-123' },
     );
     expect(allowed.statusCode).toBe(200);
+  });
+});
+
+describe('T76 mark_distinct + register-then-rule', () => {
+  it('mark_distinct confirms the row and stamps ruled_distinct_at', async () => {
+    await registryStore.register({
+      scope: 'project:20260901-demo', slug: 'project:20260901-demo',
+      claimant_raw: 'project:20260901-demo', origin_cwd: null, status: 'provisional',
+    });
+
+    const res = await rule({ scope: 'project:20260901-demo', action: 'mark_distinct' });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.data.status).toBe('confirmed');
+    expect(body.data.ruled_distinct_at).toBeTruthy();
+
+    const row = await registryRow('project:20260901-demo');
+    expect(row?.ruled_distinct_at).toBeTruthy();
+    expect(row?.status).toBe('confirmed');
+  });
+
+  // Codex round-2 item 3: the two rulings are mutually exclusive answers to the
+  // same question, and the alias is the one that governs (holdVerdict, the write
+  // path, recall). A row reading BOTH would leave the drift panel hiding the
+  // variant's buttons on a ruling the merge already overrode.
+  it('a successful merge_into SUPERSEDES a prior mark_distinct: the alias lands and ruled_distinct_at is cleared', async () => {
+    await registryStore.register({
+      scope: 'project:20260901-demo', slug: 'project:20260901-demo',
+      claimant_raw: 'project:20260901-demo', origin_cwd: null, status: 'provisional',
+    });
+
+    const distinct = await rule({ scope: 'project:20260901-demo', action: 'mark_distinct' });
+    expect(distinct.statusCode).toBe(200);
+    expect((await registryRow('project:20260901-demo'))?.ruled_distinct_at).toBeTruthy();
+
+    const merged = await rule({
+      scope: 'project:20260901-demo', action: 'merge_into', target: 'project:demo-workspace',
+    });
+    expect(merged.statusCode).toBe(200);
+
+    expect(await storedAliases()).toMatchObject({ 'project:20260901-demo': 'project:demo-workspace' });
+    const row = await registryRow('project:20260901-demo');
+    expect(row?.ruled_distinct_at).toBeNull();  // superseded
+    expect(row?.status).toBe('confirmed');
+    expect(row?.ruled_at).not.toBeNull();       // the ruling history is kept
+  });
+
+  it('merge_into on a never-marked row is unaffected (clearDistinct is a no-op UPDATE)', async () => {
+    await registryStore.register({
+      scope: 'project:20260901-other', slug: 'project:20260901-other',
+      claimant_raw: 'project:20260901-other', origin_cwd: null, status: 'provisional',
+    });
+
+    const merged = await rule({
+      scope: 'project:20260901-other', action: 'merge_into', target: 'project:demo-workspace',
+    });
+    expect(merged.statusCode).toBe(200);
+    expect((await registryRow('project:20260901-other'))?.ruled_distinct_at).toBeNull();
+  });
+
+  it('register-then-rule: an UNREGISTERED scope-form scope gets a provisional row, then the ruling APPLIES — for confirm, merge_into, AND mark_distinct (F-4)', async () => {
+    // Each case asserts the ruling's EFFECT, not just the 200 and the row's
+    // existence: registering and then silently dropping the ruling would still
+    // produce a row, which is exactly the failure this test has to exclude.
+    const cases: Array<{ scope: string; payload: Record<string, unknown>; verify: () => Promise<void> }> = [
+      {
+        scope: 'project:legacy-a',
+        payload: { scope: 'project:legacy-a', action: 'confirm' },
+        verify: async () => {
+          expect((await registryRow('project:legacy-a'))?.status).toBe('confirmed');
+        },
+      },
+      {
+        scope: 'project:Legacy-B',
+        payload: { scope: 'project:Legacy-B', action: 'merge_into', target: 'project:legacy-b' },
+        verify: async () => {
+          expect(await storedAliases()).toMatchObject({ 'project:Legacy-B': 'project:legacy-b' });
+          expect((await registryRow('project:Legacy-B'))?.status).toBe('confirmed');
+        },
+      },
+      {
+        scope: 'project:legacy-c',
+        payload: { scope: 'project:legacy-c', action: 'mark_distinct' },
+        verify: async () => {
+          const row = await registryRow('project:legacy-c');
+          expect(row?.ruled_distinct_at).toBeTruthy();
+          expect(row?.status).toBe('confirmed');
+        },
+      },
+    ];
+    for (const { scope, payload, verify } of cases) {
+      const res = await rule(payload);
+      expect(res.statusCode, scope).toBe(200);
+      expect(await registryRow(scope), scope).toBeDefined();
+      await verify();
+    }
+  });
+
+  // Both refusals are hoisted above the register-then-rule block: a rejected
+  // ruling must not leave a registry row behind as its only trace.
+  it('refuses a ruling ON "global" with a 400 and registers nothing', async () => {
+    for (const action of ['confirm', 'mark_distinct'] as const) {
+      const res = await rule({ scope: 'global', action });
+      expect(res.statusCode, action).toBe(400);
+      expect(res.json().error, action).toMatch(/global/);
+      expect(await registryRow('global'), action).toBeUndefined();
+    }
+    const merge = await rule({ scope: 'global', action: 'merge_into', target: 'project:somewhere' });
+    expect(merge.statusCode).toBe(400);
+    expect(await registryRow('global')).toBeUndefined();
+    expect(await storedAliases()).toBeUndefined();
+  });
+
+  it('refuses a "global" TARGET on an unregistered scope with a 400 and registers nothing', async () => {
+    const res = await rule({ scope: 'project:not-yet-known', action: 'merge_into', target: 'global' });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/target cannot be "global"/);
+    // The refusal precedes registration — no residue from a rejected ruling.
+    expect(await registryRow('project:not-yet-known')).toBeUndefined();
+    expect(await storedAliases()).toBeUndefined();
+  });
+
+  it('register-then-rule does NOT register non-scope-form strings (404 stands) and reserved rows still refuse (400)', async () => {
+    // Mirror server.ts's boot seed for the reserved triage scope. Registered
+    // BEFORE any rule() call so the service's cache picks it up on its first
+    // load rather than reading a snapshot cached before the store write.
+    await registryStore.register({
+      scope: 'project:_unrouted', slug: 'project:unrouted',
+      claimant_raw: 'project:_unrouted', origin_cwd: null, status: 'confirmed', reserved: true,
+    });
+
+    const bad = await rule({ scope: 'not-a-scope', action: 'confirm' });
+    expect(bad.statusCode).toBe(404);
+
+    const reserved = await rule({ scope: 'project:_unrouted', action: 'mark_distinct' });
+    expect(reserved.statusCode).toBe(400);
   });
 });

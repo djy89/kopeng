@@ -39,6 +39,44 @@ export class PgScopeRegistryQueries implements IScopeRegistryStore {
       [newScope, newSlug, oldScope]
     );
   }
+
+  async markDistinct(scope: string, ruledAt: string): Promise<void> {
+    // Clears the deferral in the SAME statement (blocker 4) — the ruling is
+    // the decision the deferral postponed; see the SQLite twin.
+    await this.pool.query(
+      `UPDATE scope_registry
+       SET status = 'confirmed', ruled_distinct_at = $1, ruled_at = COALESCE(ruled_at, $1),
+           deferred_at = NULL, deferred_note = NULL, updated_at = NOW()
+       WHERE scope = $2`,
+      [ruledAt, scope]
+    );
+  }
+
+  async setDeferred(scope: string, deferredAt: string, note: string | null): Promise<void> {
+    // status/ruled_at deliberately untouched — see IScopeRegistryStore.
+    await this.pool.query(
+      `UPDATE scope_registry SET deferred_at = $1, deferred_note = $2, updated_at = NOW()
+       WHERE scope = $3`,
+      [deferredAt, note, scope]
+    );
+  }
+
+  async clearDeferred(scope: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE scope_registry SET deferred_at = NULL, deferred_note = NULL, updated_at = NOW()
+       WHERE scope = $1`,
+      [scope]
+    );
+  }
+
+  async clearDistinct(scope: string): Promise<void> {
+    // `ruled_at` is deliberately kept: the row WAS ruled, twice — the merge is
+    // the current answer, and the earlier ruling's timestamp is still history.
+    await this.pool.query(
+      `UPDATE scope_registry SET ruled_distinct_at = NULL, updated_at = NOW() WHERE scope = $1`,
+      [scope]
+    );
+  }
 }
 
 function toIso(v: unknown): string {
@@ -61,5 +99,8 @@ function rowToRegistryRow(row: Record<string, unknown>): ScopeRegistryRow {
     first_seen: toIso(row.first_seen),
     updated_at: toIso(row.updated_at),
     ruled_at: toIsoOrNull(row.ruled_at),
+    ruled_distinct_at: toIsoOrNull(row.ruled_distinct_at),
+    deferred_at: toIsoOrNull(row.deferred_at),
+    deferred_note: (row.deferred_note as string | null) ?? null,
   };
 }

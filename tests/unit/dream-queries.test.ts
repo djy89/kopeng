@@ -4,6 +4,7 @@ import { createTestDatabase, createTestMemory } from '../fixtures/test-helpers.j
 import { DreamQueries } from '../../src/database/dream-queries.js';
 import { REVISION_KEEP_PER_MEMORY } from '../../src/types/types.js';
 import { MemoryQueries } from '../../src/database/queries.js';
+import { CarrierDream } from '../../src/dreaming/carrier.js';
 
 /**
  * D0.2 — Dreaming-layer store round-trips (SQLite).
@@ -204,6 +205,18 @@ describe('DreamQueries (D0.2, SQLite)', () => {
       expect(log[1].applied_automatically).toBe(false);
       expect(log[0].change_class).toBe('decay');
     });
+
+    it("T76 (F-2): 'archive_ephemeral' round-trips the dream_audit_log CHECK", async () => {
+      const d = await dreams.createDream({});
+      await dreams.appendAudit({
+        dream_id: d.id, memory_id: null, revision_id: null,
+        change_class: 'archive_ephemeral', action: 'archive',
+        applied_automatically: true, before_ref: null, after_ref: 'archived',
+      });
+      const log = await dreams.listAuditForDream(d.id);
+      expect(log).toHaveLength(1);
+      expect(log[0].change_class).toBe('archive_ephemeral');
+    });
   });
 
   describe('reinforcement / anchor', () => {
@@ -349,5 +362,68 @@ describe('revision retention, purge, and peek (team-review #22)', () => {
     expect(logCount()).toBe(base);
     await queries.get(id);
     expect(logCount()).toBe(base + 1);
+  });
+});
+
+describe('T76 is_carrier column (F-5/T-H3)', () => {
+  let db: Database.Database;
+  let dreams: DreamQueries;
+
+  beforeEach(() => {
+    const t = createTestDatabase();
+    db = t.db;
+    dreams = new DreamQueries(db);
+  });
+
+  it('a carrier created THROUGH the helper is excluded from the once-per-period gate with NO reason-string involvement', async () => {
+    const carrier = new CarrierDream(dreams, 'a brand-new third carrier reason nobody hardcoded');
+    await carrier.open();
+    await carrier.finalize();
+    expect(await dreams.getLastCompletedDream('default', null, 'whole_corpus')).toBeNull();
+    expect(await dreams.listPendingDreams(10)).toEqual([]);
+  });
+
+  it('createDream({is_carrier:true}) round-trips; default is false', async () => {
+    const c = await dreams.createDream({ is_carrier: true });
+    expect((await dreams.getDream(c.id))?.is_carrier).toBe(true);
+    const plain = await dreams.createDream({});
+    expect((await dreams.getDream(plain.id))?.is_carrier).toBe(false);
+  });
+
+  it('legacy reason-string carriers read is_carrier after the v12 backfill', async () => {
+    // The two reason strings are HARD-CODED here, deliberately, rather than
+    // imported from types.ts: they mirror the FROZEN text baked into the v12
+    // migration's backfill, which can never change retroactively for rows
+    // already in a deployed database. Importing the constants would make this
+    // test agree with a renamed constant — or with a migration typo — instead
+    // of catching either. If a constant is edited, this test SHOULD fail.
+    const LEGACY_PROMOTION_REASON = 'promotion decay archival (R14 audited path)';
+    const LEGACY_MAINTENANCE_REASON = 'discovery-maintenance archival (Phase 2 audited path)';
+
+    // Insert a raw legacy-shaped row directly: is_carrier explicitly 0 (the
+    // pre-migration default) with reason set to one of the two historical
+    // carrier strings — the shape a real pre-T76 carrier row had.
+    const info = db.prepare(
+      `INSERT INTO dreams (operator_id, mode, trigger_source, reason, status, is_carrier)
+       VALUES ('default', 'whole_corpus', 'scheduled', ?, 'completed', 0)`
+    ).run(LEGACY_PROMOTION_REASON);
+    const id = Number(info.lastInsertRowid);
+    expect((await dreams.getDream(id))?.is_carrier).toBe(false);
+
+    // createTestDatabase() applies every migration up front, so the v12
+    // backfill already ran before this row existed. Replay the exact backfill
+    // statement to prove it correctly flips a legacy reason-string row.
+    db.prepare(
+      `UPDATE dreams SET is_carrier = 1 WHERE reason IN (?, ?)`
+    ).run(LEGACY_PROMOTION_REASON, LEGACY_MAINTENANCE_REASON);
+
+    expect((await dreams.getDream(id))?.is_carrier).toBe(true);
+  });
+
+  it('carrier stamps trigger_source from the option (T-M6: the archive carrier is "manual")', async () => {
+    const carrier = new CarrierDream(dreams, 'r', { trigger_source: 'manual' });
+    const d = await carrier.open();
+    expect(d.trigger_source).toBe('manual');
+    expect(d.is_carrier).toBe(true);
   });
 });

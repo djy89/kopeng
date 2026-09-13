@@ -441,6 +441,57 @@ const migrations: Migration[] = [
       `ALTER TABLE memory_revisions ADD COLUMN is_locked INTEGER`,
     ],
   },
+  {
+    version: 11,
+    description: "T76 Phase A: scope_registry.ruled_distinct_at — the mark_distinct ruling's one home (a dedicated column, NOT status, because EVERY ruling confirms)",
+    up: [
+      `ALTER TABLE scope_registry ADD COLUMN ruled_distinct_at TEXT`,
+    ],
+  },
+  {
+    version: 12,
+    description: "T76 (F-5): dreams.is_carrier — carrier identity becomes a persisted column; backfilled from the two historical reason strings so a THIRD carrier reason can never silently satisfy the whole-corpus sweep gate (the P3 deadlock class)",
+    up: [
+      `ALTER TABLE dreams ADD COLUMN is_carrier INTEGER NOT NULL DEFAULT 0 CHECK(is_carrier IN (0, 1))`,
+      `UPDATE dreams SET is_carrier = 1 WHERE reason IN ('promotion decay archival (R14 audited path)', 'discovery-maintenance archival (Phase 2 audited path)')`,
+    ],
+  },
+  {
+    version: 13,
+    description: "T76 (F-2): 'archive_ephemeral' joins the dream_audit_log change_class CHECK — the ephemeral-scope bulk archive needs a truthful audit class ('decay' would be false audit data)",
+    up: [
+      `CREATE TABLE IF NOT EXISTS dream_audit_log_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dream_id INTEGER NOT NULL REFERENCES dreams(id) ON DELETE CASCADE,
+        memory_id INTEGER,
+        revision_id INTEGER,
+        change_class TEXT NOT NULL
+          CHECK(change_class IN ('exact_dup', 'decay', 'merge', 'supersede', 'reinforce', 'promote_global', 'rollback', 'conditional', 'archive_ephemeral')),
+        action TEXT,
+        applied_automatically INTEGER NOT NULL DEFAULT 0 CHECK(applied_automatically IN (0, 1)),
+        before_ref TEXT,
+        after_ref TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      )`,
+      `INSERT INTO dream_audit_log_new (id, dream_id, memory_id, revision_id, change_class,
+        action, applied_automatically, before_ref, after_ref, created_at)
+       SELECT id, dream_id, memory_id, revision_id, change_class,
+        action, applied_automatically, before_ref, after_ref, created_at
+       FROM dream_audit_log`,
+      `DROP TABLE dream_audit_log`,
+      `ALTER TABLE dream_audit_log_new RENAME TO dream_audit_log`,
+      `CREATE INDEX IF NOT EXISTS idx_dream_audit_dream ON dream_audit_log(dream_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_dream_audit_memory ON dream_audit_log(memory_id)`,
+    ],
+  },
+  {
+    version: 14,
+    description: "Blocker 4 (deferral marking): scope_registry.deferred_at + deferred_note — dedicated columns mirroring ruled_distinct_at (one fact, one home). NOT a status: a deferral POSTPONES the identity judgment, while every status value asserts one",
+    up: [
+      `ALTER TABLE scope_registry ADD COLUMN deferred_at TEXT`,
+      `ALTER TABLE scope_registry ADD COLUMN deferred_note TEXT`,
+    ],
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

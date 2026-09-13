@@ -112,6 +112,15 @@ export class ConsolidationLockManager implements IConsolidationLock {
    *
    * R4: while `fn` runs, a heartbeat re-acquires (same-holder TTL extension) every
    * `heartbeatMs`, so a pass longer than the TTL is not stale-stolen mid-write.
+   *
+   * The release is caught, not propagated: a `finally` that throws REPLACES the
+   * value the block was returning, so a store error on the way out would destroy
+   * a successful `fn` result — every locked route (archive-ephemeral, dream
+   * resolve/trigger, manual promote) would report a failure for work that
+   * actually landed. Fixed at this one definition rather than per-route. The
+   * unreleased row is self-healing: the stale-TTL check frees it on the next
+   * acquire attempt. When `fn` itself threw, its error still wins — the catch
+   * here only stops the release from masking it.
    */
   async withLock<T>(fn: () => Promise<T>): Promise<WithLockResult<T>> {
     const acquired = await this.acquire();
@@ -135,9 +144,16 @@ export class ConsolidationLockManager implements IConsolidationLock {
       return { acquired: true, result };
     } finally {
       if (heartbeat) clearInterval(heartbeat);
-      const released = await this.release();
-      if (!released) {
-        logger.warn(`Consolidation lock release was a no-op for '${this.holder}' (stale-stolen mid-run?)`);
+      try {
+        const released = await this.release();
+        if (!released) {
+          logger.warn(`Consolidation lock release was a no-op for '${this.holder}' (stale-stolen mid-run?)`);
+        }
+      } catch (err) {
+        logger.warn(
+          `Consolidation lock release FAILED for '${this.holder}' — the lock row may stay held ` +
+          `until its TTL expires; the completed work is reported as normal:`, err
+        );
       }
     }
   }

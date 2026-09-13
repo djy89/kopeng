@@ -329,6 +329,8 @@ export interface IDreamStore {
     window_key?: string | null;
     input_obs_start_id?: number | null;
     input_obs_end_id?: number | null;
+    /** T76 (F-5): defaults false. Only `CarrierDream.open()` should pass true. */
+    is_carrier?: boolean;
   }): Promise<Dream>;
 
   /** Patch a dream row (counts, status, diff, acceptance, completion). */
@@ -446,6 +448,27 @@ export interface IScopeRegistryStore {
   updateStatus(scope: string, status: ScopeRegistryStatus, ruledAt?: string): Promise<void>;
   /** Ruling 'rename': re-key a row. Throws if newScope already exists. */
   rename(oldScope: string, newScope: string, newSlug: string | null): Promise<void>;
+  /** T76 mark_distinct: stamps ruled_distinct_at AND confirms the row (every ruling confirms). */
+  markDistinct(scope: string, ruledAt: string): Promise<void>;
+  /**
+   * T76 (Codex round-2): a successful `merge_into` SUPERSEDES a prior
+   * `mark_distinct` — clears ruled_distinct_at, leaving the alias entry as the
+   * single answer. Without it the row reads alias-mapped AND ruled-distinct at
+   * once: the alias wins everywhere (holdVerdict, the write path, recall), so
+   * the stale stamp only misleads the registry view and the drift panel's
+   * per-variant buttons. Unconditional and idempotent — a row with no ruling is
+   * a no-op UPDATE, and skipping it would need a read that can go stale.
+   */
+  clearDistinct(scope: string): Promise<void>;
+
+  /**
+   * Blocker 4: stamp/clear the deferral. `setDeferred` deliberately does NOT
+   * touch `status` or `ruled_at` — a deferral postpones the identity judgment
+   * rather than making one, which is exactly what distinguishes it from every
+   * other registry write.
+   */
+  setDeferred(scope: string, deferredAt: string, note: string | null): Promise<void>;
+  clearDeferred(scope: string): Promise<void>;
 }
 
 /**

@@ -1686,17 +1686,1720 @@ window.addEventListener('resize', () => {
     }
   }
 
+  // ── Scope-drift panel (T76 Task 9) ──
+  //
+  // Consumes GET /api/ops/scope-drift (light one-GROUP-BY endpoint, rides the
+  // fast 10s cadence) and drives two admin-keyed mutating routes: POST
+  // /api/admin/scopes/rule (approve-alias / mark-distinct) and POST
+  // /api/admin/scopes/archive-ephemeral (two-step dry-run/confirm). The proxy
+  // injects the admin key server-side — this file never holds it.
+  //
+  // Ruling L-1: no action is pre-selected. Every button here waits for a
+  // click; render never fires a request on its own.
+
+  function driftChip(label, value, tone) {
+    return el('span', { class: 'radyn-pill' + (tone ? ` radyn-pill--${tone}` : '') }, `${label} ${value}`);
+  }
+
+  // The cluster aggregate is true iff EVERY uncovered variant has been marked
+  // distinct — it hides the whole action block. The per-variant flag
+  // (v.ruled_distinct) is what the individual buttons filter on: in a
+  // partially-ruled cluster the aggregate is false, and without the per-variant
+  // check the bulk "alias the variants" button would alias away the one scope
+  // the operator just ruled separate.
+  function clusterRuledDistinct(cluster) {
+    return cluster.ruled_distinct === true;
+  }
+
+  // The variants a "merge into <target>" click would actually rule. ONE
+  // definition, used by both the render-time emptiness guard and approveAlias
+  // itself — a button whose action set is empty is never drawn, and the guard
+  // cannot drift away from the action the way a second hand-written filter would.
+  function mergeSources(cluster, target) {
+    return cluster.variants.filter(v =>
+      v.scope !== target && v.aliased_to === null && !v.ruled_distinct
+    );
+  }
+
+  function topEntries(rec, n) {
+    return Object.entries(rec || {}).sort((a, b) => b[1] - a[1]).slice(0, n);
+  }
+
+  // The viz is served from the repo while the server is a long-running service,
+  // so the panel routinely runs a build ahead of the API. An ephemeral row from
+  // a PRE-GATE-L-A server carries no aggregate, and `${undefined}` renders the
+  // literal "undefined" — worse than the missing evidence it replaces. The
+  // `by_*`/`first_write` fields already degrade to '—' via topEntries/fmtAge;
+  // this is the same courtesy for the counts.
+  function countOrDash(n) {
+    return typeof n === 'number' && Number.isFinite(n) ? n.toLocaleString() : '—';
+  }
+
+  // Scope literals keep their true casing inside .radyn-btn labels. The
+  // button's uppercase transform (styles.css, the editable layer) rendered
+  // "MARK PROJECT:ACME-PLATFORM-BACKUP DISTINCT" — erasing exactly the
+  // distinction a *casing* cluster exists to show. A child span with
+  // text-transform: none overrides the inherited transform for the scope
+  // token only; the rest of the label stays Radyn-uppercase.
+  function scopeLiteral(scope) {
+    return el('span', { class: 'ops-scope-literal' }, scope);
+  }
+
+  // ---- State reversibility, stated AT THE POINT OF ACTION (GATE L-A) --------
+  // The operator's second finding: "marking something as distinct also feels
+  // dangerous." Both actions here are in fact recoverable, and that fact was
+  // documented everywhere except next to the button. One helper, so the two
+  // sentences have one spelling wherever their buttons appear.
+  const REVERSIBILITY = {
+    archive: 'archived, not deleted — every row is snapshotted first and can be rolled back by id',
+    mark_distinct: 'labels the scope as real; touches no memories; a later merge ruling supersedes it',
+    // The ephemeral variant is honest about the second consequence: a
+    // mark-distinct ruling ENDS the scope's discovery hold (T76 §5.3), so its
+    // held observations stop being held forever. Cluster variants are never
+    // ephemeral-shaped, so they keep the shorter sentence.
+    mark_distinct_ephemeral: 'labels the scope as real and ends its discovery hold — held observations return to the normal clock; touches no memories; a later merge ruling supersedes it',
+    alias: 'writes an alias entry — new writes land on the target; existing rows stay put until the migration command (in the follow-ups) is run',
+    // Re-scoping an UNRULED ephemeral scope is also the hold release (T76
+    // §5.3): the alias entry is what ends the hold, so the consequence rides
+    // the same sentence. Ruled rows use the plain `alias` line — their hold
+    // was already released by mark_distinct.
+    alias_ephemeral: 'writes an alias entry and ends this scope\'s discovery hold — new writes land on the target; existing rows stay put until the migration command (in the follow-ups) is run',
+    // The reinforce is deliberate G1 behavior and surprising if unsaid
+    // (SYNTHESIS §1.2f): without it, a rescued row's restored snapshot clock
+    // would put it right back under the next decay pass's archive line.
+    rollback: 'restores each row from its snapshot and unarchives it; deliberately REINFORCES the rescued row (bumps last_seen) so the next decay pass doesn\'t immediately re-archive it',
+    // Deliberately explicit that deferring does NOT clean the metric: the
+    // §1.2a watchdog rule is only real if the operator can see it holds.
+    defer: 'bookkeeping only — touches no memories and makes no ruling; the cluster leaves "actionable" but its rows still count in rows-adrift, so the drift metric can\'t be silenced by deferring',
+    undefer: 'clears the deferral and returns the cluster to the actionable list',
+  };
+
+  // A button and the one-line consequence of pressing it, as a single column so
+  // the hint cannot be read against the wrong button in a wrapped action row.
+  function actionWithHint(btn, kind) {
+    return el('div', { class: 'ops-drift-action' },
+      btn,
+      el('div', { class: 'ops-drift-reversibility' }, REVERSIBILITY[kind]));
+  }
+
+  // ---- Peek: a few real memories from the scope (GATE L-A) ------------------
+  // The panel described scopes entirely in aggregates — no row anywhere showed a
+  // line of actual memory content, so "archive project:wf_a1b2c3" was a decision
+  // about an opaque token. Peek is READ-ONLY (a public GET, no key) and
+  // COLLAPSED by default, so a resting panel costs nothing and the 10s poll
+  // fetches nothing.
+  //
+  // Two pieces of state, both keyed by scope (a scope appears in at most one
+  // cluster OR the ephemeral list, never both, so the key is unique):
+  //   peekCache — the fetched result, so re-opening never refetches;
+  //   peekOpen  — which peeks are expanded, so a poll's re-render RESTORES them.
+  // Restoring is what keeps the poll from moving the page: a peek that collapsed
+  // every 10s would shrink the panel under the operator mid-read.
+  const peekCache = new Map(); // scope → { rows, display, cursor, hasMore, loading?, moreError? } | { error: string }
+  const peekOpen = new Set();  // scopes whose peek is currently expanded
+  // The variant's own active-row count, so the peek can say "showing 5 of 19"
+  // (item 3, theme D). Fed by renderDriftVariant; undefined on a pre-GATE-L-A
+  // server, in which case the label degrades to a bare "showing 5".
+  const peekTotals = new Map();
+  const PEEK_EXCERPT = 320;
+  const PEEK_PAGE = 5;        // rows shown on first open
+  const PEEK_PAGE_MORE = 20;  // rows added per "show more" click
+  // Server page size. Larger than the display page because the list endpoint's
+  // scope match is CASE-INSENSITIVE (COLLATE NOCASE) while drift evidence is
+  // exact-string — peeked pages are filtered to the exact spelling below, and
+  // in a casing cluster a page can be mostly case-twin rows. Cheap: lite rows
+  // carry no embedding.
+  const PEEK_FETCH = 100;
+
+  function peekExcerpt(content) {
+    const t = String(content == null ? '' : content).replace(/\s+/g, ' ').trim();
+    if (t === '') return '(empty content)';
+    if (t.length <= PEEK_EXCERPT) return t;
+    // Cut at a word boundary so a path is dropped whole rather than sliced
+    // mid-token (theme D: a truncated path reads as a DIFFERENT path). Only
+    // back off when a boundary exists in the tail of the window — a single
+    // enormous token still truncates hard.
+    let cut = t.slice(0, PEEK_EXCERPT);
+    const sp = cut.lastIndexOf(' ');
+    if (sp > PEEK_EXCERPT * 0.6) cut = cut.slice(0, sp);
+    return cut + '…';
+  }
+
+  function peekBodyFor(scope) {
+    return document.querySelector(`[data-peek-body="${scope.replace(/"/g, '\\"')}"]`);
+  }
+
+  // Text nodes only, via el() — the corpus holds arbitrary operator and
+  // tool-captured text, so nothing here may ever reach innerHTML.
+  function renderPeekBody(scope, body) {
+    clear(body);
+    const cached = peekCache.get(scope);
+    if (!cached) {
+      body.append(el('div', { class: 'ops-drift-peek-status' }, 'reading…'));
+      return;
+    }
+    if (cached.error) {
+      body.append(el('div', { class: 'ops-drift-peek-status ops-drift-peek-err' }, cached.error));
+      return;
+    }
+    // "None" is only true once paging is exhausted — a first page can filter to
+    // zero exact-spelling rows while the case-twin's pages still hold more.
+    if (cached.rows.length === 0 && !cached.hasMore) {
+      body.append(el('div', { class: 'ops-drift-peek-status' }, 'no active memories on this scope'));
+      return;
+    }
+    const shownRows = cached.rows.slice(0, cached.display);
+    for (const m of shownRows) {
+      body.append(el('div', { class: 'ops-drift-peek-row' },
+        el('div', { class: 'ops-drift-peek-meta' },
+          el('span', null, `#${m.id}`),
+          el('span', null, m.type || '—'),
+          el('span', null, m.source || '—'),
+          el('span', null, fmtAge(m.created_at))
+        ),
+        el('div', { class: 'ops-drift-peek-content' }, peekExcerpt(m.content))
+      ));
+    }
+    // Item 3 (theme D): "5 of N shown" plus a way to reach the rest. N is the
+    // drift report's active count for the scope — exact-string, the same
+    // predicate the row filter above uses, so the two agree by construction
+    // (modulo a refresh race, where the fully-fetched row count wins).
+    const total = peekTotals.get(scope);
+    const denom = !cached.hasMore && Number.isFinite(total) && cached.rows.length > total
+      ? cached.rows.length
+      : total;
+    const label = Number.isFinite(denom)
+      ? `showing ${shownRows.length} of ${denom.toLocaleString()}`
+      : `showing ${shownRows.length}`;
+    body.append(el('div', { class: 'ops-drift-peek-status' }, label));
+    if (cached.moreError) {
+      body.append(el('div', { class: 'ops-drift-peek-status ops-drift-peek-err' }, cached.moreError));
+    }
+    // Exhausted means no further exact-spelling rows can exist: either the
+    // server pages ran out, or the cache already holds the drift report's
+    // whole exact count — without the second clause the button would linger
+    // over nothing but case-twin pages and every click would fetch in vain.
+    const exhausted = !cached.hasMore
+      || (Number.isFinite(total) && cached.rows.length >= total);
+    if (cached.rows.length > cached.display || !exhausted) {
+      const more = el('button', { class: 'replay-btn radyn-btn ops-drift-peek-btn' },
+        cached.loading ? 'loading…' : `show ${PEEK_PAGE_MORE} more`);
+      more.disabled = !!cached.loading;
+      more.addEventListener('click', () => loadPeekMore(scope, body));
+      body.append(more);
+    }
+  }
+
+  // The exact-spelling filter (see PEEK_FETCH). A peeked variant must show ITS
+  // rows — in a casing cluster the case-twin's rows under every variant would
+  // make the variants indistinguishable, defeating the evidence purpose.
+  function peekFilter(scope, data) {
+    return (Array.isArray(data) ? data : []).filter(m => m && m.scope === scope);
+  }
+
+  // Fail-soft by construction: every failure lands in the cache as an `error`
+  // string and renders as an inline line. Nothing here throws, and nothing here
+  // mutates — it is a GET.
+  //
+  // `body` is the caller's own node and is ALWAYS the render fallback. On the
+  // re-render-restore path that node is not attached yet (the row is appended
+  // after it is built), so a document query would miss it and the restored peek
+  // would paint blank — the bug this signature exists to prevent.
+  // In-flight scopes. `peekCache.has()` alone can't dedupe: it isn't
+  // populated until the fetch RESOLVES, so every re-render during a slow peek
+  // launched another identical GET with last-one-wins semantics. That raced
+  // at most once per 10s poll before the filter made re-renders per-keystroke
+  // (review F3).
+  const peekInFlight = new Set();
+
+  async function loadPeek(scope, body) {
+    if (peekInFlight.has(scope)) return; // the pending fetch will render
+    if (!peekCache.has(scope)) {
+      peekInFlight.add(scope);
+      renderPeekBody(scope, body); // 'reading…'
+      try {
+        const r = await fetch(
+          `/api/memories?scope=${encodeURIComponent(scope)}&limit=${PEEK_FETCH}&fields=lite`,
+          { cache: 'no-store' });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const j = await r.json();
+        // hasMore requires a numeric cursor — a server that says "more" without
+        // one can't be paged, and `cursor=undefined` would 400 at the Zod coerce.
+        peekCache.set(scope, {
+          rows: peekFilter(scope, j.data),
+          display: PEEK_PAGE,
+          cursor: j.meta && j.meta.cursor,
+          hasMore: !!(j.meta && j.meta.has_more && typeof j.meta.cursor === 'number'),
+        });
+      } catch (err) {
+        peekCache.set(scope, { error: `could not read this scope: ${err.message}` });
+      } finally {
+        peekInFlight.delete(scope);
+      }
+    }
+    // Collapsed while the fetch was in flight — stay collapsed.
+    if (!peekOpen.has(scope)) return;
+    // Prefer the LIVE body: a poll may have rebuilt the row mid-fetch, leaving
+    // `body` detached. Fall back to `body` when the query misses (first render).
+    renderPeekBody(scope, peekBodyFor(scope) || body);
+  }
+
+  // Grows the display window, fetching further server pages (same public GET,
+  // cursor from the last page) only while the filtered cache can't cover it —
+  // bounded per click, so one click is at most a few requests even when the
+  // exact spelling is buried under a large case-twin. Fetched rows accumulate
+  // in the cache, so a poll re-render repaints the full expanded set and
+  // "show more" never refetches what is already shown. A page failure lands
+  // as an inline line (moreError) with the button still live; the next
+  // successful page clears it.
+  async function loadPeekMore(scope, body) {
+    const cached = peekCache.get(scope);
+    if (!cached || cached.error || cached.loading) return;
+    if (cached.rows.length <= cached.display && !cached.hasMore) return;
+    cached.loading = true;
+    cached.display += PEEK_PAGE_MORE;
+    renderPeekBody(scope, peekBodyFor(scope) || body); // repaint the disabled button
+    try {
+      let fetches = 0;
+      while (cached.rows.length < cached.display && cached.hasMore && fetches < 3) {
+        fetches++;
+        const r = await fetch(
+          `/api/memories?scope=${encodeURIComponent(scope)}&limit=${PEEK_FETCH}&fields=lite&cursor=${encodeURIComponent(cached.cursor)}`,
+          { cache: 'no-store' });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const j = await r.json();
+        cached.rows.push(...peekFilter(scope, j.data));
+        cached.cursor = j.meta && j.meta.cursor;
+        cached.hasMore = !!(j.meta && j.meta.has_more && typeof cached.cursor === 'number');
+      }
+      cached.moreError = null;
+    } catch (err) {
+      cached.moreError = `could not read more: ${err.message}`;
+    } finally {
+      cached.loading = false;
+    }
+    if (!peekOpen.has(scope)) return;
+    renderPeekBody(scope, peekBodyFor(scope) || body);
+  }
+
+  function renderPeekControl(scope) {
+    const body = el('div', { class: 'ops-drift-peek-body', dataset: { peekBody: scope } });
+    const btn = el('button', { class: 'replay-btn radyn-btn ops-drift-peek-btn' });
+    const sync = () => {
+      const open = peekOpen.has(scope);
+      btn.textContent = open ? 'hide contents' : 'peek contents';
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      body.hidden = !open;
+    };
+    btn.addEventListener('click', () => {
+      if (peekOpen.has(scope)) {
+        peekOpen.delete(scope);
+        clear(body);
+        sync();
+        return;
+      }
+      peekOpen.add(scope);
+      sync();
+      loadPeek(scope, body);
+    });
+    sync();
+    // Re-render restore. A cache hit paints synchronously here, which is what
+    // keeps an open peek the same height across a poll — the panel must not
+    // shrink and re-grow under an operator mid-read.
+    if (peekOpen.has(scope)) loadPeek(scope, body);
+    return el('div', { class: 'ops-drift-peek' }, btn, body);
+  }
+
+  // ---- Triage line at rest (item 11, theme J) -------------------------------
+  // The four facts that decide "junk or real work?", on ONE line, before any
+  // action is taken. They were previously spread across by_type / by_source /
+  // two date fields — and `anchored`, the most decisive of them, existed only
+  // AFTER running an archive dry-run, which is the wrong order: it is an input
+  // to the decision, not a result of acting on it.
+  //
+  // `origin` is deliberately "auto-discovery vs everything else", not "human":
+  // `source` records the WRITE PATH (auto-discovery / mcp / claude-code / …),
+  // and only the auto-discovery bucket is machine-generated with certainty.
+  // Calling the remainder "human" would assert more than the data supports.
+  const AUTO_SOURCE = 'auto-discovery';
+
+  function renderTriageLine(v, opts) {
+    // `archivable` gates the archive-framed wording and the warning colour to
+    // rows that actually offer an archive (review F4). A cluster variant's
+    // only actions are merge_into / mark_distinct, and the Hard Anchor
+    // constrains neither — an alias entry moves nothing and refuses nothing —
+    // so warning-colouring every operator-confirmed variant was alarm noise on
+    // the exact decision this line exists to speed up.
+    const archivable = !!(opts && opts.archivable);
+    const active = typeof v.active === 'number' ? v.active : null;
+    // ACTIVE-only source counts (review F3): mixing all-row `by_source` with
+    // the active-only `active` compared two different populations and could
+    // report 0 operator-written rows while live ones sat there. Falls back to
+    // the all-row map on a server that predates by_source_active.
+    const sources = v.by_source_active || v.by_source || {};
+    const auto = Math.min(sources[AUTO_SOURCE] || 0, active ?? Infinity);
+    const parts = [];
+    if (active === null) {
+      parts.push('— no aggregate from this server');
+    } else {
+      const other = Math.max(0, active - auto);
+      parts.push(`${auto.toLocaleString()} auto-discovery`);
+      parts.push(`${other.toLocaleString()} other-source`);
+      parts.push(typeof v.anchored === 'number'
+        ? `${v.anchored.toLocaleString()} anchored`
+        : 'anchored —');
+    }
+    // fmtAge yields "66d ago"; "idle 66d ago" reads as two time phrases.
+    parts.push(v.last_write ? `idle ${fmtAge(v.last_write).replace(/\s*ago$/, '')}` : 'idle —');
+    let text = parts.join(' · ');
+    // The case worth spelling out rather than leaving as arithmetic: every
+    // active row is anchored, so the archive button below will refuse ALL of
+    // them. Discovering that from a dry-run is precisely the ordering theme J
+    // objected to — but only say it where an archive is actually on offer.
+    if (archivable && active !== null && active > 0 && v.anchored === active) {
+      text += ' — an archive would refuse every row';
+    }
+    const line = el('div', { class: 'ops-drift-triage' }, text);
+    line.setAttribute('title',
+      'auto-discovery = rows written by the discovery engine; other-source = every other write path '
+      + '(mcp, claude-code, …), which is operator-initiated but not proof of a human author. '
+      + 'anchored = ACTIVE rows the Hard Anchor protects'
+      + (archivable
+        ? ' — an archive refuses exactly these.'
+        : ' (this row offers no archive; anchoring does not constrain a merge or a distinct ruling).')
+      + ' idle = age of the most recent write.');
+    if (archivable && typeof v.anchored === 'number' && v.anchored > 0) {
+      line.classList.add('ops-drift-triage--anchored');
+    }
+    return line;
+  }
+
+  /**
+   * THE evidence renderer — one spelling, both row kinds (GATE L-A).
+   *
+   * Ephemeral rows used to hand-roll their own head and show no evidence at
+   * all, which is how the rows carrying the destructive action ended up with
+   * the least context. They now render through here; `opts` carries only what
+   * genuinely differs (the container/head classes, the ephemeral count + reason
+   * pills, the cluster-only canonical/favored badges), while the evidence block
+   * and the peek control are shared by construction.
+   */
+  function renderDriftVariant(v, opts) {
+    const o = opts || {};
+    const row = el('div', { class: o.rowClass || 'ops-drift-variant' });
+    row.append(el('div', { class: o.headClass || 'ops-drift-variant-head' },
+      el('span', { class: 'ops-drift-variant-scope' }, v.scope),
+      o.isCanonical ? el('span', { class: 'radyn-pill radyn-pill--success' }, 'canonical') : null,
+      o.countPill ? el('span', { class: 'radyn-pill' }, `${v.count} rows`) : null,
+      o.reason ? el('span', { class: 'ops-drift-reason' }, o.reason) : null,
+      v.aliased_to ? el('span', { class: 'radyn-pill' }, `→ ${v.aliased_to}`) : null,
+      v.ruled_distinct ? el('span', { class: 'radyn-pill' }, 'ruled distinct') : null,
+      // Deferral is LABELLED, never hidden (§1.2a): the row stays in the
+      // report with its evidence, carrying the operator's own reason.
+      v.deferred_at ? el('span', { class: 'radyn-pill radyn-pill--warning' },
+        v.deferred_note ? `deferred — ${v.deferred_note}` : 'deferred') : null,
+      o.favored ? el('span', { class: 'radyn-pill radyn-pill--info' }, 'evidence favors this target') : null
+    ));
+    row.append(renderTriageLine(v, { archivable: !!o.archivable }));
+    row.append(el('dl', { class: 'ops-kv' },
+      el('dt', null, 'active / archived'), el('dd', null, `${countOrDash(v.active)} / ${countOrDash(v.archived)}`),
+      el('dt', null, 'by type'), el('dd', null, topEntries(v.by_type, 3).map(([k, n]) => `${k}:${n}`).join(', ') || '—'),
+      el('dt', null, 'by source'), el('dd', null, topEntries(v.by_source, 3).map(([k, n]) => `${k}:${n}`).join(', ') || '—'),
+      el('dt', null, 'first write'), el('dd', null, fmtAge(v.first_write)),
+      el('dt', null, 'last write'), el('dd', null, fmtAge(v.last_write))
+    ));
+    // The peek's "showing X of N" denominator: active rows, the population the
+    // list endpoint pages. Undefined on a pre-aggregate server — the label
+    // degrades rather than lying.
+    peekTotals.set(v.scope, v.active);
+    row.append(renderPeekControl(v.scope));
+    return row;
+  }
+
+  // ---- Where an outcome renders (GATE L-A, two live findings) ----------------
+  // Round 2 moved every archive/ruling outcome to the persistent #ops-drift-msg
+  // area at the TOP of the card so the 10s poll could not wipe a confirm button
+  // mid-decision. That was right about the poll and wrong about the place: the
+  // buttons sit rows deep in a 70+ row list, so the outcome rendered ~900px
+  // offscreen and the click read as "nothing happened". Scrolling to it was
+  // worse — the panel yanked the view out from under the operator.
+  //
+  // So the outcome is PINNED to the row it came from: rendered into that row's
+  // host element, and re-attached after every re-render (the same node objects
+  // move into the freshly built row), which is what makes it survive the poll
+  // without moving the page at all. One outcome at a time — the operator is
+  // doing one thing — and it is dismissible.
+  //
+  // The one case that still scrolls: the host row is GONE (a fully-drained
+  // scope leaves the ephemeral list, taking its anchor with it). Then the
+  // outcome — which carries the archived ids, i.e. the only undo enumeration —
+  // falls back to the top area and pulls the view to it. Nothing is yanked out
+  // from under the operator there, because the thing they were looking at no
+  // longer exists.
+  let pinnedOutcome = null; // { key: string, nodes: Node[] }
+
+  function outcomeHostFor(key) {
+    return document.querySelector(`[data-outcome-host="${key.replace(/"/g, '\\"')}"]`);
+  }
+
+  function attachPinnedOutcome({ scrollIfOrphaned = false } = {}) {
+    if (!pinnedOutcome) return;
+    const msg = document.getElementById('ops-drift-msg');
+    const host = outcomeHostFor(pinnedOutcome.key);
+    if (host) {
+      if (msg) clear(msg);
+      clear(host);
+      for (const n of pinnedOutcome.nodes) host.append(n);
+      return;
+    }
+    if (!msg) return;
+    clear(msg);
+    for (const n of pinnedOutcome.nodes) msg.append(n);
+    if (scrollIfOrphaned) msg.scrollIntoView({ block: 'nearest' });
+  }
+
+  function pinOutcome(key, nodes) {
+    const dismiss = el('button', { class: 'replay-btn radyn-btn ops-drift-dismiss' }, 'dismiss');
+    dismiss.addEventListener('click', () => {
+      pinnedOutcome = null;
+      const host = outcomeHostFor(key);
+      if (host) clear(host);
+      const msg = document.getElementById('ops-drift-msg');
+      if (msg) clear(msg);
+    });
+    pinnedOutcome = { key, nodes: [...nodes, dismiss] };
+    attachPinnedOutcome({ scrollIfOrphaned: true });
+  }
+
+  // ---- Change ruling (item 8, theme K) --------------------------------------
+  // mark_distinct's hint promises "a later merge ruling supersedes it", but a
+  // ruled row used to lose every action — the stated undo was unreachable. A
+  // ruled row now keeps ONE action: a collapsed "change ruling" disclosure
+  // whose merge buttons post the superseding merge_into (the server clears
+  // ruled_distinct_at when the alias entry lands — this IS the documented
+  // undo, not a second mechanism). L-1 holds: everything sits behind the
+  // disclosure, no direction pre-selected. Open state + any typed target
+  // survive the 10s poll's row rebuild the same way peekOpen does.
+  const changeRulingOpen = new Set();   // scopes whose disclosure is expanded
+  const changeRulingTarget = new Map(); // scope → typed merge target (ephemeral rows)
+  const deferNoteDraft = new Map();     // scope → in-progress deferral note (survives the poll)
+
+  // ---- Defer / undefer control (blocker 4) ---------------------------------
+  // One control, both row kinds. A deferred variant shows "undefer"; an
+  // undeferred one shows a note field + "defer". The note is the operator's
+  // own reason and is what the pill displays, so the panel answers "why is
+  // this still here?" without a second lookup.
+  function renderDeferControl(v, hostKey) {
+    if (v.deferred_at) {
+      const btn = el('button', { class: 'replay-btn radyn-btn' }, 'undefer ', scopeLiteral(v.scope));
+      btn.addEventListener('click', () => deferScope(v.scope, 'undefer', null, btn, hostKey));
+      return actionWithHint(btn, 'undefer');
+    }
+    const input = el('input', {
+      class: 'ops-drift-target-input', type: 'text', maxlength: '500',
+      placeholder: 'why defer? (optional note)', value: deferNoteDraft.get(v.scope) || '',
+      dataset: { targetInput: `defer:${v.scope}` },
+    });
+    input.addEventListener('input', () => deferNoteDraft.set(v.scope, input.value));
+    const btn = el('button', { class: 'replay-btn radyn-btn' }, 'defer ', scopeLiteral(v.scope));
+    btn.addEventListener('click', () => deferScope(v.scope, 'defer', input.value.trim(), btn, hostKey));
+    return el('div', { class: 'ops-drift-defer' }, input, actionWithHint(btn, 'defer'));
+  }
+
+  function changeRulingShell(scope, body, labelKids, onOpen) {
+    body.hidden = !changeRulingOpen.has(scope);
+    const toggle = el('button', { class: 'replay-btn radyn-btn' }, labelKids);
+    const sync = () => toggle.setAttribute('aria-expanded', body.hidden ? 'false' : 'true');
+    toggle.addEventListener('click', () => {
+      if (changeRulingOpen.has(scope)) changeRulingOpen.delete(scope);
+      else {
+        changeRulingOpen.add(scope);
+        if (onOpen) onOpen();
+      }
+      body.hidden = !changeRulingOpen.has(scope);
+      sync();
+    });
+    sync();
+    return el('div', { class: 'ops-drift-change-ruling' }, toggle, body);
+  }
+
+  // Cluster variant: the merge targets are the cluster's own un-aliased members.
+  function renderChangeRuling(scope, targetScopes, hostKey) {
+    const body = el('div', { class: 'ops-drift-change-ruling-body' });
+    for (const target of targetScopes) {
+      const btn = el('button', { class: 'replay-btn radyn-btn' },
+        'merge ', scopeLiteral(scope), ' into ', scopeLiteral(target));
+      btn.addEventListener('click', () => mergeScopeInto(scope, target, btn, hostKey));
+      body.append(actionWithHint(btn, 'alias'));
+    }
+    return changeRulingShell(scope, body, ['change ruling for ', scopeLiteral(scope)]);
+  }
+
+  // ---- Re-scope: merge into…, seeded from the peeked content (blocker 1) ----
+  // Theme A, all three reviewers: given the same peeked contents they each
+  // concluded the memories were MISROUTED, not junk — and the ephemeral row
+  // offered only archive-or-keep. "Merge into…" is the missing verb, and it is
+  // server-complete: the alias entry redirects new writes, the follow-up
+  // migration command moves the rows, and on an unruled ephemeral scope the
+  // entry is ALSO the hold release (T76 §5.3) — resolving the hidden
+  // held-observation consequence by construction (SYNTHESIS §1.2e).
+
+  // The known-scope inventory (GET /api/stats by_scope), cached 5 min — it
+  // backs seed ranking only, so staleness is cosmetic. Failure caches empty
+  // for 1 min: seeds degrade to explicit tokens, the picker still works.
+  let scopeInventory = null;        // { at, entries: [scope, count][] }
+  let scopeInventoryPromise = null; // in-flight dedup: a poll restoring several
+                                    // open pickers must not fan out N stats calls
+  async function loadScopeInventory() {
+    const ttl = scopeInventory && scopeInventory.entries.length > 0 ? 300000 : 60000;
+    if (scopeInventory && Date.now() - scopeInventory.at < ttl) return scopeInventory.entries;
+    if (scopeInventoryPromise) return scopeInventoryPromise;
+    scopeInventoryPromise = (async () => {
+      try {
+        const stats = await fetchStats();
+        scopeInventory = { at: Date.now(), entries: Object.entries(stats.by_scope || {}) };
+      } catch (err) {
+        scopeInventory = { at: Date.now(), entries: [] };
+      } finally {
+        scopeInventoryPromise = null;
+      }
+      return scopeInventory.entries;
+    })();
+    return scopeInventoryPromise;
+  }
+
+  // Left boundary + captured token so "myproject:alpha" can't seed
+  // "project:alpha"; trailing ._- are trimmed after the match so a
+  // sentence-final "…in project:acme." doesn't mint a one-click merge button
+  // into the nonexistent "project:acme." (isScopeForm accepts any non-empty
+  // remainder, so the server would have taken the ruling).
+  const SCOPE_TOKEN_RE = /(^|[^A-Za-z0-9._-])((?:project|client):[A-Za-z0-9][A-Za-z0-9._-]*)/g;
+  const MERGE_SEED_CAP = 6;
+
+  // "Scopes named in the peeked content": explicit scope tokens outrank known
+  // scopes whose bare name appears in the text; among name matches, bigger
+  // scopes rank higher (a likelier home). Pure — no I/O. Precision rules,
+  // earned across the first live walk + review: boundary-safe token matching,
+  // numeric-only names never seed (a date fragment is not a project — this
+  // also covers the project:2026-from-"20260630_…" case), and case-twins
+  // collapse to the better-scoring spelling. Deliberately NO self-echo rule:
+  // for a "<datestamp>_<realname>" ephemeral scope, the name inside the
+  // source's own name is often exactly the right target (review F3), and a
+  // case-twin or cross-prefix twin of the source is a legitimate ruling.
+  function seedsFromContent(scope, rows, inventory) {
+    const text = rows.map(m => String((m && m.content) || '')).join('\n');
+    if (!text) return [];
+    const seeds = new Map();
+    for (const m of text.matchAll(SCOPE_TOKEN_RE)) {
+      const t = m[2].replace(/[._-]+$/, '');
+      if (t && t !== scope && !/^(?:project|client):$/.test(t)) {
+        seeds.set(t, (seeds.get(t) || 0) + 100);
+      }
+    }
+    const lower = text.toLowerCase();
+    for (const [known, count] of inventory) {
+      if (known === scope || known === 'global') continue;
+      const bare = known.slice(known.indexOf(':') + 1);
+      // Short names ("api", "web") match everything — require ≥4 chars so a
+      // seed means the NAME was plausibly written, not a syllable.
+      if (bare.length < 4) continue;
+      const bareLower = bare.toLowerCase();
+      if (/^[0-9]+$/.test(bareLower)) continue;
+      const esc = bareLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (!new RegExp(`(^|[^a-z0-9])${esc}([^a-z0-9]|$)`).test(lower)) continue;
+      seeds.set(known, (seeds.get(known) || 0) + 1 + Math.min(count, 1000) / 1000);
+    }
+    const byFold = new Map(); // lowercased scope → [scope, score]
+    for (const [t, score] of seeds) {
+      const key = t.toLowerCase();
+      const prev = byFold.get(key);
+      if (!prev || score > prev[1]) byFold.set(key, [t, score]);
+    }
+    return [...byFold.values()].sort((a, b) => b[1] - a[1])
+      .slice(0, MERGE_SEED_CAP).map(([t]) => t);
+  }
+
+  // Ephemeral row: a disclosure with evidence-seeded target buttons plus the
+  // free-text input for targets the content doesn't name. The server is the
+  // validator (scope form, chains, generic capture) and a refusal renders as
+  // the 400's own message via the standard ruling outcome. L-1 holds: the
+  // picker is collapsed, seeds are buttons, nothing is pre-selected.
+  function renderMergeInto(scope, hostKey, opts) {
+    const o = opts || {};
+    const hintKind = o.hintKind || 'alias';
+    const seedArea = el('div', { class: 'ops-drift-merge-seeds' });
+    const paintSeeds = (targets) => {
+      clear(seedArea);
+      if (targets === null) {
+        seedArea.append(el('div', { class: 'ops-drift-peek-status' }, 'reading this scope\'s contents for likely targets…'));
+        return;
+      }
+      if (targets.length === 0) {
+        seedArea.append(el('div', { class: 'ops-drift-peek-status' },
+          'no target named in this scope\'s contents — type one below'));
+        return;
+      }
+      seedArea.append(el('div', { class: 'ops-drift-peek-status' }, 'targets named in this scope\'s contents:'));
+      for (const target of targets) {
+        const btn = el('button', { class: 'replay-btn radyn-btn' },
+          'merge ', scopeLiteral(scope), ' into ', scopeLiteral(target));
+        btn.addEventListener('click', () => mergeScopeInto(scope, target, btn, hostKey));
+        seedArea.append(actionWithHint(btn, hintKind));
+      }
+    };
+    const fillSeeds = async () => {
+      const cached = peekCache.get(scope);
+      const needPeek = !cached || cached.error;
+      if (needPeek) {
+        paintSeeds(null);
+        // A cached {error} would make loadPeek a no-op (it never refetches a
+        // populated entry) — drop it so opening the picker RETRIES the read
+        // instead of silently claiming "no target named" (review F2).
+        if (cached && cached.error) peekCache.delete(scope);
+      }
+      // Independent fetches — pay one latency, not two (review F5). The
+      // throwaway node satisfies loadPeek's render fallback; the peek itself
+      // stays closed unless the operator opened it.
+      const [inventory] = await Promise.all([
+        loadScopeInventory(),
+        needPeek ? loadPeek(scope, document.createElement('div')) : Promise.resolve(),
+      ]);
+      const after = peekCache.get(scope);
+      if (!after || after.error) {
+        clear(seedArea);
+        seedArea.append(el('div', { class: 'ops-drift-peek-status ops-drift-peek-err' },
+          `${(after && after.error) || 'could not read this scope'} — seeds unavailable, type a target below`));
+        return;
+      }
+      // Memoized per (row-count, inventory age): the poll rebuilds open
+      // pickers every 10s, and the O(inventory × text) scan must not re-run
+      // when nothing it reads has changed (review F4).
+      const memoKey = `${after.rows.length}|${scopeInventory ? scopeInventory.at : 0}`;
+      if (!after.seedsMemo || after.seedsMemo.key !== memoKey) {
+        after.seedsMemo = { key: memoKey, seeds: seedsFromContent(scope, after.rows, inventory) };
+      }
+      paintSeeds(after.seedsMemo.seeds);
+    };
+
+    const body = el('div', { class: 'ops-drift-change-ruling-body' });
+    const input = el('input', {
+      class: 'ops-drift-target-input', type: 'text',
+      placeholder: 'client:… or project:…', value: changeRulingTarget.get(scope) || '',
+      dataset: { targetInput: scope },
+    });
+    input.addEventListener('input', () => changeRulingTarget.set(scope, input.value));
+    const btn = el('button', { class: 'replay-btn radyn-btn' }, 'merge ', scopeLiteral(scope), ' into target');
+    btn.addEventListener('click', () => {
+      const target = input.value.trim();
+      if (!target) return;
+      mergeScopeInto(scope, target, btn, hostKey);
+    });
+    body.append(seedArea, input, actionWithHint(btn, hintKind));
+
+    const shell = changeRulingShell(scope, body,
+      o.toggleLabel || ['change ruling for ', scopeLiteral(scope)], fillSeeds);
+    // Re-render restore (the peekOpen pattern): an open picker refills from
+    // caches, so a poll rebuild repaints seeds without a visible reload.
+    if (changeRulingOpen.has(scope)) fillSeeds();
+    return shell;
+  }
+
+  function renderDriftCluster(cluster) {
+    const card = el('div', { class: 'ops-drift-cluster' });
+    const head = el('div', { class: 'ops-drift-cluster-head' },
+      el('span', { class: 'radyn-pill' + (cluster.kind === 'cross_prefix' ? ' radyn-pill--warning' : '') }, cluster.kind),
+      el('span', { class: 'ops-drift-cluster-key' }, cluster.key),
+      cluster.active_rows_adrift > 0 ? el('span', { class: 'radyn-pill radyn-pill--error' }, `${cluster.active_rows_adrift} rows adrift`) : null,
+      cluster.covered ? el('span', { class: 'radyn-pill radyn-pill--success' }, 'covered') : null,
+      clusterRuledDistinct(cluster) ? el('span', { class: 'radyn-pill' }, 'ruled distinct') : null,
+      cluster.deferred ? el('span', { class: 'radyn-pill radyn-pill--warning' }, 'deferred') : null
+    );
+    card.append(head);
+
+    // Evidence hint (cross_prefix only, L-1: a label, never a selection): a
+    // project:-side variant reading ≥90% auto-discovery in by_source badges
+    // every OTHER variant EXCEPT another ≥90%-auto-discovery project:-side
+    // variant — the badge belongs on plausible real-entity targets only.
+    const favoredScopes = new Set();
+    if (cluster.kind === 'cross_prefix') {
+      const discoveryHeavy = new Set();
+      for (const v of cluster.variants) {
+        if (!v.scope.startsWith('project:') || !v.total) continue;
+        const auto = (v.by_source && v.by_source['auto-discovery']) || 0;
+        if (auto / v.total >= 0.9) discoveryHeavy.add(v.scope);
+      }
+      if (discoveryHeavy.size > 0) {
+        for (const v of cluster.variants) if (!discoveryHeavy.has(v.scope)) favoredScopes.add(v.scope);
+      }
+    }
+
+    for (const v of cluster.variants) {
+      card.append(renderDriftVariant(v, {
+        isCanonical: cluster.kind === 'casing' && v.scope === cluster.canonical,
+        favored: favoredScopes.has(v.scope),
+      }));
+    }
+
+    const actions = el('div', { class: 'review-actions ops-drift-actions' });
+    // Deferred clusters keep their full action set (review F4): the server
+    // supports merge_into / mark_distinct on a deferred scope directly and
+    // clears the deferral as part of the ruling, so gating the buttons on
+    // !deferred would force an undefer-per-variant detour to reach the
+    // one-step path the defer response itself documents.
+    if (!cluster.covered && !clusterRuledDistinct(cluster)) {
+      // A ruled-distinct variant is never a merge SOURCE (mergeSources
+      // excludes it — aliasing it away would undo the ruling) and never
+      // re-offered for marking. It IS a valid merge TARGET: merge_into clears
+      // ruled_distinct_at on the SOURCE scope only, so folding variants into
+      // the ruled spelling is the mark-distinct-then-consolidate workflow,
+      // not an undo (review F2).
+      //
+      // Direction choice for BOTH cluster kinds (blocker 5, theme I; §1.2c):
+      // every un-aliased member is offered as a merge target — the
+      // slug-canonical labelled but never privileged — so the operator can
+      // make the 1,168-row spelling win by aliasing the canonical INTO it.
+      // This deliberately routes through merge_into, NOT registry `rename`:
+      // rename re-keys claimant identity and tombstones the freed scope — a
+      // different concept from drift's display-proposal canonical. The rule
+      // endpoint validates the resulting table (chains, generic capture ⇒
+      // a 400 the panel renders), so the guard rail is server-side. L-1
+      // holds: every direction is a button, nothing pre-selected.
+      const dependents = new Set(cluster.variants.map(v => v.aliased_to).filter(Boolean));
+      let suppressedChained = false;
+      for (const target of cluster.variants.filter(v => v.aliased_to === null)) {
+        // Emptiness guard: with two uncovered members and one of them ruled,
+        // the only offered target has nothing left to merge into it, and the
+        // click would send no request at all.
+        const sources = mergeSources(cluster, target.scope);
+        if (sources.length === 0) continue;
+        // A source that other members already alias INTO is a canonical VALUE
+        // in the table — merging it elsewhere would form a chain the server
+        // refuses, so the button would 400 on its first request (review F1).
+        // Redirecting a covered cluster is a per-variant re-ruling, not a
+        // bulk button.
+        if (sources.some(s => dependents.has(s.scope))) {
+          suppressedChained = true;
+          continue;
+        }
+        const btn = el('button', { class: 'replay-btn radyn-btn' },
+          `merge ${sources.length} variant${sources.length === 1 ? '' : 's'} into `,
+          scopeLiteral(target.scope),
+          cluster.kind === 'casing' && target.scope === cluster.canonical ? ' (canonical)' : null);
+        btn.addEventListener('click', () => approveAlias(cluster, target.scope, btn, `cluster:${cluster.key}`));
+        actions.append(actionWithHint(btn, 'alias'));
+      }
+      if (suppressedChained) {
+        actions.append(el('div', { class: 'ops-hint' },
+          'some merge directions are unavailable: a member already carries aliases into it, and moving it would chain — re-rule the aliased members individually before redirecting'));
+      }
+      // Mark distinct — one scope per click, no bulk (Step 4). The canonical
+      // spelling itself is excluded: marking it distinct is a no-op mutation
+      // (cluster.canonical is null for cross_prefix, so this is a no-op filter there).
+      for (const v of cluster.variants.filter(v =>
+        v.aliased_to === null && v.scope !== cluster.canonical && !v.ruled_distinct
+      )) {
+        const btn = el('button', { class: 'replay-btn radyn-btn' }, 'mark ', scopeLiteral(v.scope), ' distinct');
+        btn.addEventListener('click', () => markDistinct(v.scope, btn, `cluster:${cluster.key}`));
+        actions.append(actionWithHint(btn, 'mark_distinct'));
+      }
+      // Defer/undefer per un-aliased, un-ruled variant — the third answer
+      // beside "merge it" and "it's distinct": "not now" (blocker 4). The
+      // canonical is excluded for the same reason the mark-distinct loop
+      // excludes it: drift's cluster arithmetic ignores the canonical, so
+      // deferring it would flip no aggregate while permanently minting a
+      // registry row for a spelling that may hold no rows at all.
+      for (const v of cluster.variants.filter(v =>
+        v.aliased_to === null && !v.ruled_distinct && v.scope !== cluster.canonical
+      )) {
+        actions.append(renderDeferControl(v, `cluster:${cluster.key}`));
+      }
+    }
+    // Ruled-distinct variants keep the change-ruling disclosure (item 8) —
+    // rendered OUTSIDE the covered/all-ruled gate above, since a fully-ruled
+    // cluster is exactly where every row used to go actionless. Targets are
+    // the cluster's other un-aliased members (an aliased member as target
+    // would chain, which the server refuses anyway).
+    for (const v of cluster.variants.filter(v => v.ruled_distinct && v.aliased_to === null)) {
+      const targets = cluster.variants
+        .filter(t => t.scope !== v.scope && t.aliased_to === null)
+        .map(t => t.scope);
+      if (targets.length > 0) actions.append(renderChangeRuling(v.scope, targets, `cluster:${cluster.key}`));
+    }
+    if (actions.childElementCount > 0) card.append(actions);
+    // The cluster's own outcome anchor — same reasoning as the ephemeral rows'
+    // (see the pinnedOutcome comment): a ruling reports where it was clicked.
+    card.append(el('div', {
+      class: 'ops-drift-cluster-result',
+      dataset: { outcomeHost: `cluster:${cluster.key}` },
+    }));
+
+    return card;
+  }
+
+  // `total` (item 12) distinguishes "the corpus has none" from "the filter
+  // matched none" — the same never-silently-empty rule the cluster list gets.
+  function renderDriftEphemeral(list, total) {
+    const wrap = document.getElementById('ops-drift-ephemeral');
+    if (!wrap) return;
+    clear(wrap);
+    if (!list || list.length === 0) {
+      const hiddenByFilter = driftFilter && (total ?? 0) > 0;
+      wrap.append(el('div', { class: 'ops-empty' },
+        hiddenByFilter ? `no ephemeral scope matches "${driftFilter}"` : 'no ephemeral scopes'));
+      return;
+    }
+    for (const e of list) {
+      // Same evidence renderer the cluster variants use (GATE L-A) — the
+      // ephemeral row keeps its own container/head classes, its count + reason
+      // pills, and its own action set, and shares everything else.
+      const row = renderDriftVariant(e, {
+        rowClass: 'ops-drift-ephemeral-row',
+        headClass: 'ops-drift-ephemeral-head',
+        countPill: true,
+        reason: e.reason,
+        // Ephemeral rows are the ONLY ones offering an archive, so they are
+        // the only ones whose triage line may frame anchoring as a refusal
+        // (review F4). Stated explicitly rather than inferred from countPill,
+        // which is about a badge and would be a silent coupling.
+        archivable: true,
+      });
+      // Archive is hidden (not disabled) whenever the route would 400 it —
+      // spec §5.4: only aliased_to === null && !ruled_distinct is eligible.
+      const actions = el('div', { class: 'review-actions ops-drift-actions' });
+      const archiveResult = el('div', {
+        class: 'ops-drift-archive-result',
+        dataset: { outcomeHost: `eph:${e.scope}` },
+      });
+      if (e.aliased_to === null && !e.ruled_distinct) {
+        // Re-scope leads (blocker 1): it is the verb all three reviewers
+        // reached for on this row, so it comes before the keep/discard pair.
+        actions.append(renderMergeInto(e.scope, `eph:${e.scope}`, {
+          toggleLabel: ['re-scope — merge ', scopeLiteral(e.scope), ' into…'],
+          hintKind: 'alias_ephemeral',
+        }));
+        const distinctBtn = el('button', { class: 'replay-btn radyn-btn' }, 'mark distinct');
+        distinctBtn.addEventListener('click', () => markDistinct(e.scope, distinctBtn, `eph:${e.scope}`));
+        actions.append(actionWithHint(distinctBtn, 'mark_distinct_ephemeral'));
+        const archiveBtn = el('button', { class: 'replay-btn radyn-btn' }, 'archive ephemeral (dry-run)');
+        archiveBtn.addEventListener('click', () => archiveEphemeralDryRun(e.scope, archiveResult));
+        // Deferred or not: the row keeps its full action set and the defer
+        // control renders as "undefer" when deferred (review F4).
+        actions.append(actionWithHint(archiveBtn, 'archive'));
+        actions.append(renderDeferControl(e, `eph:${e.scope}`));
+      } else if (e.aliased_to === null && e.ruled_distinct) {
+        // ruled_distinct takes precedence over a stale deferral (which the
+        // server now refuses to create anyway) — the change-ruling control is
+        // this row's only undo and must never be displaced.
+        // Item 8: the ruled row keeps its change-ruling action so the
+        // mark-distinct hint's stated undo stays reachable — same picker,
+        // plain alias hint (this row's hold was already released).
+        actions.append(renderMergeInto(e.scope, `eph:${e.scope}`, {
+          toggleLabel: ['change ruling for ', scopeLiteral(e.scope)],
+          hintKind: 'alias',
+        }));
+      }
+      if (actions.childElementCount > 0) row.append(actions, archiveResult);
+      wrap.append(row);
+    }
+  }
+
+  function renderRulingOutcome(hostKey, done, failure) {
+    const nodes = [];
+    if (done.length > 0) {
+      nodes.push(el('div', { class: failure ? 'review-msg-err' : 'review-msg-ok' },
+        `ruled ${done.length} scope${done.length === 1 ? '' : 's'}: ${done.map(d => d.scope).join(', ')}` +
+        (failure ? ` — stopped: ${failure}` : '')));
+    } else if (failure) {
+      nodes.push(el('div', { class: 'review-msg-err' }, `ruling failed: ${failure}`));
+    }
+    const followUps = done.flatMap(d => d.followUps || []);
+    if (followUps.length > 0) {
+      nodes.push(el('div', { class: 'ops-hint' }, 'follow-ups (run manually — never auto-run):'));
+      for (const f of followUps) nodes.push(el('div', { class: 'ops-drift-followup' }, f));
+    }
+    pinOutcome(hostKey || 'ops-drift-msg', nodes);
+  }
+
+  async function refreshDrift() {
+    try {
+      renderScopeDrift(await fetchOps('/api/ops/scope-drift'));
+    } catch (err) {
+      console.error('scope-drift refresh failed', err);
+      renderScopeDrift(UNREACHABLE);
+    }
+  }
+
+  // Sequential, STOP on first failure (F-8) — a partial merge must not race
+  // ahead past a rejected entry. follow_ups are surfaced verbatim, never
+  // auto-run (I-7); the report is re-fetched whether the loop succeeded or
+  // stopped, since it IS the recovery view.
+  async function approveAlias(cluster, target, btn, hostKey) {
+    if (btn) btn.disabled = true;
+    // Per-variant, not the cluster aggregate: in a partially-ruled cluster the
+    // aggregate is false while individual members carry their own ruling, and
+    // those must not be aliased away by the bulk button. Shared with the
+    // render-time guard, so no button reaches this with an empty set.
+    const variants = mergeSources(cluster, target);
+    const done = [];
+    let failure = null;
+    for (const v of variants) {
+      try {
+        const r = await fetch('/api/admin/scopes/rule', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ scope: v.scope, action: 'merge_into', target }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) { failure = `${v.scope}: ${j.error || r.status}`; break; }
+        done.push({ scope: v.scope, followUps: (j.meta && j.meta.follow_ups) || [] });
+      } catch (err) {
+        failure = `${v.scope}: ${err.message}`;
+        break;
+      }
+    }
+    renderRulingOutcome(hostKey, done, failure);
+    await refreshDrift();
+  }
+
+  // Deferral (blocker 4). Same request/outcome shape as markDistinct — the
+  // server treats defer/undefer as actions on the ruling endpoint, so the
+  // panel reports them through the one ruling-outcome renderer.
+  async function deferScope(scope, action, note, btn, hostKey) {
+    if (btn) btn.disabled = true;
+    try {
+      const body = { scope, action };
+      if (action === 'defer' && note) body.note = note;
+      const r = await fetch('/api/admin/scopes/rule', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        renderRulingOutcome(hostKey, [], `${scope}: ${j.error || r.status}`);
+        if (btn) btn.disabled = false;
+        return;
+      }
+      deferNoteDraft.delete(scope);
+      renderRulingOutcome(hostKey, [{ scope, followUps: [] }], null);
+    } catch (err) {
+      renderRulingOutcome(hostKey, [], `${scope}: ${err.message}`);
+      if (btn) btn.disabled = false;
+      return;
+    }
+    await refreshDrift();
+  }
+
+  async function markDistinct(scope, btn, hostKey) {
+    if (btn) btn.disabled = true;
+    try {
+      const r = await fetch('/api/admin/scopes/rule', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ scope, action: 'mark_distinct' }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        renderRulingOutcome(hostKey, [], `${scope}: ${j.error || r.status}`);
+        if (btn) btn.disabled = false;
+        return;
+      }
+      renderRulingOutcome(hostKey, [{ scope, followUps: [] }], null);
+    } catch (err) {
+      renderRulingOutcome(hostKey, [], `${scope}: ${err.message}`);
+      if (btn) btn.disabled = false;
+      return;
+    }
+    await refreshDrift();
+  }
+
+  // One-scope merge_into — the change-ruling path (item 8). Same endpoint the
+  // bulk approveAlias loop posts to; the outcome rendering and the report
+  // refresh are identical, so the two paths cannot disagree on what a ruling
+  // looks like. On success the disclosure state is dropped — the rebuilt row
+  // no longer has a ruling to change.
+  async function mergeScopeInto(scope, target, btn, hostKey) {
+    if (btn) btn.disabled = true;
+    const done = [];
+    let failure = null;
+    try {
+      const r = await fetch('/api/admin/scopes/rule', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ scope, action: 'merge_into', target }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) failure = `${scope}: ${j.error || r.status}`;
+      else done.push({ scope, followUps: (j.meta && j.meta.follow_ups) || [] });
+    } catch (err) {
+      failure = `${scope}: ${err.message}`;
+    }
+    if (failure && btn) btn.disabled = false;
+    else {
+      changeRulingOpen.delete(scope);
+      changeRulingTarget.delete(scope);
+    }
+    renderRulingOutcome(hostKey, done, failure);
+    await refreshDrift();
+  }
+
+  // Why the two stop reasons are hinted differently (Codex round-2 item 5):
+  // the split is by CAUSE, not by spelling. BOTH read failures —
+  // 'resolution_read_failed' (the F-7 re-check's uncached table read) and
+  // 'store_read_failed' (the page fetch) — are transient; the call took the
+  // fail-CLOSED branch and archived nothing further, so retrying is exactly the
+  // right move. Only a version or eligibility change means a RULING landed
+  // mid-call, and that is the case the operator must re-read the report about
+  // before doing anything else.
+  function isTransientStop(reason) {
+    return reason === 'resolution_read_failed' || reason === 'store_read_failed';
+  }
+
+  // Item 9 (theme G): the ruling-landed branch names WHAT changed — an
+  // eligibility stop is a ruling on THIS scope; a version stop is the alias
+  // table itself (the response can't say which entry, so the report is the
+  // place to look).
+  function stoppedHint(reason, scope) {
+    if (isTransientStop(reason)) return 'read hiccup — safe to retry: already-archived rows are skipped';
+    return reason === 'eligibility_changed'
+      ? `a ruling landed on ${scope} mid-call — re-check the report before retrying`
+      : 'the alias table changed mid-call (a ruling landed) — re-check the report before retrying';
+  }
+
+  // `container` is the spawning row's status node; the outcome's own re-run
+  // button has no row node to hand over (the row may have been rebuilt), so
+  // null routes the transient status through the pinned outcome instead.
+  async function archiveEphemeralDryRun(scope, container) {
+    if (container) {
+      clear(container);
+      container.append(el('div', { class: 'ops-drift-archive-status' }, 'checking…'));
+    } else {
+      renderArchiveOutcome(scope, [el('div', { class: 'ops-drift-archive-status' }, `${scope}: checking…`)]);
+    }
+    try {
+      const r = await fetch('/api/admin/scopes/archive-ephemeral', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ scope }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (container) clear(container);
+      if (!r.ok) {
+        renderArchiveOutcome(scope, [el('div', { class: 'review-msg-err' },
+          `${scope}: dry-run failed (${r.status}) ${j.error || ''}`.trim())]);
+        return;
+      }
+      const d = j.data;
+      const nodes = [
+        el('div', { class: 'ops-drift-archive-status' }, `${scope}:`),
+        el('div', { class: 'ops-drift-archive-status' },
+          `would archive ${d.archived} (${d.refused_anchored} anchored refused)`),
+      ];
+      if (d.stopped) {
+        // Codex round-2 item 1: a STOPPED dry-run is not a preview. The page
+        // read can fail on the first chunk (the guard is not gated on `apply`),
+        // which previews `would archive 0` while the apply that follows would
+        // walk up to the full 500-row cap. Offering "confirm archive" off that
+        // number would be offering an unbounded action behind a zero. No
+        // confirm button until a CLEAN dry-run: re-run it from the row's
+        // dry-run button.
+        nodes.push(
+          el('div', { class: 'review-msg-err' },
+            `dry-run STOPPED: ${d.stopped} — ${stoppedHint(d.stopped, scope)}`),
+          el('div', { class: 'ops-hint' },
+            'the counts above are partial, so apply is withheld — re-run the dry-run for a clean preview')
+        );
+        // Item 9: "re-run the dry-run" was an instruction with no control (the
+        // row's own button may sit offscreen). Transient stops only — a
+        // ruling-landed stop wants the report re-read, not a reflex retry.
+        if (isTransientStop(d.stopped)) {
+          const rerun = el('button', { class: 'replay-btn radyn-btn' }, 're-run dry-run');
+          rerun.addEventListener('click', () => archiveEphemeralDryRun(scope, null));
+          nodes.push(rerun);
+        }
+        renderArchiveOutcome(scope, nodes);
+        return;
+      }
+      const confirmBtn = el('button', { class: 'replay-btn radyn-btn' }, 'confirm archive of ', scopeLiteral(scope));
+      confirmBtn.addEventListener('click', () => archiveEphemeralApply(scope));
+      // The confirm click is the actual mutation, so the reversibility line
+      // belongs here too — same helper, same sentence as the dry-run button's.
+      nodes.push(actionWithHint(confirmBtn, 'archive'));
+      renderArchiveOutcome(scope, nodes);
+    } catch (err) {
+      if (container) clear(container); // null on the outcome's own re-run path
+      renderArchiveOutcome(scope, [el('div', { class: 'review-msg-err' },
+        `${scope}: dry-run request failed: ${err.message}`)]);
+    }
+  }
+
+  // Codex round-2 item 4c (+ the addendum): EVERY archive-ephemeral outcome —
+  // dry-run preview, its confirm button, and the apply result — goes to the
+  // PERSISTENT #ops-drift-msg area, never to the per-row container.
+  // `renderDriftEphemeral` rebuilds every row from scratch, so anything in that
+  // container is destroyed by the refresh that follows an apply AND by the ops
+  // tab's own 10s poll. For the dry-run that mattered twice over: the STOPPED
+  // warning gating the apply could be wiped mid-read, and the confirm button
+  // could vanish under the operator while they were deciding. This is the same
+  // area every ruling outcome already uses.
+  function renderArchiveOutcome(scope, nodes) {
+    pinOutcome(`eph:${scope}`, nodes);
+  }
+
+  // No container parameter: the confirm button now lives in the persistent
+  // message area, so the row element that spawned this call may already have
+  // been replaced by a poll. Its transient status renders where its result will.
+  async function archiveEphemeralApply(scope) {
+    renderArchiveOutcome(scope, [el('div', { class: 'ops-drift-archive-status' }, `${scope}: archiving…`)]);
+    try {
+      const r = await fetch('/api/admin/scopes/archive-ephemeral', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ scope, apply: true }),
+      });
+      if (r.status === 423) {
+        renderArchiveOutcome(scope, [el('div', { class: 'review-msg-err' },
+          `${scope}: consolidation lock busy — retry shortly`)]);
+        return;
+      }
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        renderArchiveOutcome(scope, [el('div', { class: 'review-msg-err' },
+          `${scope}: archive failed (${r.status}) ${j.error || ''}`.trim())]);
+        return;
+      }
+      const d = j.data;
+      // The peek lists ACTIVE rows only, and this call just archived some of
+      // them — so the cached excerpt set is stale. Drop it; an open peek
+      // refetches on the re-render below, a closed one on its next open.
+      peekCache.delete(scope);
+      const nodes = [];
+      // finalization_failed FIRST and loud (item 4b): the archives stand and
+      // are individually audited, but the carrier row never reached
+      // 'completed', so dream-history and every counter-based view of this pass
+      // under-report it. That has to be read before the counts below it are.
+      if (d.finalization_failed) {
+        nodes.push(el('div', { class: 'review-msg-err' },
+          `${scope}: the audit carrier failed to finalize — the archives below STAND and are individually audited, ` +
+          `but the carrier row may still read "running" with stale counters, so dream-history under-reports this pass`));
+      }
+      const lines = [`archived ${d.archived} (${d.refused_anchored} anchored refused)`];
+      if (d.failed_total > 0) {
+        lines.push(`${d.failed_total} failed${d.failed && d.failed.length < d.failed_total ? ` (showing ${d.failed.length})` : ''}`);
+      }
+      if (d.truncated) lines.push('truncated at the cap — run again to drain (the cap is the design)');
+      if (d.stopped) lines.push(`stopped: ${d.stopped} — ${stoppedHint(d.stopped, scope)}`);
+      if (d.withheld) lines.push(`withheld: ${d.withheld} (${d.withheld_rows ?? 0} rows)`);
+      // Item 4d: `dream_id` is the CARRIER (the audit row), not something the
+      // operator rolls back — rollback is per-memory, off the ids below.
+      if (d.dream_id != null) {
+        lines.push(`audit carrier: dream #${d.dream_id} — rollback is PER-MEMORY, off the archived ids below`);
+      }
+      nodes.push(el('div', { class: 'ops-drift-archive-status' }, `${scope}:`));
+      for (const line of lines) nodes.push(el('div', { class: 'ops-drift-archive-status' }, line));
+      // Item 6 (theme F): the per-row failures were computed, capped server-side
+      // at 20 and returned — then discarded here. Each one is a row the operator
+      // may believe archived that wasn't. First five inline, the rest behind a
+      // details fold; the `failed_total` line above reconciles past the server's
+      // detail cap. Text nodes only — `error` is server-produced free text.
+      if (Array.isArray(d.failed) && d.failed.length > 0) {
+        const rowFor = (f) => el('div', { class: 'ops-drift-failed-row' }, `#${f.memory_id}: ${f.error}`);
+        const failedWrap = el('div', { class: 'ops-drift-failed' });
+        for (const f of d.failed.slice(0, 5)) failedWrap.append(rowFor(f));
+        if (d.failed.length > 5) {
+          failedWrap.append(el('details', { class: 'ops-drift-failed-more' },
+            el('summary', null, `${d.failed.length - 5} more`),
+            d.failed.slice(5).map(rowFor)));
+        }
+        nodes.push(failedWrap);
+      }
+      // Item 4a: the archived ids ARE the undo enumeration — the rows are
+      // already archived by the time this renders, so without the list there is
+      // no way to enumerate what to hand POST /api/memories/:id/rollback short
+      // of a manual archived-rows query. Collapsed (up to 500 ids) and
+      // text-node only.
+      if (Array.isArray(d.archived_ids) && d.archived_ids.length > 0) {
+        const ids = el('details', { class: 'ops-drift-archive-ids' },
+          el('summary', null, `${d.archived_ids.length} archived id${d.archived_ids.length === 1 ? '' : 's'} (copy for rollback)`),
+          el('div', { class: 'ops-drift-archive-idlist' }, d.archived_ids.join(', '))
+        );
+        nodes.push(ids);
+      }
+      // Blocker 2 (theme B): the outcome promised rollback and offered no
+      // control, and its ids died with a dismiss/reload. Persist the pass
+      // (localStorage, capped) and put "roll back N" where the ids are;
+      // progress renders under "recent archive passes", which survives both.
+      if (d.archived > 0 && Array.isArray(d.archived_ids) && d.archived_ids.length > 0) {
+        const pass = {
+          key: `${d.dream_id ?? 'pass'}-${Date.now()}`, ts: Date.now(), scope,
+          dream_id: d.dream_id ?? null, archived: d.archived,
+          failed_total: d.failed_total || 0, ids: d.archived_ids,
+        };
+        recordArchivePass(pass);
+        const rb = el('button', { class: 'replay-btn radyn-btn' },
+          `roll back ${pass.ids.length} row${pass.ids.length === 1 ? '' : 's'} of `, scopeLiteral(scope));
+        rb.addEventListener('click', () => {
+          rb.disabled = true;
+          rb.textContent = 'rolling back — progress under recent archive passes';
+          rollbackPass(pass);
+        });
+        nodes.push(actionWithHint(rb, 'rollback'));
+      }
+      // Item 9 (theme G): "run again to drain" was an instruction with no
+      // control. The continuation is idempotent — archived rows have left the
+      // active set, so a repeat only touches survivors — and it is still an
+      // apply, so it keeps the reversibility line. Truncation and transient
+      // stops only; a ruling-landed stop wants the report re-read first.
+      if (d.truncated || (d.stopped && isTransientStop(d.stopped))) {
+        const again = el('button', { class: 'replay-btn radyn-btn' },
+          'run again — continue archiving ', scopeLiteral(scope));
+        again.addEventListener('click', () => archiveEphemeralApply(scope));
+        nodes.push(
+          el('div', { class: 'ops-hint' },
+            'safe to repeat — already-archived rows are skipped; anchored rows refuse again'),
+          actionWithHint(again, 'archive'));
+      }
+      // Refresh BEFORE rendering (item 4c): renderDriftEphemeral rebuilds the
+      // rows, and doing it after would clear the message we just wrote.
+      await refreshDrift();
+      renderArchiveOutcome(scope, nodes);
+    } catch (err) {
+      renderArchiveOutcome(scope, [el('div', { class: 'review-msg-err' },
+        `${scope}: archive request failed: ${err.message}`)]);
+    }
+  }
+
+  // ---- Recent archive passes + bulk rollback (blocker 2, theme B) ----------
+  // The apply outcome carries the archived ids — the ONLY undo enumeration —
+  // and it used to die with a dismiss or a reload. Passes now persist in
+  // localStorage (newest-first, capped) and each carries a bounded,
+  // progress-reporting bulk rollback. localStorage rather than a server list:
+  // the response's archived_ids is exactly the needed data and already
+  // client-side, while the durable server-side record (the carrier dream +
+  // per-row audits) exists independently in dream-history. The rollback
+  // endpoint needs NO proxy change — /api/memories/:id/rollback has been on
+  // the viz proxy's ADMIN_ROUTES allowlist since T27 (SYNTHESIS §1.1).
+  const ARCHIVE_PASSES_KEY = 'kopeng-viz-archive-passes';
+  const ARCHIVE_PASSES_CAP = 10;
+
+  // Session-scoped fallback when localStorage is unavailable (privacy mode,
+  // quota): the passes section still renders and rollback progress still
+  // paints — only reload-durability is lost, which is the honest best
+  // available (review F5: the inline button used to point at a section that
+  // would render nothing).
+  let archivePassesMem = null;
+
+  function loadArchivePasses() {
+    if (archivePassesMem) return archivePassesMem.slice();
+    try {
+      const list = JSON.parse(localStorage.getItem(ARCHIVE_PASSES_KEY) || '[]');
+      return Array.isArray(list) ? list : [];
+    } catch (err) {
+      return [];
+    }
+  }
+  function saveArchivePasses(list) {
+    const capped = list.slice(0, ARCHIVE_PASSES_CAP);
+    try {
+      localStorage.setItem(ARCHIVE_PASSES_KEY, JSON.stringify(capped));
+      archivePassesMem = null;
+    } catch (err) {
+      archivePassesMem = capped;
+    }
+  }
+  function recordArchivePass(pass) {
+    saveArchivePasses([pass, ...loadArchivePasses()]);
+    renderArchivePasses();
+  }
+  function updateArchivePass(key, patch) {
+    const list = loadArchivePasses();
+    const i = list.findIndex(p => p.key === key);
+    if (i >= 0) {
+      list[i] = Object.assign({}, list[i], patch);
+      saveArchivePasses(list);
+    }
+  }
+
+  // In-flight rollback state lives module-level so a poll rebuild repaints
+  // truthful progress instead of wiping it (the pinnedOutcome doctrine).
+  const rollbackState = new Map(); // pass.key → { running, done, total, failures, finished }
+
+  function passStatusText(pass) {
+    const st = rollbackState.get(pass.key);
+    if (st && st.running) {
+      return `rolling back… ${st.done}/${st.total}${st.failures.length ? ` (${st.failures.length} failed)` : ''}`;
+    }
+    if (typeof pass.rolled_back === 'number') {
+      const remaining = Array.isArray(pass.remaining_ids) ? pass.remaining_ids.length : 0;
+      return `rolled back ${pass.rolled_back}/${pass.ids.length}`
+        + (remaining ? ` — ${remaining} still archived` : '');
+    }
+    return '';
+  }
+
+  function repaintPassStatus(key) {
+    const node = document.querySelector(`[data-pass-status="${key.replace(/"/g, '\\"')}"]`);
+    const pass = loadArchivePasses().find(p => p.key === key);
+    if (node && pass) node.textContent = passStatusText(pass);
+  }
+
+  // Sequential by design: each rollback is its own audited restore, failures
+  // are independent, and one slow id must not hide progress. Failures are
+  // RETAINED per id (SYNTHESIS §1.2f) and the loop continues past them —
+  // a rollback pass is a rescue, not a transaction. Re-runnable ONLY over the
+  // ids that stayed archived: state is re-read fresh by key (review F2 — the
+  // pinned outcome's button holds a stale pass object, and re-rolling an
+  // already-restored id would restore its pre-rollback snapshot and mint junk
+  // revisions), and a fully-rescued pass is a no-op.
+  async function rollbackPass(passRef) {
+    const key = passRef.key;
+    const existing = rollbackState.get(key);
+    if (existing && existing.running) return;
+    const pass = loadArchivePasses().find(p => p.key === key) || passRef;
+    const idsToRoll = Array.isArray(pass.remaining_ids)
+      ? pass.remaining_ids
+      : (typeof pass.rolled_back === 'number' ? [] : pass.ids);
+    if (idsToRoll.length === 0) return;
+    const st = { running: true, done: 0, total: idsToRoll.length, failures: [], finished: false };
+    rollbackState.set(key, st);
+    renderArchivePasses();
+    for (const id of idsToRoll) {
+      try {
+        const r = await fetch(`/api/memories/${id}/rollback`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '{}',
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) st.failures.push({ id, error: String(j.error || r.status) });
+      } catch (err) {
+        st.failures.push({ id, error: err.message });
+      }
+      st.done++;
+      repaintPassStatus(key);
+    }
+    st.running = false;
+    st.finished = true;
+    // Persist the outcome INCLUDING the per-id failures (review F4): after a
+    // reload the in-memory state is gone, and the failed ids are the only
+    // record of which rows are still archived. Cumulative accounting: every
+    // id not in THIS run's failures is rescued now or was rescued before.
+    const failedIds = st.failures.map(f => f.id);
+    updateArchivePass(key, {
+      rolled_back: pass.ids.length - failedIds.length,
+      rollback_failures: failedIds.length,
+      remaining_ids: failedIds,
+      failures: st.failures,
+    });
+    await refreshDrift(); // restored rows return to the active lists
+    renderArchivePasses();
+  }
+
+  // Open-details state, so the 10s poll's rebuild can't snap an id list or
+  // failure fold shut mid-read (review F3 — the peekOpen doctrine, again).
+  const passDetailsOpen = new Set(); // `${pass.key}:ids` | `${pass.key}:failures`
+
+  function passDetails(openKey, cls, summaryText, kids) {
+    const d = el('details', { class: cls }, el('summary', null, summaryText), kids);
+    d.open = passDetailsOpen.has(openKey);
+    d.addEventListener('toggle', () => {
+      if (d.open) passDetailsOpen.add(openKey);
+      else passDetailsOpen.delete(openKey);
+    });
+    return d;
+  }
+
+  function renderArchivePasses() {
+    const wrap = document.getElementById('ops-drift-passes');
+    const head = document.getElementById('ops-drift-passes-h');
+    if (!wrap) return;
+    const passes = loadArchivePasses();
+    if (head) head.hidden = passes.length === 0;
+    clear(wrap);
+    for (const pass of passes) {
+      const st = rollbackState.get(pass.key);
+      const row = el('div', { class: 'ops-drift-pass-row' });
+      row.append(el('div', { class: 'ops-drift-pass-head' },
+        el('span', { class: 'ops-drift-variant-scope' }, pass.scope),
+        el('span', { class: 'radyn-pill' }, `${pass.archived} archived`),
+        pass.failed_total ? el('span', { class: 'radyn-pill radyn-pill--error' }, `${pass.failed_total} failed`) : null,
+        pass.dream_id != null ? el('span', { class: 'radyn-pill' }, `carrier #${pass.dream_id}`) : null,
+        el('span', { class: 'ops-drift-reason' }, fmtAge(new Date(pass.ts).toISOString()))
+      ));
+      if (pass.ids.length > 0) {
+        row.append(passDetails(`${pass.key}:ids`, 'ops-drift-archive-ids',
+          `${pass.ids.length} archived id${pass.ids.length === 1 ? '' : 's'}`,
+          el('div', { class: 'ops-drift-archive-idlist' }, pass.ids.join(', '))));
+      }
+      row.append(el('div', {
+        class: 'ops-drift-archive-status',
+        dataset: { passStatus: pass.key },
+      }, passStatusText(pass)));
+      // Live failures during/after a run in this session; the PERSISTED list
+      // otherwise (review F4 — after a reload it is the only record of which
+      // rows stayed archived).
+      const failures = (st && st.failures.length > 0) ? st.failures
+        : (Array.isArray(pass.failures) ? pass.failures : []);
+      if (failures.length > 0) {
+        const failedWrap = el('div', { class: 'ops-drift-failed' });
+        for (const f of failures.slice(0, 5)) {
+          failedWrap.append(el('div', { class: 'ops-drift-failed-row' }, `#${f.id}: ${f.error}`));
+        }
+        if (failures.length > 5) {
+          failedWrap.append(passDetails(`${pass.key}:failures`, 'ops-drift-failed-more',
+            `${failures.length - 5} more`,
+            failures.slice(5).map(f => el('div', { class: 'ops-drift-failed-row' }, `#${f.id}: ${f.error}`))));
+        }
+        row.append(failedWrap);
+      }
+      const actions = el('div', { class: 'review-actions ops-drift-actions' });
+      // First run rolls everything; afterwards the button offers ONLY the
+      // still-archived remainder (review F1 — an all-423 pass must stay
+      // retryable, not become a dead list).
+      const remaining = Array.isArray(pass.remaining_ids)
+        ? pass.remaining_ids
+        : (typeof pass.rolled_back === 'number' ? [] : pass.ids);
+      if (remaining.length > 0 && !(st && st.running)) {
+        const isRetry = typeof pass.rolled_back === 'number';
+        const btn = el('button', { class: 'replay-btn radyn-btn' },
+          `${isRetry ? 'retry rollback of' : 'roll back'} ${remaining.length} row${remaining.length === 1 ? '' : 's'} of `,
+          scopeLiteral(pass.scope));
+        btn.addEventListener('click', () => { btn.disabled = true; rollbackPass(pass); });
+        actions.append(actionWithHint(btn, 'rollback'));
+      }
+      const rm = el('button', { class: 'replay-btn radyn-btn ops-drift-dismiss' }, 'remove from list');
+      rm.addEventListener('click', () => {
+        saveArchivePasses(loadArchivePasses().filter(p => p.key !== pass.key));
+        renderArchivePasses();
+      });
+      actions.append(rm);
+      row.append(actions);
+      wrap.append(row);
+    }
+  }
+
+  // ---- Minimal text filter (item 12, theme H subset) ----------------------
+  // "Find one of 71" with no scrolling. Deliberately minimal: substring match
+  // over the scope strings an operator would actually type, no sort, no facets
+  // — the full scanning treatment (sort, collapse-at-rest, saved views) is the
+  // Phase-5 design pass, which should design that surface rather than inherit
+  // a guess at it.
+  //
+  // Two rules this shares with the deferral counter, for the same reason:
+  // the filter narrows the LIST only — the summary chips stay corpus-wide
+  // truth — and whenever it hides anything it SAYS SO with a count, so a
+  // filtered panel can never be mistaken for a clean one.
+  let driftFilter = '';
+  // The last GOOD report + when it arrived, so a keystroke re-renders without
+  // refetching — and so a stale repaint can SAY how old it is (review F1).
+  let lastDriftReport = null;
+  let lastDriftAt = 0;
+  let driftUnreachable = false;
+
+  function driftFilterMatches(text) {
+    return String(text || '').toLowerCase().includes(driftFilter);
+  }
+
+  // A row hosting the operator's pending outcome is NEVER filtered away
+  // (review F2): the pinned nodes carry the dry-run's confirm button and the
+  // archived-id list — the only undo enumeration — and filtering the host
+  // out would relocate them to the top of the card, off-screen, reviving the
+  // exact "the click read as nothing happened" defect the pinning fixed.
+  function hostsPinnedOutcome(key) {
+    return !!pinnedOutcome && pinnedOutcome.key === key;
+  }
+
+  // A cluster matches on its key or ANY variant scope: the operator types a
+  // spelling they saw, which may be a variant rather than the slug key.
+  function clusterMatchesFilter(cluster) {
+    if (!driftFilter) return true;
+    if (hostsPinnedOutcome(`cluster:${cluster.key}`)) return true;
+    if (driftFilterMatches(cluster.key)) return true;
+    return (cluster.variants || []).some(v => driftFilterMatches(v.scope));
+  }
+
+  function ephemeralMatchesFilter(e) {
+    if (!driftFilter) return true;
+    if (hostsPinnedOutcome(`eph:${e.scope}`)) return true;
+    return driftFilterMatches(e.scope) || driftFilterMatches(e.reason);
+  }
+
+  function wireDriftFilter() {
+    const input = document.getElementById('ops-drift-filter-input');
+    const clearBtn = document.getElementById('ops-drift-filter-clear');
+    if (!input || input.dataset.wired) return; // static node — wire once
+    input.dataset.wired = '1';
+    let debounce = null;
+    const apply = () => {
+      driftFilter = input.value.trim().toLowerCase();
+      if (clearBtn) clearBtn.hidden = driftFilter === '';
+      // Re-render from the last report — no refetch, so typing never waits on
+      // the network. `stale` is load-bearing: repainting a cached report as
+      // though it were live would erase the api-unreachable state (F1).
+      if (lastDriftReport) renderScopeDrift(lastDriftReport, { stale: driftUnreachable });
+    };
+    // Coalesce keystrokes (review F3): each apply rebuilds 40+ clusters and
+    // 70+ rows and re-reads the passes list from localStorage; at 120ms the
+    // typing still feels immediate.
+    const applyDebounced = () => {
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(apply, 120);
+    };
+    input.addEventListener('input', applyDebounced);
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') { input.value = ''; if (debounce) clearTimeout(debounce); apply(); }
+    });
+    if (clearBtn) {
+      clearBtn.addEventListener('click', () => {
+        input.value = '';
+        if (debounce) clearTimeout(debounce);
+        apply();
+        input.focus();
+      });
+    }
+    // Adopt a value the browser restored (session restore / bfcache survive
+    // autocomplete="off"), so the field and the filter can't disagree — F5.
+    if (input.value.trim() !== '') apply();
+  }
+
+  function renderDriftFilterCount(shownClusters, totalClusters, shownEph, totalEph) {
+    const countEl = document.getElementById('ops-drift-filter-count');
+    if (!countEl) return;
+    if (!driftFilter) { countEl.textContent = ''; return; }
+    countEl.textContent =
+      `showing ${shownClusters} of ${totalClusters} cluster${totalClusters === 1 ? '' : 's'}`
+      + ` · ${shownEph} of ${totalEph} ephemeral scope${totalEph === 1 ? '' : 's'}`
+      + ' — the chips above stay corpus-wide';
+  }
+
+  function renderScopeDrift(report, opts) {
+    // `stale` = re-rendered from cache while the API is unreachable (the
+    // filter path). The rows are shown because losing them mid-filter is
+    // worse, but the panel must never LOOK live: an operator ruling against
+    // an arbitrarily old report is the failure this flag exists to prevent.
+    const stale = !!(opts && opts.stale);
+    // The 10s poll rebuilds every row, which would drop keyboard focus from a
+    // mid-typing free-target input (its VALUE survives via changeRulingTarget;
+    // focus and caret do not). Capture before the teardown, restore after —
+    // the same survive-the-poll doctrine as peekOpen/pinnedOutcome.
+    const active = document.activeElement;
+    const focusedTarget = active && active.classList
+      && active.classList.contains('ops-drift-target-input')
+      ? { scope: active.dataset.targetInput, start: active.selectionStart, end: active.selectionEnd }
+      : null;
+    const sub = document.getElementById('ops-drift-sub');
+    const chips = document.getElementById('ops-drift-chips');
+    const clustersEl = document.getElementById('ops-drift-clusters');
+    const foot = document.getElementById('ops-drift-foot');
+    if (!chips || !clustersEl) return; // markup missing (stale cached page) — degrade silently
+    wireDriftFilter();
+    // Keep the last GOOD report so a keystroke during an outage can re-render
+    // it — LABELLED stale (see `stale` above), never as if it were live.
+    if (report && !report.__unreachable) {
+      lastDriftReport = report;
+      lastDriftAt = Date.now();
+      driftUnreachable = false;
+    }
+
+    // Distinguish UNREACHABLE (api down) from an empty-but-healthy report
+    // (the 2026-07-03 false-alarm rule) — an empty `clusters`/`ephemeral` list
+    // is a legitimate "nothing to rule" state, not a fetch failure.
+    if (!report || report.__unreachable) {
+      driftUnreachable = true;
+      if (sub) sub.textContent = 'api unreachable';
+      clear(chips);
+      chips.append(el('span', { class: 'ops-empty' }, 'could not reach /api/ops/scope-drift'));
+      clear(clustersEl);
+      const ephemeralWrap = document.getElementById('ops-drift-ephemeral');
+      if (ephemeralWrap) {
+        clear(ephemeralWrap);
+        ephemeralWrap.append(el('div', { class: 'ops-empty' }, 'api unreachable'));
+      }
+      if (foot) foot.textContent = '';
+      // NOT "0 of 0" (review F4): during a fetch failure nothing is known,
+      // and a zero reads as corpus truth in exactly that state.
+      const countEl = document.getElementById('ops-drift-filter-count');
+      if (countEl) countEl.textContent = '';
+      return;
+    }
+
+    if (sub) {
+      sub.textContent = stale
+        ? `API UNREACHABLE — showing the last report, from ${new Date(lastDriftAt).toLocaleTimeString()}`
+        : 'the Librarian — Phase A';
+    }
+    const s = report.summary || {};
+    clear(chips);
+    // Leads the row so every number after it is read as historical, and the
+    // action buttons below are understood to be aimed at a stale report.
+    if (stale) chips.append(driftChip('stale', 'not live', 'error'));
+    chips.append(
+      driftChip('rows adrift', s.active_rows_adrift ?? 0, (s.active_rows_adrift ?? 0) > 0 ? 'error' : 'success'),
+      driftChip('clusters actionable', s.clusters_actionable ?? 0, (s.clusters_actionable ?? 0) > 0 ? 'warning' : ''),
+      driftChip('ruled distinct', s.clusters_ruled_distinct ?? 0, ''),
+      // Additive counter (§1.2a): deferred work stays counted and visible —
+      // `countOrDash` so a pre-blocker-4 server reads '—', never a false 0.
+      driftChip('deferred', countOrDash(s.clusters_deferred), (s.clusters_deferred ?? 0) > 0 ? 'warning' : ''),
+      driftChip('ephemeral', `${s.ephemeral_scopes ?? 0} scopes / ${s.ephemeral_rows ?? 0} rows`, ''),
+      driftChip('alias rejects', s.alias_entries_rejected ?? 0, (s.alias_entries_rejected ?? 0) > 0 ? 'error' : 'success')
+    );
+
+    const allClusters = report.clusters || [];
+    const allEphemeral = report.ephemeral || [];
+    const shownClusters = allClusters.filter(clusterMatchesFilter);
+    const shownEphemeral = allEphemeral.filter(ephemeralMatchesFilter);
+    renderDriftFilterCount(shownClusters.length, allClusters.length,
+      shownEphemeral.length, allEphemeral.length);
+
+    clear(clustersEl);
+    if (allClusters.length === 0) {
+      clustersEl.append(el('div', { class: 'ops-empty' }, 'no drift clusters — nothing to rule'));
+    } else if (shownClusters.length === 0) {
+      // Never a bare empty list under a filter: an operator who forgot the
+      // filter was on would read "nothing to rule" as corpus truth.
+      clustersEl.append(el('div', { class: 'ops-empty' }, `no cluster matches "${driftFilter}"`));
+    } else {
+      // Server pre-sorts worst-first (most live un-aliased rows).
+      for (const cluster of shownClusters) clustersEl.append(renderDriftCluster(cluster));
+    }
+
+    renderDriftEphemeral(shownEphemeral, allEphemeral.length);
+    renderArchivePasses();
+    // Re-attach the operator's pending outcome to its freshly rebuilt host —
+    // this is what lets the 10s poll keep the panel live without wiping a
+    // preview or its confirm button. Never scrolls: a poll must not move the
+    // page (the orphaned-host scroll is reserved for the user-action path).
+    attachPinnedOutcome();
+    if (focusedTarget && focusedTarget.scope) {
+      const inp = document.querySelector(
+        `[data-target-input="${focusedTarget.scope.replace(/"/g, '\\"')}"]`);
+      if (inp) {
+        inp.focus();
+        try { inp.setSelectionRange(focusedTarget.start, focusedTarget.end); }
+        catch { /* selection restore is best-effort */ }
+      }
+    }
+
+    if (foot) {
+      // The alias-table version is what the archive-ephemeral F-7 guard
+      // reasons about, so a stale one must not read as current.
+      const ver = ((s.alias_table_version || '').slice(0, 8) || '—') + (stale ? ' (stale)' : '');
+      foot.textContent = `alias table ${ver} · ${s.scopes_total ?? 0} scopes · ${s.near_miss_pairs ?? 0} near-miss pairs`;
+    }
+  }
+
   async function pollOpsFast() {
     if (activeTab !== 'ops') return;
     setOpsStatus('fetching…');
     try {
-      const [disc, reasoner, prom, conf, cache, dream] = await Promise.all([
+      const [disc, reasoner, prom, conf, cache, dream, drift] = await Promise.all([
         fetchOps('/api/ops/discovery-status').catch(() => UNREACHABLE),
         fetchOps('/api/ops/reasoner-status').catch(() => UNREACHABLE),
         fetchOps('/api/ops/last-promotion').catch(() => UNREACHABLE),
         fetchOps('/api/ops/confidence-distribution').catch(() => UNREACHABLE),
         fetchOps('/api/ops/cache-stats').catch(() => UNREACHABLE),
         fetchOps('/api/ops/dream-history?limit=15').catch(() => UNREACHABLE),
+        fetchOps('/api/ops/scope-drift').catch(() => UNREACHABLE),
       ]);
       renderDiscoveryStatus(disc);
       renderReasonerStatus(reasoner);
@@ -1704,6 +3407,7 @@ window.addEventListener('resize', () => {
       renderConfidence(conf);
       renderCacheStats(cache);
       renderDreamHistory(dream);
+      renderScopeDrift(drift);
       setOpsStatus('updated ' + new Date().toLocaleTimeString('en-US', { hour12: false }));
     } catch (err) {
       console.error('ops poll failed', err);
@@ -2175,7 +3879,11 @@ window.addEventListener('resize', () => {
         const applied = (c.auto_applied ?? 0) + (c.accepted ?? 0);
         const tr = el('tr', { class: 'review-row' + (d.id === reviewSelectedId ? ' review-row-active' : '') },
           el('td', { title: d.completed_at || d.started_at }, fmtAge(d.completed_at || d.started_at)),
-          el('td', { title: d.window_key }, d.mode === 'whole_corpus' ? 'whole' : (d.window_key || '—')),
+          // Carrier rows ride in this list looking like any other whole-corpus
+          // pass; the pill is what distinguishes "this archived 19 rows" from
+          // "this examined the corpus and proposed nothing".
+          el('td', { title: d.window_key }, d.mode === 'whole_corpus' ? 'whole' : (d.window_key || '—'),
+            d.is_carrier ? el('span', { class: 'radyn-pill review-carrier-pill' }, 'carrier') : null),
           el('td', null, String(d.memories_examined ?? '—')),
           el('td', null, String(c.proposed ?? 0)),
           el('td', null, String(applied)),
@@ -2337,6 +4045,11 @@ window.addEventListener('resize', () => {
     pane.append(el('div', { class: 'review-entry-head' },
       el('b', null, `dream #${dream.id}`),
       el('span', { class: 'review-badge radyn-pill' }, dream.scope || '—'),
+      // An audit carrier is the row a bulk archive hangs its audit off, not a
+      // dream that proposed anything — worth saying out loud, since its entry
+      // list reads the same as an ordinary empty pass. Absent = ordinary pass,
+      // so only the true case earns a badge.
+      dream.is_carrier ? el('span', { class: 'review-badge radyn-pill' }, 'carrier') : null,
       el('span', { class: 'review-badge radyn-pill review-badge-tier' }, dream.status || '—'),
       el('span', { class: 'review-badge radyn-pill review-badge-tier' }, `${dream.changes_auto_applied ?? 0} auto · ${dream.changes_queued ?? 0} queued`)
     ));

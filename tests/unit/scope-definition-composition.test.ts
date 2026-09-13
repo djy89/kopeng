@@ -16,9 +16,12 @@
  * correctness is scope-resolver.test.ts's job.
  */
 import { describe, it, expect } from 'vitest';
-import { buildScopeResolution } from '../../src/scopes/resolver.js';
+import { buildScopeResolution, EMPTY_RESOLUTION } from '../../src/scopes/resolver.js';
 import { ScopeAliasService, SCOPE_ALIASES_CONFIG_KEY } from '../../src/services/scope-alias.js';
-import { buildScopeDrift } from '../../src/scopes/drift.js';
+import { buildScopeDrift, DistinctRulings } from '../../src/scopes/drift.js';
+import { holdVerdict } from '../../src/discovery/hold.js';
+import { ScopeRegistryQueries } from '../../src/database/scope-registry-queries.js';
+import { createTestDatabase } from '../fixtures/test-helpers.js';
 import type { IOperatorConfigStore } from '../../src/database/interfaces.js';
 
 /** Every rejection class at once, plus one entry that must survive. */
@@ -94,5 +97,44 @@ describe('one definition of the alias table, across every consumer', () => {
     for (const [alias, canonical] of pairs) {
       expect(await svc.canonicalize(alias)).toBe(canonical);
     }
+  });
+});
+
+describe('T76: the hold predicate and the drift detector agree on ruled-distinct scopes', () => {
+  it('a mark_distinct ruling releases the SAME scope from both the hold predicate and drift\'s ephemeral evidence, reading one registry source', async () => {
+    const { db } = createTestDatabase();
+    const store = new ScopeRegistryQueries(db);
+    await store.register({
+      scope: 'project:20260901-demo', slug: 'project:20260901-demo',
+      claimant_raw: 'project:20260901-demo', origin_cwd: null, status: 'provisional',
+    });
+    // A sibling of the same ephemeral shape, left unruled — the control.
+    await store.register({
+      scope: 'project:20260902-other', slug: 'project:20260902-other',
+      claimant_raw: 'project:20260902-other', origin_cwd: null, status: 'provisional',
+    });
+    await store.markDistinct('project:20260901-demo', '2026-09-01T00:00:00Z');
+
+    const rows = await store.listAll();
+    const isRuledDistinct = async (s: string) => rows.find(r => r.scope === s)?.ruled_distinct_at != null;
+
+    // The hold predicate releases the ruled scope; the unruled sibling stays held.
+    expect(await holdVerdict('project:20260901-demo', { isRuledDistinct })).toBe(false);
+    expect(await holdVerdict('project:20260902-other', { isRuledDistinct })).toBe(true);
+
+    // The drift detector, built from the SAME rows via DistinctRulings, agrees:
+    // both scopes are ephemeral-shaped, so they land in the ephemeral list, and
+    // the ruled one alone carries ruled_distinct: true.
+    const distinct = DistinctRulings.fromRegistryRows(rows);
+    const agg = (scope: string, active: number) =>
+      ({ scope, total: active, active, archived: 0, by_type: {}, by_source: {}, first_write: null, last_write: null });
+    const report = buildScopeDrift(
+      [agg('project:20260901-demo', 1), agg('project:20260902-other', 1)],
+      EMPTY_RESOLUTION,
+      distinct,
+    );
+    const byScope = Object.fromEntries(report.ephemeral.map(e => [e.scope, e]));
+    expect(byScope['project:20260901-demo'].ruled_distinct).toBe(true);
+    expect(byScope['project:20260902-other'].ruled_distinct).toBe(false);
   });
 });

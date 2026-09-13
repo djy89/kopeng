@@ -2,7 +2,7 @@ import type pg from 'pg';
 import type { IDreamStore, IOperatorConfigStore } from './interfaces.js';
 import { PgQueries } from './pg-queries.js';
 import {
-  PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON, REVISION_KEEP_PER_MEMORY,
+  REVISION_KEEP_PER_MEMORY,
   type Dream, type DreamDiff, type MemoryRevision, type DreamAuditEntry, type OperatorConfig,
   type DreamMode, type DreamTrigger, type ConsolidationLock,
 } from '../types/types.js';
@@ -34,11 +34,12 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
     window_key?: string | null;
     input_obs_start_id?: number | null;
     input_obs_end_id?: number | null;
+    is_carrier?: boolean;
   }): Promise<Dream> {
     const r = await this.pool.query(
       `INSERT INTO dreams (operator_id, scope, mode, trigger_source, reason, window_key,
-        input_obs_start_id, input_obs_end_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        input_obs_start_id, input_obs_end_id, is_carrier)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
       [
         input.operator_id ?? 'default',
@@ -49,6 +50,7 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
         input.window_key ?? null,
         input.input_obs_start_id ?? null,
         input.input_obs_end_id ?? null,
+        input.is_carrier ?? false,
       ]
     );
     return rowToDream(r.rows[0]);
@@ -87,17 +89,19 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
   }
 
   async getLastCompletedDream(operatorId: string, scope: string | null, mode: DreamMode): Promise<Dream | null> {
-    // Excludes promotion + discovery-maintenance audit-carrier rows (P3, Phase
-    // 2): a carrier is a real completed dreams row that exists only to route
-    // archives through the audited apply path, not an actual dream pass —
-    // counting it satisfies the once-per-period gate and permanently blocks
-    // the whole-corpus sweep from firing.
+    // Excludes audit-carrier rows (F-5): a carrier is a real completed dreams
+    // row that exists only to route archives through the audited apply path,
+    // not an actual dream pass — counting it satisfies the once-per-period
+    // gate and permanently blocks the whole-corpus sweep from firing. The
+    // is_carrier COLUMN is the discriminator, not a reason-string match — a
+    // third carrier writer can never silently bypass this (the P3 deadlock
+    // class this closes).
     const r = await this.pool.query(
       `SELECT * FROM dreams WHERE operator_id = $1 AND mode = $2
         AND scope IS NOT DISTINCT FROM $3 AND status = 'completed'
-        AND COALESCE(reason, '') NOT IN ($4, $5)
+        AND is_carrier = FALSE
        ORDER BY started_at DESC, id DESC LIMIT 1`,
-      [operatorId, mode, scope, PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON]
+      [operatorId, mode, scope]
     );
     return r.rows.length ? rowToDream(r.rows[0]) : null;
   }
@@ -112,9 +116,9 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
   async listRecentDreams(limit: number, offset: number = 0): Promise<Dream[]> {
     // Carriers are INCLUDED here (team-review #22 S3): they perform real,
     // automatic archives, so dream-history is their one operator-facing record
-    // — the ops endpoint labels them `is_carrier`. The carrier exclusion lives
-    // only where it is load-bearing: getLastCompletedDream (the once-per-period
-    // scheduler gate) and listPendingDreams (the review queue).
+    // — the ops endpoint labels them via the is_carrier column (F-5). The
+    // carrier exclusion lives only where it is load-bearing: getLastCompletedDream
+    // (the once-per-period scheduler gate) and listPendingDreams (the review queue).
     const r = await this.pool.query(
       `SELECT * FROM dreams WHERE status = 'completed'
        ORDER BY started_at DESC, id DESC LIMIT $1 OFFSET $2`,
@@ -126,13 +130,14 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
   async listPendingDreams(limit: number): Promise<Dream[]> {
     // Carrier exclusion in the QUERY, matching listRecentDreams/getLastCompletedDream
     // (team-review #22): carriers previously stayed out of the review queue only because
-    // their writers hardcode acceptance_status — an incidental value, not a rule.
+    // their writers hardcode acceptance_status — an incidental value, not a rule. F-5:
+    // the exclusion is now the is_carrier COLUMN, not a reason-string match.
     const r = await this.pool.query(
       `SELECT * FROM dreams WHERE status = 'completed'
         AND acceptance_status IN ('pending', 'partial')
-        AND COALESCE(reason, '') NOT IN ($2, $3)
+        AND is_carrier = FALSE
        ORDER BY started_at DESC, id DESC LIMIT $1`,
-      [limit, PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON]
+      [limit]
     );
     return r.rows.map(rowToDream);
   }
@@ -449,6 +454,7 @@ function rowToDream(row: Record<string, unknown>): Dream {
     scope: (row.scope as string | null) ?? null,
     mode: row.mode as Dream['mode'],
     trigger_source: row.trigger_source as Dream['trigger_source'],
+    is_carrier: row.is_carrier === true || row.is_carrier === 1,
     reason: (row.reason as string | null) ?? null,
     window_key: (row.window_key as string | null) ?? null,
     input_obs_start_id: row.input_obs_start_id !== null && row.input_obs_start_id !== undefined ? Number(row.input_obs_start_id) : null,

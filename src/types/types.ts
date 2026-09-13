@@ -25,6 +25,9 @@ export const PROMOTION_CARRIER_REASON = 'promotion decay archival (R14 audited p
 /** Marks the internal dream row that carries discovery-maintenance's audited archives. */
 export const MAINTENANCE_CARRIER_REASON = 'discovery-maintenance archival (Phase 2 audited path)';
 
+/** Marks the carrier that routes the T76 archive-ephemeral bulk archives (operator-clicked). */
+export const ARCHIVE_EPHEMERAL_CARRIER_REASON = 'ephemeral-scope archival (T76 operator action)';
+
 /**
  * Retention bound for OPERATOR-EDIT revisions (team-review #22): snapshotRevision trims each
  * memory's `created_by_dream_id IS NULL` revisions to the newest N. Dream-linked revisions are
@@ -268,8 +271,29 @@ export interface ScopeAggregateRow {
   total: number;
   active: number;
   archived: number;
+  /**
+   * ACTIVE rows the Hard Anchor protects — the number an archive of this scope
+   * would refuse (item 11). Active-only by design: archived rows cannot be
+   * archived again, so counting them would inflate the "how much of this is
+   * untouchable?" answer the triage line exists to give. Counted in SQL via
+   * `ANCHORED_SQL_PREDICATE`, which is pinned equivalent to the `isAnchored`
+   * contract by `tests/unit/anchored-aggregate.test.ts`.
+   */
+  anchored: number;
   /** memory type -> count, over all rows in this scope. */
   by_type: Record<string, number>;
+  /** memory source -> count, over all rows in this scope (T76 §5.1: separates
+   *  auto-discovery from operator writes directly, instead of via the type proxy).
+   *  NULL source folds under 'unknown'. */
+  by_source: Record<string, number>;
+  /**
+   * The same breakdown over ACTIVE rows only. `by_source` counts archived rows
+   * too, so any figure derived by subtracting it from `active` is comparing
+   * two different populations — which inverted the triage verdict on scopes
+   * with a large archived backlog (item 11 review F3). Free to compute: the
+   * (scope, type, source) group row already carries its own active count.
+   */
+  by_source_active: Record<string, number>;
   first_write: string | null;
   last_write: string | null;
 }
@@ -400,17 +424,21 @@ export type DreamTrigger = 'scheduled' | 'manual';
 export type DreamAcceptance = 'pending' | 'partial' | 'accepted' | 'rejected' | 'auto_applied' | 'empty';
 export type DreamStatus = 'running' | 'completed' | 'failed';
 /**
- * `promote_global` (D1.2/R6): cross-scope duplicate routed to the cross-scope
- * promotion path — a diff-only signal (never applied by the dream apply path).
- * `rollback` (D1.3): audit-only — written when a memory_revisions snapshot is
- * restored over the live row; never emitted in a diff. Both are covered by the
- * dream_audit_log CHECK as of SQLite v6 / PG v8.
- * `conditional` (D2.2): reasoner-classified branch pair — apply encodes
- * "when X→A; when Y→B" as a new memory with provenance; audited (SQLite v7 /
- * PG v9). `contested` (D2.2): contradiction with no clear distinguisher —
- * diff-only, queued for the operator, NEVER applied or audited.
+ * T76 (T-M5): the diff and audit roles are separated AT THE TYPE LEVEL.
+ * Diff classes are proposals in the review pipeline; audit classes are applied
+ * changes in dream_audit_log. They share the members that genuinely appear in
+ * both; 'rollback' and 'archive_ephemeral' are audit-only (never proposed),
+ * 'contested' is diff-only (reviewed, never applied — hence never audited).
+ * Phase B adds 'curation' to the DIFF side only.
  */
-export type DreamChangeClass = 'exact_dup' | 'decay' | 'merge' | 'supersede' | 'reinforce' | 'promote_global' | 'rollback' | 'conditional' | 'contested';
+export type DreamDiffClass =
+  | 'exact_dup' | 'decay' | 'merge' | 'supersede' | 'reinforce'
+  | 'promote_global' | 'conditional' | 'contested';
+export type DreamAuditClass =
+  | 'exact_dup' | 'decay' | 'merge' | 'supersede' | 'reinforce'
+  | 'promote_global' | 'rollback' | 'conditional' | 'archive_ephemeral';
+/** Back-compat union — prefer the specific split in new code. */
+export type DreamChangeClass = DreamDiffClass | DreamAuditClass;
 /** Deterministic-safe entries may auto-apply; reasoner-driven entries are queued for review. */
 export type DreamDiffTier = 'deterministic-safe' | 'reasoner-driven';
 
@@ -421,6 +449,15 @@ export interface Dream {
   scope: string | null;
   mode: DreamMode;
   trigger_source: DreamTrigger;
+  /**
+   * T76 (F-5): persisted carrier identity. Set only by `CarrierDream.open()` —
+   * a real dreams row that exists purely to route audited archives through the
+   * apply path, not an actual dream pass. Readers exclude on this column, not
+   * on `reason` string matching (the P3 deadlock class: a third carrier reason
+   * nobody hardcoded into the two exclusion constants used to silently satisfy
+   * the once-per-period gate).
+   */
+  is_carrier: boolean;
   reason: string | null;
   window_key: string | null;
   input_obs_start_id: number | null;
@@ -439,7 +476,7 @@ export interface Dream {
 
 /** A single proposed change within a dream pass. Serialized into `dreams.output_diff`. */
 export interface DreamDiffEntry {
-  change_class: DreamChangeClass;
+  change_class: DreamDiffClass;
   tier: DreamDiffTier;
   memory_ids: number[];
   rationale: string;
@@ -512,7 +549,7 @@ export interface DreamAuditEntry {
   dream_id: number;
   memory_id: number | null;
   revision_id: number | null;
-  change_class: DreamChangeClass;
+  change_class: DreamAuditClass;
   action: string | null;
   applied_automatically: boolean;
   before_ref: string | null;

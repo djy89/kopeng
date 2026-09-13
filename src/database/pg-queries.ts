@@ -5,6 +5,7 @@ import type { IMemoryStore } from './interfaces.js';
 import { computeContentHash, generateSummary, foldScopeAggregates } from './queries.js';
 import { computeDecayScores } from '../promotion/decay.js';
 import { ARCHIVED_SQL_PREDICATE } from '../utils/archived.js';
+import { ANCHORED_SQL_PREDICATE } from '../dreaming/scoring.js';
 
 function embeddingBufferToVector(buf: Buffer): string {
   const arr = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
@@ -816,23 +817,27 @@ export class PgQueries implements IMemoryStore {
     // here because the pg driver hands back Date objects, and foldScopeAggregates
     // compares them as strings.
     const result = await this.pool.query<{
-      scope: string; type: string; n: string | number; active: string | number;
+      scope: string; type: string; source: string | null; n: string | number; active: string | number; anchored: string | number;
       first_write: Date | string | null; last_write: Date | string | null;
     }>(
-      `SELECT scope, type,
+      `SELECT scope, type, source,
               COUNT(*) AS n,
               SUM(CASE WHEN is_archived THEN 0 ELSE 1 END) AS active,
+              SUM(CASE WHEN is_archived THEN 0
+                       WHEN ${ANCHORED_SQL_PREDICATE.postgres} THEN 1 ELSE 0 END) AS anchored,
               MIN(created_at) AS first_write,
               MAX(created_at) AS last_write
        FROM memories
-       GROUP BY scope, type`
+       GROUP BY scope, type, source`
     );
     const iso = (v: Date | string | null) => (v instanceof Date ? v.toISOString() : v);
     return foldScopeAggregates(result.rows.map(r => ({
       scope: r.scope,
       type: r.type,
+      source: r.source,
       n: Number(r.n),
       active: Number(r.active),
+      anchored: Number(r.anchored),
       first_write: iso(r.first_write),
       last_write: iso(r.last_write),
     })));

@@ -5,6 +5,7 @@ import type { IMemoryStore } from './interfaces.js';
 import { computeDecayScores } from '../promotion/decay.js';
 import { CONTRADICTION_FLAG_TAG } from '../dreaming/contradiction.js';
 import { ARCHIVED_SQL_PREDICATE } from '../utils/archived.js';
+import { ANCHORED_SQL_PREDICATE } from '../dreaming/scoring.js';
 
 export function computeContentHash(content: string): string {
   return crypto.createHash('sha256').update(content.trim()).digest('hex');
@@ -660,18 +661,20 @@ export class MemoryQueries implements IMemoryStore {
   }
 
   async getScopeAggregates(): Promise<ScopeAggregateRow[]> {
-    // GROUP BY scope, type then fold in JS: one pass, no content scanning.
+    // GROUP BY scope, type, source then fold in JS: one pass, no content scanning.
     // `CASE WHEN is_archived THEN` (not `= 0`) so the identical SQL is valid on
     // SQLite's 0/1 and Postgres's boolean.
     const rows = this.db.prepare(
-      `SELECT scope, type,
+      `SELECT scope, type, source,
               COUNT(*) AS n,
               SUM(CASE WHEN is_archived THEN 0 ELSE 1 END) AS active,
+              SUM(CASE WHEN is_archived THEN 0
+                       WHEN ${ANCHORED_SQL_PREDICATE.sqlite} THEN 1 ELSE 0 END) AS anchored,
               MIN(created_at) AS first_write,
               MAX(created_at) AS last_write
        FROM memories
-       GROUP BY scope, type`
-    ).all() as { scope: string; type: string; n: number; active: number; first_write: string | null; last_write: string | null }[];
+       GROUP BY scope, type, source`
+    ).all() as { scope: string; type: string; source: string | null; n: number; active: number; anchored: number; first_write: string | null; last_write: string | null }[];
     return foldScopeAggregates(rows);
   }
 
@@ -695,15 +698,29 @@ export class MemoryQueries implements IMemoryStore {
 /**
  * Folds (scope, type) group rows into one row per scope. Shared by both
  * backends so the SQLite and Postgres shapes cannot diverge. Exported for tests.
+ *
+ * The `by_type` / `by_source` tallies accumulate on NULL-PROTOTYPE maps because
+ * their keys are stored column values, not a fixed vocabulary: `source` is
+ * free-text, and on a plain object `agg.by_source['__proto__'] = n` silently
+ * fails to create an own property (it hits the prototype setter instead), so
+ * that group's rows would vanish from the count while `total` still included
+ * them. Spread back into plain objects on the way out so the returned rows
+ * serialize and compare exactly as before — spread DEFINES properties rather
+ * than assigning them, so the recovered `__proto__` key survives the copy.
  */
 export function foldScopeAggregates(
-  rows: { scope: string; type: string; n: number; active: number; first_write: string | null; last_write: string | null }[],
+  rows: { scope: string; type: string; source?: string | null; n: number; active: number; anchored?: number; first_write: string | null; last_write: string | null }[],
 ): ScopeAggregateRow[] {
   const byScope = new Map<string, ScopeAggregateRow>();
   for (const r of rows) {
     let agg = byScope.get(r.scope);
     if (!agg) {
-      agg = { scope: r.scope, total: 0, active: 0, archived: 0, by_type: {}, first_write: null, last_write: null };
+      agg = {
+        scope: r.scope, total: 0, active: 0, archived: 0, anchored: 0,
+        by_type: Object.create(null), by_source: Object.create(null),
+        by_source_active: Object.create(null),
+        first_write: null, last_write: null,
+      };
       byScope.set(r.scope, agg);
     }
     const n = Number(r.n);
@@ -711,11 +728,28 @@ export function foldScopeAggregates(
     agg.total += n;
     agg.active += active;
     agg.archived += n - active;
+    // `?? 0`, not `Number(undefined)`: a caller that omits the column must
+    // fold to a truthful zero rather than NaN poisoning the whole scope.
+    agg.anchored += Number(r.anchored ?? 0);
     agg.by_type[r.type] = (agg.by_type[r.type] ?? 0) + n;
+    const src = r.source ?? 'unknown';
+    agg.by_source[src] = (agg.by_source[src] ?? 0) + n;
+    // ACTIVE-only companion (item 11 review F3): `by_source` counts every row
+    // including archived ones, so mixing it with the active-only `active` /
+    // `anchored` in one line inverted the triage verdict on a scope with a
+    // large archived backlog. Free — the group row already carries `active`.
+    agg.by_source_active[src] = (agg.by_source_active[src] ?? 0) + active;
     if (r.first_write && (agg.first_write === null || r.first_write < agg.first_write)) agg.first_write = r.first_write;
     if (r.last_write && (agg.last_write === null || r.last_write > agg.last_write)) agg.last_write = r.last_write;
   }
-  return [...byScope.values()].sort((a, b) => b.total - a.total || a.scope.localeCompare(b.scope));
+  return [...byScope.values()]
+    .map(agg => ({
+      ...agg,
+      by_type: { ...agg.by_type },
+      by_source: { ...agg.by_source },
+      by_source_active: { ...agg.by_source_active },
+    }))
+    .sort((a, b) => b.total - a.total || a.scope.localeCompare(b.scope));
 }
 
 function rowToPromotionRun(row: Record<string, unknown>): PromotionRun {

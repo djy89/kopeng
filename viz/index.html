@@ -266,6 +266,34 @@
             </div>
           </section>
 
+          <section class="ops-card ops-card-wide" id="ops-drift-card">
+            <header class="ops-card-head">
+              <h3>scope drift <span class="ops-card-sub" id="ops-drift-sub">the Librarian — Phase A</span></h3>
+            </header>
+            <div class="ops-drift-chips" id="ops-drift-chips"></div>
+            <!-- Filter lives in STATIC markup, outside every re-rendered
+                 region: the 10s poll rebuilds the cluster and ephemeral lists
+                 wholesale, so an input built by the renderer would lose focus
+                 and caret on every tick. Item 12 (the 20% of theme H that
+                 unblocks "find one of 71"); the full scanning treatment is
+                 the Phase-5 design pass. -->
+            <div class="ops-drift-filter">
+              <input type="search" id="ops-drift-filter-input" class="ops-drift-filter-input"
+                     placeholder="filter scopes… (substring, case-insensitive)"
+                     aria-label="filter scope drift clusters and ephemeral rows"
+                     autocomplete="off" spellcheck="false" maxlength="120">
+              <button type="button" id="ops-drift-filter-clear" class="replay-btn radyn-btn" hidden>clear</button>
+              <span class="ops-drift-filter-count" id="ops-drift-filter-count"></span>
+            </div>
+            <div class="review-msg" id="ops-drift-msg"></div>
+            <div class="ops-drift-clusters" id="ops-drift-clusters"></div>
+            <h4 class="ops-drift-h">ephemeral scopes</h4>
+            <div class="ops-drift-ephemeral" id="ops-drift-ephemeral"></div>
+            <h4 class="ops-drift-h" id="ops-drift-passes-h" hidden>recent archive passes</h4>
+            <div class="ops-drift-passes" id="ops-drift-passes"></div>
+            <div class="ops-card-foot" id="ops-drift-foot"></div>
+          </section>
+
           <section class="ops-card ops-card-wide" data-card="top-decaying">
             <header class="ops-card-head">
               <h3>top decaying memories</h3>

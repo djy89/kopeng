@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from 'vitest';
 import type pg from 'pg';
 import { PgDreamQueries } from '../../src/database/pg-dream-queries.js';
 import { PgObservationQueries } from '../../src/database/pg-observation-queries.js';
-import { PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON } from '../../src/types/types.js';
 
 /**
  * R2/R3 — Postgres store coverage via a mocked pool (no live PG in unit tests).
@@ -49,10 +48,10 @@ describe('PgDreamQueries (R2)', () => {
     const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
     expect(sql).toMatch(/status = 'completed'/);
     expect(sql).toMatch(/scope IS NOT DISTINCT FROM \$3/); // NULL-scope safe
-    expect(sql).toMatch(/COALESCE\(reason, ''\) NOT IN \(\$4, \$5\)/); // excludes promotion + maintenance carrier rows (P3, Phase 2)
+    expect(sql).toMatch(/is_carrier = FALSE/); // F-5: excludes carrier rows by column, not reason string
     expect(sql).toMatch(/ORDER BY started_at DESC, id DESC/);
     expect(sql).toMatch(/LIMIT 1/);
-    expect(params).toEqual(['default', 'windowed', 'project:a', PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON]);
+    expect(params).toEqual(['default', 'windowed', 'project:a']);
   });
 
   it('getLastCompletedDream returns null when no completed dream exists', async () => {
@@ -71,12 +70,12 @@ describe('PgDreamQueries (R2)', () => {
     const [sql, params] = query.mock.calls[0] as unknown as [string, unknown[]];
     expect(sql).toMatch(/status = 'completed'/);
     expect(sql).toMatch(/acceptance_status IN \('pending', 'partial'\)/);
-    // $2/$3 are the carrier exclusion even though $1 is limit — the placeholders
-    // do NOT appear in textual order; the exclusion lives in the QUERY, not in
-    // the writers' hardcoded acceptance values (team-review #22 A6).
-    expect(sql).toMatch(/COALESCE\(reason, ''\) NOT IN \(\$2, \$3\)/);
+    // F-5: the carrier exclusion lives in the QUERY as the is_carrier column,
+    // not in the writers' hardcoded acceptance values (team-review #22 A6) or
+    // a reason-string match.
+    expect(sql).toMatch(/is_carrier = FALSE/);
     expect(sql).toMatch(/ORDER BY started_at DESC, id DESC/);
-    expect(params).toEqual([20, PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON]);
+    expect(params).toEqual([20]);
   });
 
   it('listRecentDreams INCLUDES carrier rows (team-review #22 S3 — history is their operator-facing record), newest-first, paged', async () => {

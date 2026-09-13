@@ -22,7 +22,7 @@ import { isActivityPath } from '../dreaming/activity-tracker.js';
 // Dreaming review/apply surface (D1.3)
 import { ConsolidationLockManager, uniqueHolder } from '../dreaming/lock.js';
 import { resolveDream, rollbackMemory } from '../dreaming/apply.js';
-import { PROMOTION_CARRIER_REASON, MAINTENANCE_CARRIER_REASON, type DreamDiff, type DreamChangeClass } from '../types/types.js';
+import { type DreamDiff, type DreamDiffClass } from '../types/types.js';
 import type { AppContext } from '../types/app-context.js';
 import type { ScopeAliasService } from '../services/scope-alias.js';
 import { resolveWriteThroughAliases, type ScopeRegistryService } from '../services/scope-registry.js';
@@ -32,9 +32,10 @@ import { surface } from '../surfacing/surface.js';
 // Corpus-health derived signals (ops endpoint)
 import { isAnchored, isDecayedAtRisk } from '../dreaming/scoring.js';
 import { cosineSimilarity, COSINE_DUPLICATE_THRESHOLD, classifyDupPair } from '../dreaming/pipeline.js';
-import { buildScopeDrift } from '../scopes/drift.js';
+import { buildScopeDrift, DistinctRulings, DeferredMarks } from '../scopes/drift.js';
 import { buildScopeResolution, type ScopeResolution, type RejectedAlias, isGlobalScope, isScopeForm, slugifyScope, GLOBAL_SCOPE } from '../scopes/resolver.js';
 import { SCOPE_ALIASES_CONFIG_KEY } from '../services/scope-alias.js';
+import { runArchiveEphemeral, IneligibleScopeError } from '../scopes/archive-ephemeral.js';
 import { bufferToEmbedding } from '../embeddings/embedder.js';
 import { KOPENG_VERSION } from '../version.js';
 
@@ -67,12 +68,34 @@ const RedriveSchema = z.object({ scope: z.string().min(1) });
 // path params can't carry `project:My Project` cleanly.
 const RuleScopeSchema = z.object({
   scope: z.string().min(1),
-  action: z.enum(['confirm', 'merge_into', 'rename']),
+  action: z.enum(['confirm', 'merge_into', 'rename', 'mark_distinct', 'defer', 'undefer']),
   target: z.string().optional(), // required for merge_into / rename (refine())
+  // Blocker 4: the operator's own reason for postponing. Bounded like every
+  // other operator string that reaches storage and an echo; refused past the
+  // limit rather than truncated, so what the panel shows is what was typed.
+  note: z.string().max(500).optional(),
 }).refine(
-  (v) => v.action === 'confirm' || (typeof v.target === 'string' && v.target.length > 0),
+  // mark_distinct / defer / undefer behave like confirm — no target.
+  (v) => v.action === 'merge_into' || v.action === 'rename'
+    ? (typeof v.target === 'string' && v.target.length > 0)
+    : true,
   { message: 'target is required for merge_into / rename' },
+).refine(
+  // `note` has exactly one storage home (deferred_note). Accepting it on the
+  // other actions would silently drop an operator's stated rationale, which
+  // is the opposite of what a note is for — refuse instead.
+  (v) => v.note === undefined || v.action === 'defer',
+  { message: 'note is only accepted with action "defer"' },
 );
+
+// T76 §5.4 (Task 7): bulk-archive an ephemeral scope's active rows.
+const ArchiveEphemeralSchema = z.object({
+  // Bounded like every other scope input (the server sanitizer's 512 ceiling):
+  // the string reaches store queries and the refusal message, so an unbounded
+  // one is free work and an unbounded echo.
+  scope: z.string().min(1).max(512),
+  apply: z.boolean().default(false),
+});
 
 const TriggerDreamSchema = z.object({
   reason: z.string().max(500).optional(),
@@ -274,8 +297,14 @@ function parseMetadata(metadata: string): Record<string, unknown> {
  * Plain-language translation of what accept/reject literally do to the corpus,
  * per change_class. Purely a fixed lookup — no reasoner involvement — so it's
  * safe to compute for every entry regardless of tier or auto-accept config.
+ *
+ * Takes DreamDiffClass, not the wider DreamChangeClass: the only call site
+ * feeds `DreamDiffEntry.change_class`, and the audit-only classes have no
+ * accept/reject semantics to describe. Their branches here were unreachable,
+ * and the narrower type is what makes that a compile error rather than dead
+ * prose that outlives the class it described.
  */
-function describeDreamImpact(changeClass: DreamChangeClass): { if_accepted: string; if_rejected: string; reversible: boolean } {
+function describeDreamImpact(changeClass: DreamDiffClass): { if_accepted: string; if_rejected: string; reversible: boolean } {
   switch (changeClass) {
     case 'exact_dup':
       return {
@@ -323,12 +352,6 @@ function describeDreamImpact(changeClass: DreamChangeClass): { if_accepted: stri
       return {
         if_accepted: 'Diff-only signal — this entry itself makes no change. Promoting a cross-scope duplicate to global scope happens via the separate promotion pipeline, not this accept action.',
         if_rejected: 'Nothing changes.',
-        reversible: true,
-      };
-    case 'rollback':
-      return {
-        if_accepted: 'Audit-only record of a previously executed rollback — not a proposal, nothing to accept or reject here.',
-        if_rejected: 'N/A',
         reversible: true,
       };
     default:
@@ -1972,6 +1995,11 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
             scope: dream.scope,
             mode: dream.mode,
             trigger_source: dream.trigger_source,
+            // The carrier discriminator is the persisted column (F-5), never a
+            // reason-string match. Surfaced here so the review tab can label an
+            // audit carrier as one — GATE L-A flagged that the UI showed no
+            // trace of it while the field was correct all along.
+            is_carrier: dream.is_carrier,
             status: dream.status,
             acceptance_status: dream.acceptance_status,
             started_at: dream.started_at,
@@ -2216,14 +2244,48 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
         const input = RuleScopeSchema.parse(request.body);
         const { scope, action } = input;
 
+        // Both `global` refusals are hoisted ABOVE the register-then-rule block
+        // below, which mints a provisional row for any scope-form string it has
+        // never seen. Refusing AFTER that point would leave the registry row
+        // behind — a rejected ruling that still permanently changed registry
+        // state, and for `global` a row decideMint's Rule 1 will never consult.
+        //
+        // `global` is never mintable, renameable or aliasable (it is the one
+        // scope the resolver passes before any lookup), so a ruling ON it is
+        // inert and a ruling INTO it is merge-shaped drift.
+        if (scope === GLOBAL_SCOPE) {
+          reply.status(400);
+          return { error: 'Rulings do not apply to "global"' };
+        }
+        if (input.target === GLOBAL_SCOPE) {
+          reply.status(400);
+          return { error: 'Ruling target cannot be "global"' };
+        }
+
         // updateStatus/rename are silent no-ops on a missing scope — the 404
         // needs an explicit existence check. The row is kept: a rename needs
         // its PRE-rename slug for the tombstone (I1, below).
         const rows = await scopeRegistry.snapshotRows();
-        const ruledRow = rows.find((r) => r.scope === scope);
+        let ruledRow = rows.find((r) => r.scope === scope);
         if (!ruledRow) {
-          reply.status(404);
-          return { error: `No registry row for scope "${scope}"` };
+          // F-4 register-then-rule: the 404 used to fire BEFORE the action
+          // branch, and most drift variants predate the registry — a panel
+          // ruling on a legacy variant must not dead-end. Scope-form scopes
+          // get a provisional row (claimant_raw = the scope itself, no
+          // origin) and the ruling proceeds in the same request. Non-scope-form
+          // strings keep the 404: there is nothing rulable to register.
+          if (!isScopeForm(scope)) {
+            reply.status(404);
+            return { error: `No registry row for scope "${scope}" and it is not a registrable scope form` };
+          }
+          await scopeRegistry.register({
+            scope, slug: slugifyScope(scope), claimant_raw: scope, origin_cwd: null, status: 'provisional',
+          });
+          ruledRow = (await scopeRegistry.snapshotRows()).find((r) => r.scope === scope);
+          if (!ruledRow) {
+            reply.status(500);
+            return { error: `Registered "${scope}" but could not re-read the row — retry the ruling` };
+          }
         }
 
         // Round-2 fix CO4: reserved rows (the seeded triage scope, rename
@@ -2244,15 +2306,59 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
           return { data: { scope, action, status: 'confirmed', ruled_at: ruledAt } };
         }
 
-        const target = input.target!; // refine() guarantees it for merge_into / rename
-
-        // `global` is never a mintable or renameable scope (decideMint Rule 1
-        // passes it before any lookup), so a global target would be inert as a
-        // rename and merge-shaped as an alias — refuse rather than accept-and-drift.
-        if (target === GLOBAL_SCOPE) {
-          reply.status(400);
-          return { error: 'Ruling target cannot be "global"' };
+        if (action === 'mark_distinct') {
+          // T76 §5.3: "distinct" is a dedicated column, not a status reading —
+          // every ruling confirms, so status alone cannot carry it (T-C1).
+          // The store clears any deferral in the same statement (blocker 4):
+          // this ruling IS the decision the deferral postponed.
+          await scopeRegistry.markDistinct(scope, ruledAt);
+          opsMemo.delete(SCOPE_REGISTRY_MEMO_KEY);
+          return { data: { scope, action, status: 'confirmed', ruled_distinct_at: ruledAt } };
         }
+
+        // Blocker 4: defer / undefer are BOOKKEEPING, not rulings — they are
+        // the two actions here that deliberately do NOT confirm the row. A
+        // deferral says "I have seen this and am postponing the judgment";
+        // confirming it would be making the judgment. Everything above still
+        // applies (reserved refusal, register-then-rule), so a legacy variant
+        // with no registry row can be deferred straight from the panel.
+        if (action === 'defer') {
+          // A ruled scope has already had the judgment a deferral postpones,
+          // so the two marks are mutually exclusive: refuse rather than write
+          // a row that reads BOTH ruled and deferred (the markDistinct path
+          // enforces the same invariant in the other order by clearing).
+          if (ruledRow.ruled_distinct_at !== null) {
+            reply.status(400);
+            return {
+              error: `"${scope}" is already ruled distinct (${ruledRow.ruled_distinct_at}) — a deferral postpones a judgment that has been made. `
+                + `Merge it away with merge_into, or leave the ruling in place.`,
+            };
+          }
+          await scopeRegistry.setDeferred(scope, ruledAt, input.note ?? null);
+          opsMemo.delete(SCOPE_REGISTRY_MEMO_KEY);
+          return {
+            data: { scope, action, deferred_at: ruledAt, deferred_note: input.note ?? null },
+            meta: {
+              note: 'Deferral changes no memory and makes no ruling: this cluster leaves '
+                + '`clusters_actionable` but stays in `clusters_uncovered` and its rows still count in '
+                + '`active_rows_adrift`, so the drift metric cannot be silenced by deferring. Undo with '
+                + 'action "undefer"; any real ruling (merge_into / mark_distinct) clears it automatically. '
+                + 'One durable side effect, shared with every other action here: a scope with no registry '
+                + 'row is registered `provisional` first (register-then-rule), and registry rows are never '
+                + 'deleted — so "undefer" clears the deferral but leaves that row behind.',
+            },
+          };
+        }
+
+        if (action === 'undefer') {
+          await scopeRegistry.clearDeferred(scope);
+          opsMemo.delete(SCOPE_REGISTRY_MEMO_KEY);
+          return { data: { scope, action, deferred_at: null } };
+        }
+
+        const target = input.target!; // refine() guarantees it for merge_into / rename
+        // The `target === GLOBAL_SCOPE` refusal is hoisted to the top of the
+        // handler — see the comment there for why it cannot live here.
 
         if (action === 'rename' && rows.some((r) => r.scope === target)) {
           // The store's rename throws on the PK conflict anyway; pre-check for
@@ -2353,6 +2459,32 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
               origin_cwd: null,
               status: 'confirmed',
             });
+            // Codex round-2 item 3: the merge SUPERSEDES any prior
+            // mark_distinct on this scope. Leaving both would make the row read
+            // alias-mapped AND ruled-distinct — the alias wins everywhere that
+            // decides anything (holdVerdict, the write path, recall), so the
+            // stale stamp is pure misdirection in the registry view and in the
+            // drift panel, whose per-variant buttons filter on it.
+            // Unconditional: the UPDATE is a no-op on a never-ruled row, and a
+            // read-first guard would only add a way to be stale.
+            // Blocker 4 folds the deferral into the same step, for the same
+            // reason: a merge is the decision a deferral postponed, so a row
+            // reading alias-mapped AND deferred is contradictory residue that
+            // would keep the cluster labelled "deferred" in the panel. Both
+            // writes are idempotent, so the shared retry advice holds.
+            try {
+              await scopeRegistry.clearDistinct(scope);
+              await scopeRegistry.clearDeferred(scope);
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              return {
+                ok: false,
+                httpStatus: 500,
+                reason: `Ruling partially applied: alias entry {"${scope}": "${target}"} is live but clearing the earlier mark_distinct / deferral bookkeeping on "${scope}" failed (${msg}). ` +
+                  `The row may still read "ruled distinct" or "deferred", which is now stale — the alias is what governs. ` +
+                  `Retry the SAME merge_into ruling; it is idempotent.`,
+              };
+            }
           }
           // Spec §12: every ruling confirms — merge_into confirms the merged
           // row under its own name; rename confirms the claimant under the
@@ -2424,6 +2556,53 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
           ? { data: { scope, action, target, status: 'confirmed', ruled_at: ruledAt }, meta }
           : { data: { scope, action, target, slug: slugifyScope(target), status: 'confirmed', ruled_at: ruledAt }, meta };
       });
+
+      // --- T76 §5.4 (Task 7): bulk-archive an ephemeral scope's active rows ---
+      // Thin wrapper over runArchiveEphemeral (Task 6) — schema parse, lock
+      // acquisition on apply, and error-class -> HTTP-status mapping only; the
+      // eligibility matrix and archive loop live entirely in that module.
+      app.post('/api/admin/scopes/archive-ephemeral', { preHandler: [requireAdminKey] }, async (request, reply) => {
+        const { scope, apply } = ArchiveEphemeralSchema.parse(request.body);
+        const deps = {
+          memoryStore: queries,
+          dreamStore: dreamStore ?? null,
+          vectorIndex: embeddingIndex,
+          readResolution: readScopeResolutionStrict,
+          isRuledDistinct: (s: string) => scopeRegistry.isRuledDistinct(s),
+        };
+        const run = () => runArchiveEphemeral(deps, { scope, apply });
+        try {
+          if (apply && dreamStore) {
+            const lock = new ConsolidationLockManager({ store: dreamStore, holder: uniqueHolder('scope-archive') });
+            const { acquired, result } = await lock.withLock(run);
+            if (!acquired) {
+              reply.status(423);
+              return { error: 'Consolidation lock busy — retry after the current pass completes' };
+            }
+            return { data: result };
+          }
+          // dry-run and the no-dream-store withhold path mutate nothing — no lock needed.
+          return { data: await run() };
+        } catch (err) {
+          if (err instanceof IneligibleScopeError) {
+            reply.status(400);
+            return { error: err.message };
+          }
+          // Everything reaching this catch is a PRE-archive failure, by
+          // construction (Task 6): runArchiveEphemeral only throws from its
+          // pre-loop eligibility reads — IneligibleScopeError (handled above)
+          // or a broken readResolution / isRuledDistinct. Once the loop has
+          // started nothing escapes: a per-row failure lands in the result's
+          // `failed[]`, and EVERY in-loop read failure returns normally with
+          // the partial counts and a `stopped` reason — `resolution_read_failed`
+          // for the F-7 re-check, `store_read_failed` for the page fetch — so
+          // this 503 can never hide archives that actually happened. Strict
+          // fail-CLOSED reads (T-H4): refuse, never archive, and never
+          // masquerade as a 500 logic error.
+          reply.status(503);
+          return { error: `Refusing to archive: eligibility inputs unreadable (${err instanceof Error ? err.message : String(err)})` };
+        }
+      });
     }
   }
 
@@ -2458,11 +2637,15 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
 
     // --- Admin: Discovery maintenance ---
     app.post('/api/admin/discovery/maintain', { preHandler: [requireAdminKey] }, async (_request, reply) => {
-      // Round-2 CO5+S1a: §1's purge exemption runs the SHARED hold predicate
-      // (ephemeral-shaped AND not alias-mapped) — wired on BOTH call shapes,
-      // since the purge is not an archive site and runs without audit deps too.
+      // Round-2 CO5+S1a, extended by T76 §5.3: §1's purge exemption runs the
+      // SHARED hold predicate (ephemeral-shaped AND not ruled-distinct AND not
+      // alias-mapped) — wired on BOTH call shapes, since the purge is not an
+      // archive site and runs without audit deps too.
       const maintenanceOpts = {
-        isHeld: buildHoldPredicate(scopeAliases ? (s: string) => scopeAliases.canonicalize(s) : undefined),
+        isHeld: buildHoldPredicate(
+          scopeAliases ? (s: string) => scopeAliases.canonicalize(s) : undefined,
+          scopeRegistry ? (s: string) => scopeRegistry.isRuledDistinct(s) : undefined,
+        ),
       };
       if (dreamStore) {
         const lock = new ConsolidationLockManager({ store: dreamStore, holder: uniqueHolder('discovery-maintenance') });
@@ -2828,8 +3011,9 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
         window_key: d.window_key,
         // Audit-carrier rows (promotion decay / discovery maintenance) are real
         // archives and belong in history — labeled so the viz can render them
-        // distinctly (team-review #22 S3).
-        is_carrier: d.reason === PROMOTION_CARRIER_REASON || d.reason === MAINTENANCE_CARRIER_REASON,
+        // distinctly (team-review #22 S3). F-5: the persisted is_carrier column
+        // is the label, not a reason-string comparison.
+        is_carrier: d.is_carrier,
         status: d.status,
         acceptance_status: d.acceptance_status,
         started_at: d.started_at,
@@ -2936,14 +3120,23 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
   // scope variant the alias table does not cover. It reads 0 on a reconciled
   // corpus, so any rise is new drift rather than a backlog to interpret.
   //
-  // Cost: one GROUP BY (scope, type) — no content scanning, no O(n^2) — so it
-  // joins the light 10s ops cadence rather than the memoized heavy pair.
+  // Cost: one GROUP BY (scope, type, source) — no content scanning, no O(n^2)
+  // — so it joins the light 10s ops cadence rather than the memoized heavy
+  // pair. Item 11 added an anchored SUM whose third disjunct reads the
+  // `metadata` JSON per row (the first two are plain column tests and
+  // short-circuit); the default store confidence is 0.9, so ordinary
+  // discovery rows do reach that branch. Still one pass and no content scan,
+  // but it is no longer free — if this endpoint ever shows up in a latency
+  // profile, the anchored SUM is the part that grew, and the fix is to give
+  // it the memo treatment rather than to drop the column the panel now
+  // depends on.
   app.get('/api/ops/scope-drift', async () => {
-    const [aggregates, coverage] = await Promise.all([
+    const [aggregates, coverage, rulings] = await Promise.all([
       queries.getScopeAggregates(),
       readScopeResolution(),
+      readRegistryMarks(),
     ]);
-    const report = buildScopeDrift(aggregates, coverage);
+    const report = buildScopeDrift(aggregates, coverage, rulings.distinct, rulings.deferred);
     return {
       data: report,
       meta: {
@@ -3040,6 +3233,53 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
       return buildScopeResolution(parsed?.[SCOPE_ALIASES_CONFIG_KEY]);
     } catch {
       return buildScopeResolution(null);
+    }
+  }
+
+  /**
+   * T76 §5.4 (Task 7): STRICT, UNCACHED resolution read for the archive-ephemeral
+   * route — deliberately a SEPARATE function from readScopeResolution above.
+   * That reader fails OPEN to the empty resolution, which here would read
+   * "un-aliased" and AUTHORIZE the archive (T-H4); this one THROWS so the
+   * route refuses (503) instead. It also bypasses the 60s ScopeAliasService
+   * cache (reads the operator-config blob directly), which is what the F-7
+   * per-chunk re-check inside runArchiveEphemeral needs — a fresh read every
+   * call, not a cached one that could still show the pre-ruling table.
+   *
+   * Scope of "uncached": the ALIAS half only. The re-check's other input,
+   * `scopeRegistry.isRuledDistinct`, rides the registry service's own 60s TTL
+   * snapshot — invalidated by rulings made in THIS process, so the local
+   * ruling-then-archive race is closed, but up to 60s stale for a ruling made
+   * by another process against a shared database. Single-process is the
+   * standing deployment assumption (the ops memo and the alias service cache
+   * rest on it too); documented rather than closed.
+   */
+  async function readScopeResolutionStrict(): Promise<{ table: Record<string, string>; version: string }> {
+    if (!operatorConfigStore) throw new Error('no operator-config store — cannot verify the alias table');
+    const cfg = await operatorConfigStore.getConfig();           // throws ⇒ 503
+    const parsed = JSON.parse(cfg?.config ?? '{}');               // corrupt blob throws ⇒ 503
+    const res = buildScopeResolution(parsed?.[SCOPE_ALIASES_CONFIG_KEY]);
+    return { table: res.table, version: res.version };
+  }
+
+  /** T76: ruled-distinct coverage for the drift report. Fail-open to EMPTY —
+   *  a registry outage over-reports drift (the safe side), never 500s an ops poll. */
+  /**
+   * One registry snapshot, both marks (blocker 4) — two independent reads
+   * would double the registry hit per ops poll and could disagree across a
+   * ruling that lands between them. Fail-open to EMPTY/EMPTY: drift
+   * over-reported, the safe side, same posture as readDistinctRulings had.
+   */
+  async function readRegistryMarks(): Promise<{ distinct: DistinctRulings; deferred: DeferredMarks }> {
+    try {
+      if (!scopeRegistry) return { distinct: DistinctRulings.EMPTY, deferred: DeferredMarks.EMPTY };
+      const rows = await scopeRegistry.snapshotRows();
+      return {
+        distinct: DistinctRulings.fromRegistryRows(rows),
+        deferred: DeferredMarks.fromRegistryRows(rows),
+      };
+    } catch {
+      return { distinct: DistinctRulings.EMPTY, deferred: DeferredMarks.EMPTY };
     }
   }
 

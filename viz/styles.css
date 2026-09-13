@@ -1203,6 +1203,143 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   padding: 1rem !important;
 }
 
+/* Scope-drift panel (T76 Task 9) — chips, worst-first clusters, ephemeral
+   list. Composes the existing ops-card / radyn-pill / review-* primitives;
+   only cluster/variant/ephemeral row scaffolding is new. */
+.ops-drift-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.ops-drift-clusters { display: flex; flex-direction: column; gap: 0.6rem; }
+.ops-drift-cluster {
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 0.6rem 0.7rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.ops-drift-cluster-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+.ops-drift-cluster-key { font-weight: 500; color: var(--foreground); }
+.ops-drift-h {
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+  margin: 0.6rem 0 0.2rem;
+  padding-bottom: 0.25rem;
+  border-bottom: 1px solid var(--border);
+}
+.ops-drift-variant { border-left: 2px solid var(--border); padding: 0.3rem 0 0.3rem 0.6rem; }
+.ops-drift-variant-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; margin-bottom: 0.2rem; }
+.ops-drift-variant-scope { font-weight: 500; color: var(--foreground); }
+.ops-drift-ephemeral { display: flex; flex-direction: column; gap: 0.4rem; }
+.ops-drift-ephemeral-row { border: 1px solid var(--border); padding: 0.4rem 0.6rem; }
+.ops-drift-ephemeral-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; }
+.ops-drift-reason { color: var(--muted-foreground); font-size: 0.72rem; }
+.ops-drift-archive-result { margin-top: 0.3rem; }
+/* Outcome hosts: an outcome pinned to the row/cluster it came from. Empty until
+   one is pinned, so they add no vertical noise to a resting panel. */
+.ops-drift-cluster-result:not(:empty),
+.ops-drift-archive-result:not(:empty) {
+  margin-top: 0.4rem;
+  padding: 0.4rem 0.55rem;
+  border-left: 2px solid var(--accent, currentColor);
+  background: rgba(255, 255, 255, 0.03);
+}
+.ops-drift-dismiss { margin-top: 0.35rem; opacity: 0.75; }
+.ops-drift-archive-status { font-size: 0.72rem; color: var(--muted-foreground); }
+.ops-drift-followup { font-size: 0.68rem; color: var(--muted-foreground); padding: 0.1rem 0; }
+/* The archived-id enumeration is the operator's rollback list — up to 500 ids,
+   so it collapses by default and wraps rather than stretching the panel. */
+.ops-drift-archive-ids { font-size: 0.72rem; color: var(--muted-foreground); margin-top: 0.25rem; }
+.ops-drift-archive-ids > summary { cursor: pointer; }
+.ops-drift-archive-idlist {
+  overflow-wrap: anywhere;
+  user-select: all;
+  padding: 0.25rem 0;
+}
+
+/* GATE L-A: legibility at the point of action.
+   A button and the one-line consequence of pressing it stack as one column, so
+   a wrapped action row can never pair a hint with the wrong button. The column
+   tops align (the parent .review-actions centers by default, which would stagger
+   the buttons whenever two hints wrap to different heights). */
+.ops-drift-actions { align-items: flex-start; }
+/* Scope literals inside uppercase-transformed buttons keep their true casing —
+   in a *casing* cluster the label IS the evidence (backlog item 10). */
+.ops-scope-literal { text-transform: none; }
+
+/* Per-row archive failures (backlog item 6). */
+.ops-drift-failed { display: flex; flex-direction: column; gap: 0.1rem; margin-top: 0.2rem; }
+.ops-drift-failed-row { font-size: 0.7rem; color: var(--error); overflow-wrap: anywhere; }
+.ops-drift-failed-more { font-size: 0.7rem; color: var(--muted-foreground); }
+.ops-drift-failed-more > summary { cursor: pointer; }
+
+/* Change-ruling disclosure on ruled-distinct rows (backlog item 8). */
+.ops-drift-change-ruling { display: flex; flex-direction: column; gap: 0.3rem; }
+.ops-drift-change-ruling-body { display: flex; flex-direction: column; gap: 0.3rem;
+  border-left: 2px solid var(--border); padding-left: 0.6rem; }
+.ops-drift-change-ruling-body[hidden] { display: none; }
+.ops-drift-target-input { font: inherit; font-size: 0.72rem; color: var(--foreground);
+  background: transparent; border: 1px solid var(--border-strong-c); padding: 0.25rem 0.4rem;
+  max-width: 22rem; }
+.ops-drift-merge-seeds { display: flex; flex-direction: column; gap: 0.3rem; }
+/* Triage line at rest (backlog item 11): the decide-at-a-glance summary. */
+.ops-drift-triage { font-size: 0.7rem; color: var(--muted-foreground); margin: 0.15rem 0 0.25rem; }
+.ops-drift-triage--anchored { color: var(--warning); }
+
+/* Text filter (backlog item 12) — static row, never rebuilt by the poll. */
+.ops-drift-filter { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin-top: 0.3rem; }
+.ops-drift-filter-input { flex: 1 1 18rem; min-width: 12rem; max-width: 32rem;
+  font: inherit; font-size: 0.72rem; color: var(--foreground); background: transparent;
+  border: 1px solid var(--border-strong-c); padding: 0.25rem 0.4rem; }
+.ops-drift-filter-input::placeholder { color: var(--muted-foreground); }
+.ops-drift-filter-count { font-size: 0.68rem; color: var(--muted-foreground); }
+
+/* Defer control (backlog item 4): note field above its button. */
+.ops-drift-defer { display: flex; flex-direction: column; gap: 0.2rem; }
+
+/* Recent archive passes (backlog item 2) — same visual weight as ephemeral rows. */
+.ops-drift-passes { display: flex; flex-direction: column; gap: 0.4rem; }
+.ops-drift-pass-row { border: 1px solid var(--border); padding: 0.4rem 0.6rem; }
+.ops-drift-pass-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; }
+.ops-drift-action { display: flex; flex-direction: column; gap: 0.2rem; max-width: 26rem; }
+.ops-drift-reversibility {
+  font-size: 0.66rem;
+  line-height: 1.35;
+  color: var(--muted-foreground);
+  opacity: 0.75;
+}
+
+/* Peek: a few real memories from the scope. Collapsed at rest, so the resting
+   panel is unchanged in height and the 10s poll fetches nothing. */
+.ops-drift-peek { margin-top: 0.3rem; }
+.ops-drift-peek-btn { min-width: 0; opacity: 0.8; }
+.ops-drift-peek-body { margin-top: 0.3rem; display: flex; flex-direction: column; gap: 0.3rem; }
+.ops-drift-peek-body[hidden] { display: none; }
+.ops-drift-peek-status { font-size: 0.7rem; color: var(--muted-foreground); }
+.ops-drift-peek-err { color: var(--error); }
+.ops-drift-peek-row {
+  border-left: 2px solid var(--border);
+  padding: 0.2rem 0 0.2rem 0.5rem;
+}
+.ops-drift-peek-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  font-size: 0.64rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted-foreground);
+}
+/* Memory content is arbitrary operator text — wrap it rather than let a long
+   unbroken path stretch the panel. */
+.ops-drift-peek-content {
+  font-size: 0.7rem;
+  line-height: 1.4;
+  color: var(--foreground);
+  overflow-wrap: anywhere;
+}
+
 /* ============================================================================
    SLOTS panel
    ============================================================================ */
@@ -1402,6 +1539,9 @@ tr.slot-open .slot-chevron { transform: rotate(45deg); }
 .radyn-pill--warning { border-color: var(--warning); color: var(--warning); }
 .radyn-pill--error   { border-color: var(--error);   color: var(--error); }
 .radyn-pill--info    { border-color: var(--info);    color: var(--info); }
+/* Carrier marker sits inline after the window label in the review history row,
+   so it needs the gap the surrounding text node doesn't provide. */
+.review-carrier-pill { margin-left: 6px; }
 
 .radyn-btn { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border-strong-c);
   background: transparent; color: var(--foreground); height: 28px; padding: 0 10px;

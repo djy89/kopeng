@@ -18,8 +18,12 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import Database from 'better-sqlite3';
 import { runMigrations } from '../../src/database/migrations.js';
 import { MemoryQueries } from '../../src/database/queries.js';
+import { DreamQueries } from '../../src/database/dream-queries.js';
+import { ScopeRegistryQueries } from '../../src/database/scope-registry-queries.js';
 import { EmbeddingIndex } from '../../src/embeddings/index.js';
 import { registerRoutes } from '../../src/api/routes.js';
+import { ScopeRegistryService } from '../../src/services/scope-registry.js';
+import { ScopeAliasService } from '../../src/services/scope-alias.js';
 import config from '../../src/config/config.js';
 import type { IDatabaseLifecycle } from '../../src/database/interfaces.js';
 
@@ -209,4 +213,86 @@ describe('POST /api/memories/traverse stays open (CX-13 — registration proven,
     });
     expect(res.statusCode).toBe(200);
   });
+});
+
+describe('scope-registry admin routes (T76) are gated — a separate app, since both routes register only inside `if (operatorConfigStore) { if (scopeRegistry) { ... } }`', () => {
+  // Both routes are conditionally registered — without wiring operatorConfig +
+  // scopeRegistry the vacuous pass (404 !== 401 trivially holding) is live, the
+  // same trap the CX-13 traverse block above guards against. A separate,
+  // minimal app avoids reshaping the shared MUTATING harness above just to
+  // thread these two extra deps through every other case.
+  let scopeApp: FastifyInstance;
+  let scopeDb: Database.Database;
+  let registryStore: ScopeRegistryQueries;
+  let scopedPrevKey = '';
+
+  beforeAll(async () => {
+    scopeDb = new Database(':memory:');
+    runMigrations(scopeDb);
+    const scopeQueries = new MemoryQueries(scopeDb);
+    const dreamQueries = new DreamQueries(scopeDb);
+    registryStore = new ScopeRegistryQueries(scopeDb);
+    const scopeRegistry = new ScopeRegistryService({ registry: registryStore, configStore: dreamQueries });
+    const scopeAliases = new ScopeAliasService(dreamQueries);
+    const lifecycle: IDatabaseLifecycle = {
+      initialize: async () => {},
+      close: async () => {},
+      getStats: async () => ({}) as never,
+      backup: async () => '',
+    } as unknown as IDatabaseLifecycle;
+
+    scopeApp = Fastify({ logger: false });
+    registerRoutes(scopeApp, {
+      stores: { queries: scopeQueries, operatorConfig: dreamQueries, dreams: dreamQueries },
+      services: { embeddingIndex: new EmbeddingIndex(), scopeAliases, scopeRegistry },
+      lifecycle,
+    } as never);
+    await scopeApp.ready();
+
+    await registryStore.register({
+      scope: 'project:my-project', slug: 'project:my-project',
+      claimant_raw: 'project:my-project', origin_cwd: null, status: 'provisional',
+    });
+  });
+
+  afterAll(async () => {
+    await scopeApp.close();
+    scopeDb.close();
+  });
+
+  beforeEach(() => {
+    scopedPrevKey = config.server.adminApiKey;
+    config.server.adminApiKey = KEY;
+  });
+
+  afterEach(() => {
+    config.server.adminApiKey = scopedPrevKey;
+  });
+
+  const SCOPE_MUTATING: Array<{ url: string; payload: unknown }> = [
+    { url: '/api/admin/scopes/rule', payload: { scope: 'project:my-project', action: 'confirm' } },
+    { url: '/api/admin/scopes/archive-ephemeral', payload: { scope: 'project:20260901-demo' } },
+  ];
+
+  for (const route of SCOPE_MUTATING) {
+    it(`POST ${route.url} rejects a missing key (registered, not 404)`, async () => {
+      const res = await scopeApp.inject({ method: 'POST', url: route.url, payload: route.payload as never });
+      expect(res.statusCode).not.toBe(404);
+      expect(res.statusCode).toBe(401);
+    });
+
+    it(`POST ${route.url} rejects a wrong key`, async () => {
+      const res = await scopeApp.inject({
+        method: 'POST', url: route.url, headers: { 'x-api-key': 'nope' }, payload: route.payload as never,
+      });
+      expect(res.statusCode).toBe(401);
+    });
+
+    it(`POST ${route.url} accepts the correct key`, async () => {
+      const res = await scopeApp.inject({
+        method: 'POST', url: route.url, headers: { 'x-api-key': KEY }, payload: route.payload as never,
+      });
+      expect(res.statusCode).not.toBe(401);
+    });
+  }
 });

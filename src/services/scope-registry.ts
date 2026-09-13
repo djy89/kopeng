@@ -182,6 +182,36 @@ export class ScopeRegistryService {
     return inserted;
   }
 
+  async markDistinct(scope: string, ruledAt: string): Promise<void> {
+    await this.registry.markDistinct(scope, ruledAt);
+    this.invalidate();
+  }
+
+  /** A successful merge_into supersedes a prior mark_distinct (Codex round-2). */
+  async clearDistinct(scope: string): Promise<void> {
+    await this.registry.clearDistinct(scope);
+    this.invalidate();
+  }
+
+  /** Blocker 4: deferral is bookkeeping — no status change, no ruled_at. */
+  async setDeferred(scope: string, deferredAt: string, note: string | null): Promise<void> {
+    await this.registry.setDeferred(scope, deferredAt, note);
+    this.invalidate();
+  }
+
+  async clearDeferred(scope: string): Promise<void> {
+    await this.registry.clearDeferred(scope);
+    this.invalidate();
+  }
+
+  /** T76: is this scope ruled distinct? THROWS on a registry read failure —
+   *  loose consumers (hold) catch toward holding; the strict archive consumer
+   *  must refuse, so the throw is load-bearing. */
+  async isRuledDistinct(scope: string): Promise<boolean> {
+    await this.ensureLoaded();
+    return this.rows.find((r) => r.scope === scope)?.ruled_distinct_at != null;
+  }
+
   private async ensureLoaded(): Promise<void> {
     if (this.now() - this.loadedAt < this.ttlMs) return;
     if (!this.loading) {

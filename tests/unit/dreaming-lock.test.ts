@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type Database from 'better-sqlite3';
 import { createTestDatabase } from '../fixtures/test-helpers.js';
 import { DreamQueries } from '../../src/database/dream-queries.js';
 import { ConsolidationLockManager, DEFAULT_OPERATOR_ID, uniqueHolder } from '../../src/dreaming/lock.js';
+import logger from '../../src/utils/logger.js';
 
 /**
  * D0.4 — Consolidation lock (SQLite). Covers acquire-or-skip, holder-scoped
@@ -99,6 +100,46 @@ describe('ConsolidationLockManager (D0.4, SQLite)', () => {
 
     const lock = await store.getLock(DEFAULT_OPERATOR_ID);
     expect(lock?.holder).toBeNull(); // released despite the throw
+  });
+
+  // Codex round-2 item 2: the release runs in a `finally`, and a throwing
+  // `finally` REPLACES the value the block was returning. Without the catch, a
+  // store error on the way out turns a completed archive/dream pass into a 500.
+  describe('a throwing release() does not destroy the result', () => {
+    /** Store proxy whose releaseLock rejects; everything else is the real store. */
+    function withFailingRelease(real: DreamQueries): DreamQueries {
+      return new Proxy(real, {
+        get(target, prop, receiver) {
+          if (prop === 'releaseLock') {
+            return async () => { throw new Error('release exploded'); };
+          }
+          const v = Reflect.get(target, prop, receiver);
+          return typeof v === 'function' ? v.bind(target) : v;
+        },
+      }) as DreamQueries;
+    }
+
+    it('fn resolves + releaseLock rejects ⇒ withLock still resolves with the result, and warns', async () => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      try {
+        const a = new ConsolidationLockManager({ store: withFailingRelease(store), holder: 'A' });
+        await expect(a.withLock(async () => 42)).resolves.toEqual({ acquired: true, result: 42 });
+        expect(warnSpy.mock.calls.some(c => String(c[0]).includes('release FAILED'))).toBe(true);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("fn REJECTS + releaseLock rejects ⇒ fn's error propagates, not the release's", async () => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      try {
+        const a = new ConsolidationLockManager({ store: withFailingRelease(store), holder: 'A' });
+        await expect(a.withLock(async () => { throw new Error('boom'); }))
+          .rejects.toThrow('boom'); // not 'release exploded'
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
   });
 
   // R4: the heartbeat re-acquires (same-holder extend) while fn runs, so a pass
