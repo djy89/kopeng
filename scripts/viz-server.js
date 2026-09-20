@@ -82,6 +82,11 @@ const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
+  // ES modules are served from .mjs here (viz/timeline.mjs). Without this entry
+  // the unknown-extension fallback is application/octet-stream, which browsers
+  // REFUSE to execute for a module import — the graph tab would go blank with a
+  // MIME-type console error and no other symptom.
+  '.mjs': 'application/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',

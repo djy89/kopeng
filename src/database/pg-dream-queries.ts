@@ -345,6 +345,14 @@ export class PgDreamQueries implements IDreamStore, IOperatorConfigStore {
     return r.rows.map(rowToAudit);
   }
 
+  async listAuditAfter(opts: { after?: number; limit: number }): Promise<DreamAuditEntry[]> {
+    const r = await this.pool.query(
+      `SELECT * FROM dream_audit_log WHERE id > $1 ORDER BY id ASC LIMIT $2`,
+      [opts.after ?? 0, opts.limit]
+    );
+    return r.rows.map(rowToAudit);
+  }
+
   // ──────────────────── reinforcement / anchor ──────────────────
 
   async reinforceMemory(memoryId: number, at?: string): Promise<void> {

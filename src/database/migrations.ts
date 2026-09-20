@@ -492,6 +492,34 @@ const migrations: Migration[] = [
       `ALTER TABLE scope_registry ADD COLUMN deferred_note TEXT`,
     ],
   },
+  {
+    version: 15,
+    description: "T43: 'crystallize' joins the dream_audit_log change_class CHECK — auto-crystallization becomes an audited event class (was snapshot-only, no audit row)",
+    up: [
+      `CREATE TABLE IF NOT EXISTS dream_audit_log_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dream_id INTEGER NOT NULL REFERENCES dreams(id) ON DELETE CASCADE,
+        memory_id INTEGER,
+        revision_id INTEGER,
+        change_class TEXT NOT NULL
+          CHECK(change_class IN ('exact_dup', 'decay', 'merge', 'supersede', 'reinforce', 'promote_global', 'rollback', 'conditional', 'archive_ephemeral', 'crystallize')),
+        action TEXT,
+        applied_automatically INTEGER NOT NULL DEFAULT 0 CHECK(applied_automatically IN (0, 1)),
+        before_ref TEXT,
+        after_ref TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      )`,
+      `INSERT INTO dream_audit_log_new (id, dream_id, memory_id, revision_id, change_class,
+        action, applied_automatically, before_ref, after_ref, created_at)
+       SELECT id, dream_id, memory_id, revision_id, change_class,
+        action, applied_automatically, before_ref, after_ref, created_at
+       FROM dream_audit_log`,
+      `DROP TABLE dream_audit_log`,
+      `ALTER TABLE dream_audit_log_new RENAME TO dream_audit_log`,
+      `CREATE INDEX IF NOT EXISTS idx_dream_audit_dream ON dream_audit_log(dream_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_dream_audit_memory ON dream_audit_log(memory_id)`,
+    ],
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

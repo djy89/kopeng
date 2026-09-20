@@ -427,6 +427,16 @@ const migrations: Migration[] = [
       ALTER TABLE scope_registry ADD COLUMN IF NOT EXISTS deferred_note TEXT;
     `,
   },
+  {
+    version: 17,
+    name: 't43_audit_crystallize',
+    sql: `
+      -- T43: truthful audit class for auto-crystallization (was snapshot-only).
+      ALTER TABLE dream_audit_log DROP CONSTRAINT IF EXISTS dream_audit_log_change_class_check;
+      ALTER TABLE dream_audit_log ADD CONSTRAINT dream_audit_log_change_class_check
+        CHECK(change_class IN ('exact_dup', 'decay', 'merge', 'supersede', 'reinforce', 'promote_global', 'rollback', 'conditional', 'archive_ephemeral', 'crystallize'));
+    `,
+  },
 ];
 
 export async function runPgMigrations(pool: pg.Pool): Promise<void> {

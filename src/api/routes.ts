@@ -34,6 +34,7 @@ import { isAnchored, isDecayedAtRisk } from '../dreaming/scoring.js';
 import { cosineSimilarity, COSINE_DUPLICATE_THRESHOLD, classifyDupPair } from '../dreaming/pipeline.js';
 import { buildScopeDrift, DistinctRulings, DeferredMarks } from '../scopes/drift.js';
 import { buildScopeResolution, type ScopeResolution, type RejectedAlias, isGlobalScope, isScopeForm, slugifyScope, GLOBAL_SCOPE } from '../scopes/resolver.js';
+import { toStructuredEvent } from './audit-events.js';
 import { SCOPE_ALIASES_CONFIG_KEY } from '../services/scope-alias.js';
 import { runArchiveEphemeral, IneligibleScopeError } from '../scopes/archive-ephemeral.js';
 import { bufferToEmbedding } from '../embeddings/embedder.js';
@@ -3199,6 +3200,33 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
         meta: { row_total: rows.length, truncated },
       };
     });
+  });
+
+  // --- Audit events (Phase 3, Task 43) ---
+  // Read-only, id-cursored feed of the structured dream_audit_log rows behind
+  // the viz timeline. The table is append-only, so id order IS time order —
+  // the cursor is just the last row id returned, no timestamp comparison
+  // needed. Absent dream store degrades to an empty, unavailable feed rather
+  // than a 404/500: Task 8's client fetch loop branches on meta.available.
+  const AuditEventsQuerySchema = z.object({
+    cursor: z.coerce.number().int().positive().optional(),
+    limit: z.coerce.number().int().min(1).max(1000).default(500),
+  });
+  app.get('/api/ops/audit-events', async (request) => {
+    if (!dreamStore) {
+      return { data: [], meta: { available: false, has_more: false, cursor: null } };
+    }
+    const q = AuditEventsQuerySchema.parse(request.query);
+    const rows = await dreamStore.listAuditAfter({ after: q.cursor, limit: q.limit + 1 });
+    const page = rows.slice(0, q.limit);
+    return {
+      data: page.map(toStructuredEvent),
+      meta: {
+        available: true,
+        has_more: rows.length > q.limit,
+        cursor: page.length > 0 ? page[page.length - 1].id : null,
+      },
+    };
   });
 
   /**

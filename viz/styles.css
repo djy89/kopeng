@@ -545,6 +545,14 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   text-transform: lowercase; letter-spacing: 0.04em;
 }
 #detail .meta-line { font-size: 0.625rem; color: var(--muted-foreground); margin-top: 0.35rem; }
+/* Time-mode absence banner — selected memory isn't present at the current
+   timeline position. Sits above the rest of the pane; see updateAbsenceBanner()
+   in app.js. */
+#detail .tm-banner {
+  border: 1px solid var(--warning); color: var(--warning);
+  font-size: 0.625rem; text-transform: uppercase; letter-spacing: 0.08em;
+  padding: 3px 7px; margin-bottom: 0.6rem;
+}
 #detail .pill.radyn-pill--info    { border-color: var(--info);    color: var(--info); }
 #detail .pill.radyn-pill--warning { border-color: var(--warning); color: var(--warning); }
 #detail .pill.radyn-pill--success { border-color: var(--success); color: var(--success); }
@@ -659,6 +667,104 @@ input[type="search"]::placeholder { color: var(--muted-foreground); }
   background: hsl(var(--surface-01) / 0.8); padding: 4px 8px; border: 1px solid var(--border);
 }
 @media (min-width: 640px) { .overlay-hint { font-size: 10px; } }
+
+/* ----- T43 time mode ----- */
+/* The toggle and the panel are absolutely positioned: the graph tab panel is a
+   flex column, so either one in flow would take height away from the canvas. */
+.time-btn {
+  position: absolute; z-index: 3; top: 12px; left: 12px;
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  background: hsl(var(--surface-01) / 0.9); color: var(--muted-foreground);
+  border: 1px solid var(--border-strong-c); padding: 4px 9px;
+  font-family: inherit; font-size: 10px; letter-spacing: 0.1em;
+  text-transform: uppercase; cursor: pointer;
+  transition: color 100ms ease-out, border-color 100ms ease-out;
+}
+.time-btn:hover { color: var(--text-strong); border-color: var(--accent-color); }
+.time-btn[disabled] { cursor: progress; opacity: 0.6; }
+/* Entry fetches the archived corpus and the whole audit log — on a large store
+   that is seconds, and the toggle is the only thing that can say so. */
+.time-btn.time-loading { color: var(--accent-color); border-color: var(--accent-color); }
+.time-btn.time-loading::after {
+  content: "…"; animation: time-loading-pulse 900ms steps(1) infinite;
+}
+@keyframes time-loading-pulse { 50% { opacity: 0.25; } }
+
+.time-panel {
+  position: absolute; z-index: 3; left: 0; right: 0; bottom: 0;
+  display: flex; align-items: center; gap: 0.6rem;
+  min-height: 34px; padding: 0.5rem 0.9rem;
+  background: var(--panel); border-top: 1px solid var(--border-strong-c);
+  font-size: 0.72rem; color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+.time-panel[hidden] { display: none !important; }
+.time-panel .time-btn { position: static; }
+.time-panel .time-btn[disabled] { cursor: not-allowed; }
+#time-speed {
+  background: hsl(var(--surface-01) / 0.9); color: var(--muted-foreground);
+  border: 1px solid var(--border-strong-c); font-family: inherit; font-size: 10px;
+  padding: 3px 4px;
+}
+.time-track {
+  position: relative; flex: 1 1 auto; min-width: 80px;
+  display: flex; align-items: center;
+}
+#time-density {
+  position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+  width: 100%; height: 14px; pointer-events: none; opacity: 0.55;
+}
+#time-scrub { position: relative; width: 100%; margin: 0; }
+.time-label { white-space: nowrap; }
+.time-caption { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.7; }
+.time-diagnostic { white-space: nowrap; color: var(--accent-color); }
+.time-diagnostic[hidden] { display: none !important; }
+.time-log {
+  position: absolute; bottom: 100%; left: 0.9rem; right: 0.9rem;
+  max-height: 90px; overflow-y: auto; margin-bottom: 4px;
+  display: flex; flex-direction: column-reverse; gap: 2px;
+}
+.time-log:empty { display: none; }
+.time-log-row {
+  background: hsl(var(--surface-01) / 0.92); border: 1px solid var(--border-strong-c);
+  padding: 2px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  cursor: pointer;
+}
+.time-log-row:hover { border-color: var(--accent-color); }
+.time-log-badge {
+  display: inline-block; padding: 0 4px; margin-right: 4px; border-radius: 2px;
+  font-weight: 600; color: var(--panel);
+}
+.time-log-badge-merge, .time-log-badge-exact_dup { background: var(--type-feedback); }
+.time-log-badge-decay, .time-log-badge-archive_ephemeral { background: var(--muted-foreground); }
+.time-log-badge-supersede { background: var(--type-reference); }
+.time-log-badge-reinforce { background: var(--type-user); }
+.time-log-badge-crystallize, .time-log-badge-conditional { background: var(--type-discovery); }
+.time-log-badge-promote_global, .time-log-badge-rollback { background: var(--type-project); }
+.time-log-badge-other { background: var(--muted-foreground); }
+
+/* Membership at the current instant. A node the timeline says is not there must
+   also not be hoverable — otherwise an invisible dot still owns the cursor.
+   !important because time-mode visibility must win over hover-dim (.dimmed/.lit)
+   and selection-dim (.sel-dimmed/.sel-lit), both of which can also apply to the
+   same node and are otherwise higher specificity (e.g. #canvas g.sel-dimmed
+   .node:not(.sel-lit)). An absent node stays absent regardless of dim/lit/selected. */
+.node.tm-absent { opacity: 0 !important; pointer-events: none; }
+.link.tm-absent { opacity: 0 !important; }
+/* Cross-fade while time mode is scrubbing/playing — per-frame opacity changes
+   made while '.time-active' is present animate over 300ms; this includes scrub
+   jumps, since '.time-active' is set for the whole time-mode session rather
+   than only during continuous playback. */
+.time-active .node, .time-active .link { transition: opacity 0.3s ease-out; }
+.node.tm-unknown .dot { stroke-dasharray: 2 2; }
+/* !important for the same reason as tm-absent above: ghost must render at 0.15
+   whether or not a hover-dim or selection-dim is also active on this node. */
+.node.tm-ghost { opacity: 0.15 !important; }
+/* Supersede archives nothing — the old node stays visible with a lasting
+   deprecated tint rather than disappearing. */
+.node.tm-deprecated .dot { opacity: 0.5; filter: saturate(0.4); }
+
+.tm-fx { pointer-events: none; }
 
 .tooltip {
   position: absolute;

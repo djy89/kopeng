@@ -134,4 +134,59 @@ describe('crystallizeEligible (T30.3)', () => {
     expect(res.withheld).toBe(1);
     expect(await conf(idEligible)).toBeCloseTo(0.85, 5);
   });
+
+  it('appends a crystallize audit row under a carrier dream (T43)', async () => {
+    const result = await crystallizeEligible({ memoryStore: queries, dreamStore, now: NOW });
+    expect(result.crystallized).toContain(idEligible);
+
+    const row = db.prepare(
+      `SELECT * FROM dream_audit_log WHERE memory_id = ? AND change_class = 'crystallize'`,
+    ).get(idEligible) as { dream_id: number; after_ref: string; before_ref: string; applied_automatically: number; revision_id: number | null } | undefined;
+    expect(row).toBeDefined();
+    expect(row!.after_ref).toBe('crystallized;confidence=0.97');
+    expect(row!.before_ref).toBe('confidence=0.85'); // the suite seeds idEligible at 0.85
+    expect(row!.applied_automatically).toBe(1);      // raw SQLite row: 0/1
+    expect(row!.revision_id).not.toBeNull();
+
+    const dream = db.prepare(`SELECT is_carrier, status FROM dreams WHERE id = ?`).get(row!.dream_id) as { is_carrier: number; status: string };
+    expect(dream.is_carrier).toBe(1);
+    expect(dream.status).toBe('completed'); // carrier.finalize ran
+  });
+
+  it('compensates (restores confidence) when the audit append fails (T43)', async () => {
+    const failingStore = Object.create(dreamStore) as typeof dreamStore;
+    failingStore.appendAudit = async () => { throw new Error('audit path down'); };
+
+    const result = await crystallizeEligible({ memoryStore: queries, dreamStore: failingStore, now: NOW });
+    expect(result.crystallized).toHaveLength(0);
+    expect(await conf(idEligible)).toBe(0.85); // mutation compensated back to seeded value
+  });
+
+  it('opens no carrier dream when nothing is eligible (T43)', async () => {
+    // Fresh empty stores — the suite-level fixtures all seed candidates.
+    const fresh = createTestDatabase();
+    const freshDreams = new DreamQueries(fresh.db);
+    await crystallizeEligible({ memoryStore: fresh.queries, dreamStore: freshDreams, now: NOW });
+    const n = fresh.db.prepare(`SELECT COUNT(*) AS n FROM dreams`).get() as { n: number };
+    expect(n.n).toBe(0); // CarrierDream.open() is lazy — zero candidates, zero rows
+    fresh.db.close();
+  });
+});
+
+describe('crystallize audit class (T43)', () => {
+  it('accepts crystallize as a dream_audit_log change_class', async () => {
+    const { db } = createTestDatabase();
+    const dreams = new DreamQueries(db);
+    const dream = await dreams.createDream({
+      mode: 'whole_corpus', trigger_source: 'scheduled',
+      reason: 'test carrier', is_carrier: true,
+    });
+    const row = await dreams.appendAudit({
+      dream_id: dream.id, memory_id: null,
+      change_class: 'crystallize',
+      after_ref: 'crystallized;confidence=0.97',
+    });
+    expect(row.change_class).toBe('crystallize');
+    db.close();
+  });
 });

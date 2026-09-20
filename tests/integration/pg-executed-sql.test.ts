@@ -478,11 +478,11 @@ describe.skipIf(!PG_URL)('PG executed-SQL (real Postgres via KOPENG_PG_TEST_URL)
   it('dream_audit_log CHECK allows every permitted change class and rejects contested', async () => {
     const id = await storeOne('Audit CHECK probe.');
     const dream = await dreams.createDream({ trigger_source: 'manual', reason: 'pg executed-sql test' });
-    // Every class the CHECK allows (SQLite v6/v7/v13 ↔ PG v8/v9/v15 parity) —
+    // Every class the CHECK allows (SQLite v6/v7/v13/v15 ↔ PG v8/v9/v15/v17 parity) —
     // the apply path writes seven of these; 'reinforce' is allowed by the
     // CHECK but currently unwritten, covered here so a future writer has
-    // parity too. 'archive_ephemeral' (T76 F-2) is audit-only, like 'rollback'.
-    const allowed = ['exact_dup', 'decay', 'merge', 'supersede', 'reinforce', 'promote_global', 'rollback', 'conditional', 'archive_ephemeral'] as const;
+    // parity too. 'archive_ephemeral' (T76 F-2) and 'crystallize' (T43) are audit-only, like 'rollback'.
+    const allowed = ['exact_dup', 'decay', 'merge', 'supersede', 'reinforce', 'promote_global', 'rollback', 'conditional', 'archive_ephemeral', 'crystallize'] as const;
     for (const changeClass of allowed) {
       const entry = await dreams.appendAudit({
         dream_id: dream.id,

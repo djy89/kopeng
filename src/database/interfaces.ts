@@ -389,6 +389,9 @@ export interface IDreamStore {
 
   listAuditForDream(dreamId: number): Promise<DreamAuditEntry[]>;
 
+  /** Page the whole audit log by id ascending (append-only ⇒ id order is time order). */
+  listAuditAfter(opts: { after?: number; limit: number }): Promise<DreamAuditEntry[]>;
+
   // ── reinforcement / anchor on memories ──
   /** Bump observation_count and refresh last_seen (recall/reinforce reset of the decay clock). */
   reinforceMemory(memoryId: number, at?: string): Promise<void>;

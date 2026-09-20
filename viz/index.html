@@ -154,6 +154,29 @@
           <div id="zoom-hud" class="zoom-hud"><span class="zoom-label">zoom</span><span id="zoom-value">100%</span></div>
           <div class="overlay-hint">drag · scroll to zoom · click a node</div>
         </div>
+        <!-- T43 time mode. Both overlay the canvas absolutely: the graph panel
+             is a flex column, so an in-flow button or panel would steal height
+             from the <svg>. The panel is an empty shell here — Task 9 fills it
+             with the scrubber, transport, and density strip. -->
+        <button id="time-toggle" class="time-btn" title="timeline">⏱ timeline</button>
+        <div id="time-panel" class="time-panel" hidden>
+          <button id="time-play" class="time-btn" aria-label="play">▶</button>
+          <button id="time-step-back" class="time-btn" aria-label="previous event">⏮</button>
+          <button id="time-step-fwd" class="time-btn" aria-label="next event">⏭</button>
+          <select id="time-speed" aria-label="playback speed">
+            <option value="86400000">day/s</option>
+            <option value="604800000" selected>week/s</option>
+            <option value="2592000000">month/s</option>
+          </select>
+          <div class="time-track">
+            <canvas id="time-density" height="14"></canvas>
+            <input id="time-scrub" type="range" min="0" max="1000" value="1000" step="1" aria-label="timeline position" />
+          </div>
+          <span id="time-label" class="time-label"></span>
+          <span id="time-caption" class="time-caption">positions, links, and node attributes are today's values; timeline shows recorded membership and automated curation</span>
+          <span id="time-diagnostic" class="time-diagnostic" hidden></span>
+          <div id="time-log" class="time-log"></div>
+        </div>
       </div>
 
       <div class="tab-panel" data-panel="live" hidden>
@@ -437,6 +460,9 @@
     network from another origin. This one ships in the tarball.
   -->
   <script src="d3.min.js"></script>
-  <script src="app.js"></script>
+  <!-- type="module": app.js imports the T43 timeline reducer from timeline.mjs.
+       Modules are deferred, so this still runs after the classic d3 tag above
+       has defined the global it depends on. -->
+  <script type="module" src="app.js"></script>
 </body>
 </html>

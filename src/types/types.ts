@@ -436,7 +436,8 @@ export type DreamDiffClass =
   | 'promote_global' | 'conditional' | 'contested';
 export type DreamAuditClass =
   | 'exact_dup' | 'decay' | 'merge' | 'supersede' | 'reinforce'
-  | 'promote_global' | 'rollback' | 'conditional' | 'archive_ephemeral';
+  | 'promote_global' | 'rollback' | 'conditional' | 'archive_ephemeral'
+  | 'crystallize';
 /** Back-compat union — prefer the specific split in new code. */
 export type DreamChangeClass = DreamDiffClass | DreamAuditClass;
 /** Deterministic-safe entries may auto-apply; reasoner-driven entries are queued for review. */

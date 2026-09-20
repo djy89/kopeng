@@ -323,6 +323,13 @@ export class DreamQueries implements IDreamStore, IOperatorConfigStore {
     return rows.map(rowToAudit);
   }
 
+  async listAuditAfter(opts: { after?: number; limit: number }): Promise<DreamAuditEntry[]> {
+    const rows = this.db.prepare(
+      `SELECT * FROM dream_audit_log WHERE id > ? ORDER BY id ASC LIMIT ?`
+    ).all(opts.after ?? 0, opts.limit) as Record<string, unknown>[];
+    return rows.map(rowToAudit);
+  }
+
   // ──────────────────── reinforcement / anchor ──────────────────
 
   async reinforceMemory(memoryId: number, at?: string): Promise<void> {

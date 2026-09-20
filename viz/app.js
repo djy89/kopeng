@@ -1,3 +1,5 @@
+import { buildTimeline, parseDbTime, visibleAt, diffVisible } from './timeline.mjs';
+
 const TYPES = ['user', 'feedback', 'project', 'reference', 'discovery'];
 const ENTITY_TYPES = ['concept', 'technology', 'project', 'organization', 'person'];
 
@@ -29,7 +31,7 @@ function setTheme(name) {
   refreshColors();
   if (typeof lastStats !== 'undefined' && lastStats) {
     renderLegend();
-    renderGraph();
+    requestRender();
   }
 }
 try {
@@ -106,12 +108,34 @@ let activeScopes = new Set();
 let searchTerm = '';
 let lastStats = null;
 let nodeSel, linkSel; // active D3 selections (mixed: memory + entity nodes)
+let root = null;            // zoom/pan <g> — module scope so time mode can clear its temp elements
 let nodesGroup, linksGroup; // container <g>s — hover dims via one class here, not per node
 let adjacency = new Map(); // node id → Set of neighbour ids, rebuilt per render
 const layoutCache = new Map(); // node id → {x,y}: warm re-renders reuse positions instead of re-solving
 let renderGen = 0; // generation guard — a new render aborts the previous async layout loop
 let svgRect = null; // cached canvas rect (renderGraph refreshes it) — avoids per-mousemove reads
 let tooltipSize = { w: 0, h: 0 }; // measured once per tooltip show, not per mousemove
+
+// T43: time-mode state. requestRender() is the ONLY direct caller of the full
+// re-render: a full re-render tears down the SVG, so any active or in-progress
+// time mode must be dismantled first (spec: one centralized guard, no
+// per-trigger special cases).
+const timeMode = {
+  phase: 'idle',      // 'idle' | 'entering' | 'active'
+  anchor: null,       // Map<nodeId, {x,y}> — LIVE coordinates captured at entry
+  activeMems: null,   // filtered non-archived rows (the t=now universe)
+  archivedMems: null, // filtered archived rows, fetched at entry
+  timeline: null,     // buildTimeline() output over the FULL corpus
+  visible: null,      // Set<memoryId> currently on screen
+  t: 0, tMin: 0, tNow: 0,
+};
+let timeEntryToken = 0;        // invalidates an in-flight entry
+let timeNodeById = new Map();  // nodeId → that node's d3 selection (time render only)
+function requestRender() {
+  timeEntryToken++;                          // abandon any entry in progress
+  if (timeMode.phase !== 'idle') exitTimeMode();
+  renderGraph();
+}
 
 // ---------- DOM helpers ----------
 function el(tag, attrs, ...kids) {
@@ -194,7 +218,10 @@ async function fetchAllMemories() {
   }
 }
 
-async function pageMemories(params) {
+// opts.noCap lifts the 5000-row safety stop. The live graph is happy to draw a
+// truncated corpus; the timeline is not — a missing archived row would read as
+// "this memory never existed" rather than "we stopped paging".
+async function pageMemories(params, opts = {}) {
   const out = [];
   let cursor;
   while (true) {
@@ -209,7 +236,33 @@ async function pageMemories(params) {
     }
     if (!j.meta.has_more) break;
     cursor = j.meta.cursor;
-    if (out.length > 5000) break;
+    if (!opts.noCap && out.length > 5000) break;
+  }
+  return out;
+}
+
+// ---------- T43 time-mode fetchers ----------
+async function fetchArchivedMemories() {
+  // include_archived returns actives too — keep only the archived rows;
+  // actives are already in allMemories.
+  const all = await pageMemories('limit=1000&fields=lite&include_archived=true', { noCap: true });
+  return all.filter(m => m.is_archived);
+}
+
+async function fetchAuditEvents() {
+  const out = [];
+  let cursor = null;
+  for (;;) {
+    // No cursor param on page 1 — the endpoint's schema requires a POSITIVE
+    // integer, so `cursor=0` is a 400 rather than "start from the beginning".
+    const url = `/api/ops/audit-events?limit=1000${cursor ? `&cursor=${cursor}` : ''}`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`audit-events: ${r.status}`);
+    const j = await r.json();
+    if (j.meta.available === false) throw new Error('audit-events: dream store unavailable');
+    out.push(...j.data);
+    if (!j.meta.has_more) break;
+    cursor = j.meta.cursor;
   }
   return out;
 }
@@ -272,7 +325,7 @@ async function load() {
     renderLegend();
     renderFilters(stats);
     renderHealth(stats);
-    renderGraph();
+    requestRender();
   } catch (err) {
     clear(els.health);
     els.health.append('error: ' + err.message);
@@ -445,7 +498,7 @@ function renderFilters(stats) {
         el('span', { class: 'count' }, (stats.by_type[t] || 0).toLocaleString()),
       ],
       activeTypes.has(t),
-      next => { next ? activeTypes.add(t) : activeTypes.delete(t); renderGraph(); },
+      next => { next ? activeTypes.add(t) : activeTypes.delete(t); requestRender(); },
     ));
   }
   els.filters.append(typeGroup);
@@ -463,7 +516,7 @@ function renderFilters(stats) {
           el('span', { class: 'count' }, (entityCounts[et] || 0).toLocaleString()),
         ],
         activeEntityTypes.has(et),
-        next => { next ? activeEntityTypes.add(et) : activeEntityTypes.delete(et); renderGraph(); },
+        next => { next ? activeEntityTypes.add(et) : activeEntityTypes.delete(et); requestRender(); },
       ));
     }
     els.filters.append(entGroup);
@@ -475,7 +528,7 @@ function renderFilters(stats) {
     scopeList.append(makeCheck(
       [el('span', null, s), el('span', { class: 'count' }, c.toLocaleString())],
       activeScopes.has(s),
-      next => { if (next) activeScopes.add(s); else activeScopes.delete(s); renderGraph(); },
+      next => { if (next) activeScopes.add(s); else activeScopes.delete(s); requestRender(); },
     ));
   });
   scopeBody.append(scopeList);
@@ -490,15 +543,18 @@ function renderFilters(stats) {
     const v = e.target.value.toLowerCase();
     debounce = setTimeout(() => {
       searchTerm = v;
-      renderGraph();
+      requestRender();
     }, 200);
   });
   searchGroup.append(searchInput);
   els.filters.append(searchGroup);
 }
 
-function visibleMemories() {
-  return allMemories.filter(m => {
+// The one type/scope/search predicate. Extracted so time mode can apply the
+// SAME filter to archived rows — an archived memory that the operator has
+// filtered out must not reappear just because it is being viewed in the past.
+function filterMemories(list) {
+  return list.filter(m => {
     if (!activeTypes.has(m.type)) return false;
     if (!(activeScopes.size === 0 || activeScopes.has(m.scope))) return false;
     if (searchTerm) {
@@ -509,9 +565,30 @@ function visibleMemories() {
   });
 }
 
+function visibleMemories() {
+  return filterMemories(allMemories);
+}
+
 // Tag-edge heuristic — kept as fallback for when Neo4j is disabled. Memory↔
 // memory edges built from shared tags (skipping mega-tags >30 nodes).
-function buildTagLinks(mems) {
+//
+// The >30 cutoff is evaluated against `capPopulation`, which defaults to `mems`
+// and so leaves the live graph untouched. Time mode passes the UNION as `mems`
+// but keeps the ACTIVE rows as the cap population, because the cutoff decides
+// which tags produce edges at all: counted over the union, a tag with 28 active
+// and 5 archived members crosses 30 and gets skipped, which deletes links
+// between two memories that are both active and both visible at t=now, and
+// changes the weight (hence stroke-width) of any surviving link that shared it.
+// Capping on the active population keeps the qualifying tag set identical to
+// the live graph's, so every active↔active edge — existence, weight, and tags —
+// is reproduced exactly, while archived rows still get their edges.
+function buildTagLinks(mems, capPopulation = mems) {
+  const capCount = new Map();
+  const capIds = new Set();
+  for (const m of capPopulation) {
+    capIds.add(m.id);
+    for (const t of m.tags) capCount.set(t, (capCount.get(t) || 0) + 1);
+  }
   const byTag = new Map();
   for (const m of mems) {
     for (const t of m.tags) {
@@ -520,8 +597,18 @@ function buildTagLinks(mems) {
     }
   }
   const merged = new Map();
-  for (const [tag, ids] of byTag) {
-    if (ids.length > 30) continue;
+  for (const [tag, allIds] of byTag) {
+    if ((capCount.get(tag) || 0) > 30) continue;
+    // The cutoff is judged against the cap population (the ACTIVE set in time
+    // mode) so t=now keeps the live graph's qualifying-tag set — but the pair
+    // loop is quadratic in the members it emits. A tag with few active and
+    // thousands of ARCHIVED members passed the cutoff and emitted C(n,2)
+    // pairs, freezing the renderer on the real corpus. Bound it: an oversized
+    // union emits pairs among cap-population members only (<=30 => <=435
+    // pairs), which is exactly the live link set; archived-involving links
+    // for that tag are skipped. On the live path capPopulation === mems, so
+    // both branches are identical and behavior is unchanged.
+    const ids = allIds.length > 30 ? allIds.filter(id => capIds.has(id)) : allIds;
     for (let i = 0; i < ids.length; i++) {
       for (let j = i + 1; j < ids.length; j++) {
         const a = ids[i], b = ids[j];
@@ -547,18 +634,16 @@ function entityRadius(e) {
 }
 
 // ---------- Graph render ----------
-function renderGraph() {
-  const gen = ++renderGen; // invalidates any in-flight async layout from a previous render
-  const svgRoot = els.svg;
-  const svg = d3.select(svgRoot);
-  svg.selectAll('*').remove();
+// Link endpoints are string ids until d3.forceLink swaps in node objects, and
+// the time-mode render resolves them to objects itself. One reader for both.
+const endId = (v) => (v && typeof v === 'object' ? v.id : v);
 
-  const rect = svgRoot.getBoundingClientRect();
-  svgRect = rect;
-  const width = rect.width || 800;
-  const height = rect.height || 600;
-
-  const mems = visibleMemories();
+// Node + link model for a set of memories. Shared by the live render and the
+// time-mode static render so both build the same graph under the same rules.
+// `capPopulation` is the row set the tag-edge cutoff is measured against — the
+// live render measures against its own `mems`, time mode passes the union as
+// `mems` and the ACTIVE rows here (see buildTagLinks).
+function buildGraphModel(mems, capPopulation = mems) {
   const memById = new Map(mems.map(m => [m.id, m]));
 
   // Build mixed node list and link list. Each node has a unique id ('m-N' or
@@ -603,31 +688,40 @@ function renderGraph() {
       links.push({ source: 'm-' + link.memoryId, target, weight: 1, kind: 'mention' });
     }
   } else {
-    links = buildTagLinks(mems).filter(l => memById.has(parseInt(l.source.slice(2), 10)) && memById.has(parseInt(l.target.slice(2), 10)));
+    links = buildTagLinks(mems, capPopulation).filter(l => memById.has(parseInt(l.source.slice(2), 10)) && memById.has(parseInt(l.target.slice(2), 10)));
   }
 
-  const allNodes = [...memNodes, ...entNodes];
+  return { allNodes: [...memNodes, ...entNodes], links };
+}
 
-  // Adjacency for hover highlighting — built once here (link source/target are
-  // still string ids at this point), not rescanned on every mouseover.
+// DOM half of a render: clears the canvas, rebuilds adjacency, wires zoom and
+// background-click, joins nodes and links, and hands back the paint closure.
+// ONE join implementation — the live render and the time-mode static render
+// both go through here, so a change to node/link markup or handlers cannot
+// land on only one of them.
+function buildGraphDom(allNodes, links) {
+  const svgRoot = els.svg;
+  const svg = d3.select(svgRoot);
+  svg.selectAll('*').remove();
+
+  const rect = svgRoot.getBoundingClientRect();
+  svgRect = rect;
+
+  // Adjacency for hover highlighting — built once here, not rescanned on every
+  // mouseover. Endpoints are string ids on the live path (forceLink has not run
+  // yet) and node objects on the time path, hence endId().
   adjacency = new Map();
   const addAdj = (a, b) => {
     let s = adjacency.get(a);
     if (!s) { s = new Set(); adjacency.set(a, s); }
     s.add(b);
   };
-  for (const l of links) { addAdj(l.source, l.target); addAdj(l.target, l.source); }
-
-  // Seed positions from the previous layout so filter/resize/theme/tab-return
-  // re-renders keep the map stable and only need a short settle pass.
-  let seeded = 0;
-  for (const n of allNodes) {
-    const p = layoutCache.get(n.id);
-    if (p) { n.x = p.x; n.y = p.y; seeded++; }
+  for (const l of links) {
+    const s = endId(l.source), t = endId(l.target);
+    addAdj(s, t); addAdj(t, s);
   }
-  const warm = allNodes.length > 0 && seeded / allNodes.length > 0.9;
 
-  const root = svg.append('g').attr('class', 'root');
+  root = svg.append('g').attr('class', 'root');
   const zoomHud = document.getElementById('zoom-value');
   if (zoomHud) zoomHud.textContent = '100%';
 
@@ -672,7 +766,7 @@ function renderGraph() {
     .attr('height', d => d._r * 2)
     .attr('transform', 'rotate(45)');
 
-  node.on('click', (e, d) => { selectedNodeId = d.id; applySelection(); showDetail(d); });
+  node.on('click', (e, d) => { selectedNodeId = d.id; applySelection(); showDetail(d); updateAbsenceBanner(); });
   node.on('mouseover', (e, d) => { highlight(d.id); showTooltip(e, d); });
   node.on('mousemove', e => moveTooltip(e));
   node.on('mouseout', () => { unhighlight(); hideTooltip(); });
@@ -685,6 +779,41 @@ function renderGraph() {
       .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
     node.attr('transform', d => `translate(${d.x},${d.y})`);
   }
+
+  node.call(
+    d3.drag()
+      .on('start', (e, d) => { d.fx = d.x; d.fy = d.y; })
+      .on('drag', (e, d) => {
+        d.fx = e.x; d.fy = e.y;
+        d.x = e.x; d.y = e.y;
+        paint();
+      })
+      .on('end', (e, d) => { layoutCache.set(d.id, { x: d.x, y: d.y }); })
+  );
+
+  nodeSel = node;
+  linkSel = linkSelLocal;
+
+  if (selectedNodeId != null && !allNodes.some(n => n.id === selectedNodeId)) selectedNodeId = null;
+  applySelection();
+
+  return { node, link: linkSelLocal, paint, width: rect.width || 800, height: rect.height || 600 };
+}
+
+function renderGraph() {
+  const gen = ++renderGen; // invalidates any in-flight async layout from a previous render
+  const { allNodes, links } = buildGraphModel(visibleMemories());
+
+  // Seed positions from the previous layout so filter/resize/theme/tab-return
+  // re-renders keep the map stable and only need a short settle pass.
+  let seeded = 0;
+  for (const n of allNodes) {
+    const p = layoutCache.get(n.id);
+    if (p) { n.x = p.x; n.y = p.y; seeded++; }
+  }
+  const warm = allNodes.length > 0 && seeded / allNodes.length > 0.9;
+
+  const { paint, width, height } = buildGraphDom(allNodes, links);
 
   // Charge: entities repel a bit harder so they form natural hubs without the
   // memory points crowding through them.
@@ -722,23 +851,740 @@ function renderGraph() {
     }
   };
   requestAnimationFrame(step);
+}
 
-  node.call(
-    d3.drag()
-      .on('start', (e, d) => { d.fx = d.x; d.fy = d.y; })
-      .on('drag', (e, d) => {
-        d.fx = e.x; d.fy = e.y;
-        d.x = e.x; d.y = e.y;
-        paint();
-      })
-      .on('end', (e, d) => { layoutCache.set(d.id, { x: d.x, y: d.y }); })
-  );
+// ---------- T43 time mode ----------
+// Entry is a token-guarded state machine: idle → entering → active. Every await
+// is followed by a token re-check, because requestRender() (filter change,
+// resize, theme cycle, tab return, SSE-driven reload) bumps the token and
+// rebuilds the live graph underneath us — the entry must then abandon without
+// touching the canvas, leaving the freshly rendered live graph standing.
+async function enterTimeMode() {
+  if (timeMode.phase !== 'idle') return;      // no concurrent entries
+  const btn = document.getElementById('time-toggle');
+  btn.disabled = true;
+  btn.classList.add('time-loading');
+  timeMode.phase = 'entering';
+  const token = ++timeEntryToken;
+  const bail = () => timeEntryToken !== token; // a re-render invalidated us
+  try {
+    // (1) Freeze the live view: a newer generation makes any in-flight settle
+    // loop abandon on its next frame (existing gen !== renderGen check).
+    renderGen++;
+    // (2) Anchor = LIVE coordinates from the bound data — never layoutCache,
+    // which is stale until a settle completes (only written at settle end).
+    // nodeSel holds exactly the FILTERED set on screen — that set IS the
+    // time-mode active universe (t=now must equal the pre-entry graph).
+    const anchor = new Map();
+    nodeSel.each(d => anchor.set(d.id, { x: d.x, y: d.y }));
+    const activeMems = filterMemories(allMemories);
+    // (3) Fetch in parallel; archived rows pass the SAME filter predicate.
+    const [archivedAll, events] = await Promise.all([fetchArchivedMemories(), fetchAuditEvents()]);
+    if (bail()) return;
+    const archivedMems = filterMemories(archivedAll);
+    // (4) Async pinned settle (rAF-chunked); positions for archived memories
+    // AND any entity nodes only they introduce.
+    const positions = await settleTimeNodes(activeMems, archivedMems, anchor, bail, events);
+    if (bail() || !positions) return;
+    // (5) Reducer over the FULL corpus (unfiltered) — the diagnostic is global.
+    const timeline = buildTimeline([...allMemories, ...archivedAll], events);
+    if (bail()) return;
+    // (6) Activate: single static render of the union at final positions.
+    timeMode.phase = 'active';
+    timeMode.anchor = anchor;
+    timeMode.activeMems = activeMems;
+    timeMode.archivedMems = archivedMems;
+    timeMode.timeline = timeline;
+    timeMode.tNow = Date.now();
+    timeMode.tMin = Math.min(...[...timeline.records.values()].map(r => r.born));
+    timeMode.t = timeMode.tNow;
+    renderTimeGraph([...activeMems, ...archivedMems], positions);
+    // Deterministic initial visibility (t=now must equal the pre-entry graph):
+    // the union was just rendered, so hide the archived side IMMEDIATELY and
+    // seed `visible` with the active set — the first seek then diffs from a
+    // truthful baseline instead of `null`.
+    timeMode.visible = new Set(activeMems.map(m => m.id));
+    for (const m of archivedMems) timeNodeById.get('m-' + m.id)?.classed('tm-absent', true);
+    hideArchivedOnlyDecor();
+    // Only NOW does the opacity transition arm — before this line the baseline
+    // above has not yet applied, and any reflow in between would turn entry
+    // itself into a 300ms fade-out of the archived corpus.
+    root.classed('time-active', true);
+    showTimePanel();
+    renderTimeControls();
+  } catch (err) {
+    console.error('time mode entry failed:', err);
+    // Restore the live graph THROUGH the centralized guard — do not set the
+    // phase to idle first. A throw after the phase flips to 'active' (the
+    // render, the panel) leaves anchor/timeline/visible/timeNodeById populated
+    // and the panel possibly shown; only requestRender's `phase !== 'idle'`
+    // branch runs exitTimeMode to tear all of that down, and pre-setting idle
+    // makes it a no-op. The finally block still demotes a stuck 'entering'.
+    if (!bail()) requestRender();
+    els.health.textContent = `time mode failed: ${err.message}`;
+  } finally {
+    if (timeMode.phase !== 'active') timeMode.phase = timeMode.phase === 'entering' ? 'idle' : timeMode.phase;
+    btn.disabled = false;
+    btn.classList.remove('time-loading');
+  }
+}
 
-  nodeSel = node;
-  linkSel = linkSelLocal;
+// Place the archived nodes around the frozen live map. The anchored nodes are
+// PINNED (fx/fy) so today's layout is preserved exactly; charge and collide
+// still process them, so this has to be chunked — a synchronous loop over
+// ~4,400 nodes measured ~5.8s of frozen main thread (same lesson as the live
+// settle loop). Seeding order: the archiving event's surviving partner, then
+// the scope centroid, then viewport center.
+function settleTimeNodes(activeMems, archivedMems, anchor, bail, events) {
+  return new Promise(resolve => {
+    // Partner map: archived memory id → surviving partner memory id, from the
+    // already-fetched structured events (relation.kind 'kept' or 'promoted_to').
+    const keptPartner = new Map();
+    for (const e of events) {
+      if ((e.relation?.kind === 'kept' || e.relation?.kind === 'promoted_to') && e.memory_id != null) {
+        keptPartner.set(e.memory_id, e.relation.target_id);
+      }
+    }
+    const centroids = new Map(); // scope → {x, y, n} over anchored memory nodes
+    for (const m of activeMems) {
+      const p = anchor.get('m-' + m.id);
+      if (!p) continue;
+      const c = centroids.get(m.scope) || { x: 0, y: 0, n: 0 };
+      c.x += p.x; c.y += p.y; c.n++;
+      centroids.set(m.scope, c);
+    }
+    const fallback = { x: (svgRect?.width ?? 800) / 2, y: (svgRect?.height ?? 600) / 2, n: 1 };
+    const seedFor = (m) => {
+      const partner = keptPartner.get(m.id);
+      const pp = partner != null ? anchor.get('m-' + partner) : null;
+      if (pp) return { x: pp.x + (Math.random() - 0.5) * 40, y: pp.y + (Math.random() - 0.5) * 40 };
+      const c = centroids.get(m.scope) || fallback;
+      return { x: c.x / c.n + (Math.random() - 0.5) * 60, y: c.y / c.n + (Math.random() - 0.5) * 60 };
+    };
+    const pinned = [...anchor.entries()].map(([id, p]) => ({ id, fx: p.x, fy: p.y, x: p.x, y: p.y, _r: 6 }));
+    const free = archivedMems.map(m => ({ id: 'm-' + m.id, ...seedFor(m), _r: memoryRadius(m) }));
+    // Entity nodes introduced ONLY by archived memories (entity mode): absent
+    // from the anchor, so they settle here too, seeded at the centroid of their
+    // incident archived memories' seeds. Their positions are returned alongside
+    // the memory positions — the time render consumes both from one map.
+    const freeEntities = [];
+    if (useEntityEdges) {
+      const freeById = new Map(free.map(n => [n.id, n]));
+      const incident = new Map(); // 'e-<name>' → seed nodes of its archived memories
+      for (const link of bipartite.links) {
+        const seed = freeById.get('m-' + link.memoryId);
+        if (!seed) continue;                      // link not to an archived memory
+        const eid = 'e-' + link.entityName;
+        if (anchor.has(eid)) continue;            // entity already on the live map
+        let arr = incident.get(eid);
+        if (!arr) { arr = []; incident.set(eid, arr); }
+        arr.push(seed);
+      }
+      for (const [eid, seeds] of incident) {
+        const sx = seeds.reduce((s, n) => s + n.x, 0) / seeds.length;
+        const sy = seeds.reduce((s, n) => s + n.y, 0) / seeds.length;
+        freeEntities.push({ id: eid, x: sx, y: sy, _r: 8 });
+      }
+    }
+    const sim = d3.forceSimulation([...pinned, ...free, ...freeEntities])
+      .force('charge', d3.forceManyBody().strength(-60).distanceMax(200))
+      .force('collide', d3.forceCollide().radius(d => d._r + 4).strength(0.9))
+      .stop();
+    let ticked = 0;
+    const step = () => {
+      if (bail()) return resolve(null);
+      const frameStart = performance.now();
+      while (ticked < 120 && performance.now() - frameStart < 12) { sim.tick(); ticked++; }
+      if (ticked < 120) return requestAnimationFrame(step);
+      resolve(new Map([...free, ...freeEntities].map(n => [n.id, { x: n.x, y: n.y }])));
+    };
+    requestAnimationFrame(step);
+  });
+}
 
-  if (selectedNodeId != null && !allNodes.some(n => n.id === selectedNodeId)) selectedNodeId = null;
-  applySelection();
+// Static render of the active∪archived union at already-decided positions. No
+// simulation runs here at all — every node's coordinates come from the anchor
+// (today's live layout, unchanged) or from the settle pass above.
+function renderTimeGraph(unionMems, positions) {
+  const { allNodes, links: modelLinks } = buildGraphModel(unionMems, timeMode.activeMems);
+
+  for (const n of allNodes) {
+    const p = timeMode.anchor.get(n.id) || positions.get(n.id);
+    n.x = p ? p.x : (svgRect?.width ?? 800) / 2;
+    n.y = p ? p.y : (svgRect?.height ?? 600) / 2;
+  }
+
+  // Resolve link endpoints BEFORE painting: paint() reads d.source.x, which is
+  // only a node object after d3.forceLink initializes the links. No simulation
+  // runs on this path, so nothing would ever do that swap for us.
+  const nodeById = new Map(allNodes.map(n => [n.id, n]));
+  for (const l of modelLinks) {
+    l.source = nodeById.get(endId(l.source));
+    l.target = nodeById.get(endId(l.target));
+  }
+  const links = modelLinks.filter(l => l.source && l.target);
+
+  const { node, paint } = buildGraphDom(allNodes, links);
+  paint(); // once — no tick loop
+
+  timeNodeById = new Map();
+  node.each(function (d) { timeNodeById.set(d.id, d3.select(this)); });
+}
+
+// Entry-visibility baseline, run immediately after the union render. Archived
+// MEMORY nodes are hidden by the caller; this hides the decor that would
+// otherwise hang off them — links with a hidden endpoint, and entity nodes that
+// were not on the live map (they exist only because an archived memory mentions
+// them, so at t=now they must not be there either).
+//
+// Archived-only caveat: entity edges for archived memories exist only if the
+// backend returned them (the bipartite payload has no archive filter, but it is
+// also min/max-capped). Sparse is honest — do not fabricate links.
+function hideArchivedOnlyDecor() {
+  const hiddenNode = id => {
+    if (id.startsWith('m-')) return !timeMode.visible.has(parseInt(id.slice(2), 10));
+    return !timeMode.anchor.has(id); // entity that wasn't on the live map
+  };
+  linkSel.classed('tm-absent', l => hiddenNode(endId(l.source)) || hiddenNode(endId(l.target)));
+  nodeSel.filter(d => d.kind === 'entity' && !timeMode.anchor.has(d.id)).classed('tm-absent', true);
+}
+
+function exitTimeMode() {
+  if (timeMode.phase === 'idle') return;
+  timeMode.phase = 'idle';
+  cancelPlayback();
+  nodesGroup?.selectAll('*').interrupt('tm');
+  linksGroup?.selectAll('*').interrupt('tm');
+  root?.selectAll('.tm-fx').remove(); // temp animation elements
+  root?.classed('time-active', false);
+  timeMode.anchor = timeMode.timeline = timeMode.archivedMems = timeMode.activeMems = timeMode.visible = null;
+  timeNodeById = new Map();
+  hideTimePanel();
+  document.getElementById('time-log').replaceChildren();
+  updateAbsenceBanner(); // phase is idle now — clears any lingering banner
+  // Caller re-renders the live graph; the live corpus was never mutated.
+}
+function showTimePanel() { document.getElementById('time-panel').hidden = false; }
+function hideTimePanel() { document.getElementById('time-panel').hidden = true; }
+
+// ---------- T43 seek engine ----------
+// Idempotent: calling seekTo repeatedly with the same t always leaves the same
+// classes set, because it always diffs from timeMode.visible (the last true
+// state) rather than accumulating deltas.
+function seekTo(t, opts = {}) {
+  const tl = timeMode.timeline;
+  cancelSeekArtifacts(); // interrupt('tm') on nodes+links, remove .tm-fx temp elements, clear .tm-deprecated
+  timeMode.t = t;
+  // At t >= now, recorded state yields to ACTUAL current state (spec: t=now
+  // is today's graph by construction) — filtered actives visible, archived hidden.
+  const next = t >= timeMode.tNow
+    ? new Set(timeMode.activeMems.map(m => m.id))
+    : visibleAt(tl, t);
+  const prev = timeMode.visible ?? next;
+  const { enter, exit } = diffVisible(prev, next);
+  for (const id of enter) timeNodeById.get('m-' + id)?.classed('tm-absent', false);
+  for (const id of exit) timeNodeById.get('m-' + id)?.classed('tm-absent', true);
+  // Computed ONCE per seek (one pass over adjacency) — updateLinkVisibility and
+  // updateEntityGhosts both read it instead of each re-scanning every entity's
+  // neighbor set, which on a high-degree entity corpus (and play, which seeks
+  // every frame) was O(links) work repeated twice per seek.
+  const visibleEntities = computeVisibleEntities(next);
+  updateLinkVisibility(next, visibleEntities);   // link visible iff both memory endpoints visible; entity endpoints follow their memory side
+  updateEntityGhosts(next, visibleEntities);     // entity gets .tm-ghost when zero visible neighbors
+  timeMode.visible = next;
+  document.getElementById('time-label').textContent = new Date(t).toISOString().slice(0, 10);
+  if (opts.animate) animateCrossedEvents(prev, next, t, opts.tPrev);
+  updateAbsenceBanner();
+}
+
+// Selected memory not present at the current timeline position → banner at the
+// top of the detail pane. Entities are present-day context, never banner'd.
+// Re-derives from scratch on every call (selection change, seek, exit) rather
+// than tracking a prior-shown flag, so it can't drift from actual state.
+function updateAbsenceBanner() {
+  const existing = els.detail.querySelector('.tm-banner');
+  const absent = timeMode.phase !== 'idle'
+    && typeof selectedNodeId === 'string' && selectedNodeId.startsWith('m-')
+    && !timeMode.visible?.has(parseInt(selectedNodeId.slice(2), 10));
+  if (!absent) { existing?.remove(); return; }
+  if (!existing) els.detail.prepend(el('div', { class: 'tm-banner' }, 'not present at this point in the timeline'));
+}
+
+function cancelSeekArtifacts() {
+  nodesGroup.selectAll('*').interrupt('tm');
+  linksGroup.selectAll('*').interrupt('tm');
+  root.selectAll('.tm-fx').remove();
+  // .tm-deprecated is transient-but-consistent decoration, not membership: clear
+  // it on every seek entry so a scrub-back past the supersede that set it
+  // doesn't leave a stale tint. The crossing path below re-applies it whenever
+  // the newly-crossed events include that supersede.
+  nodesGroup.selectAll('.tm-deprecated').classed('tm-deprecated', false);
+}
+
+// ---------- T43 event animations ----------
+// Zero transitions when the operator has asked for reduced motion — the final
+// classes are already applied by seekTo's diff, so the graph itself never
+// stalls; only the flourish and the log differ.
+const REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+const EVENT_LOG_CAP = 200;
+const GROUP_ANIMATE_CAP = 12; // beyond this many groups in one crossed window, log-only
+
+const EVENT_ANIMATIONS = {
+  merge: animateMerge,             // losers arc into the kept node, then fade
+  exact_dup: animateShrinkOut,     // desaturate + scale to 0
+  decay: animateShrinkOut,
+  archive_ephemeral: animateShrinkOut,
+  supersede: animateSupersede,     // both nodes stay: new ring-pulses (old's dim tint is state, applied separately)
+  reinforce: animatePulse,         // one radius pulse
+  crystallize: animateRing,        // expanding stroke ring
+  promote_global: animatePromote,  // per-action: archive/rescope/compensate_unarchive
+  rollback: animateRollback,       // per-action: restore_revision/archive_creation
+  conditional: animateConditional, // ring on the encoded target, ticks on sources
+};
+
+// First index in a (t, id)-sorted event array with e.t > t — shared bisection
+// for both ends of the crossed window below.
+function bisectAfterT(events, t) {
+  let lo = 0, hi = events.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (events[mid].t > t) hi = mid; else lo = mid + 1;
+  }
+  return lo;
+}
+
+// Groups by group_key in first-seen order; a null key is always its own
+// singleton group (per the reducer's grouping contract).
+function groupCrossedEvents(events) {
+  const groups = [];
+  const byKey = new Map();
+  for (const e of events) {
+    if (e.group_key == null) { groups.push([e]); continue; }
+    let g = byKey.get(e.group_key);
+    if (!g) { g = []; byKey.set(e.group_key, g); groups.push(g); }
+    g.push(e);
+  }
+  return groups;
+}
+
+function animateCrossedEvents(prev, next, t, tPrev) {
+  const events = timeMode.timeline.globalEvents;
+  const startIdx = bisectAfterT(events, tPrev);
+  const endIdx = bisectAfterT(events, t); // exclusive
+  if (startIdx >= endIdx) return;
+  const groups = groupCrossedEvents(events.slice(startIdx, endIdx));
+  let animated = 0;
+  for (const group of groups) {
+    logEventGroup(group);
+    // State, not a transition: applies in BOTH motion modes so reduced-motion
+    // and full-motion users end up with identical classes after the same
+    // crossed events. Only the flourish below is motion-gated.
+    if (group[0].change_class === 'supersede') applySupersedeState(group);
+    if (REDUCED_MOTION) continue;
+    if (animated >= GROUP_ANIMATE_CAP) continue; // a play-speed jump is a jump — log only
+    const fn = EVENT_ANIMATIONS[group[0].change_class];
+    if (fn) fn(group);
+    animated++;
+  }
+}
+
+function nodePos(id) {
+  const sel = timeNodeById.get('m-' + id);
+  if (!sel || sel.empty()) return null;
+  const d = sel.datum();
+  return d ? { x: d.x, y: d.y } : null;
+}
+
+// Temp visual-only element: never mutates a persistent node's attributes, so
+// an interrupt mid-flight (cancelSeekArtifacts) can just delete it — nothing
+// to restore on the real graph.
+function fxNode(tag) {
+  return root.append(tag).attr('class', 'tm-fx').style('pointer-events', 'none');
+}
+
+function shrinkOutNode(id) {
+  const p = nodePos(id);
+  if (!p) return;
+  const sel = timeNodeById.get('m-' + id);
+  const r0 = sel.datum()?._r ?? 4;
+  fxNode('circle')
+    .attr('cx', p.x).attr('cy', p.y).attr('r', r0)
+    .style('fill', cssVar('--muted-foreground') || '#888')
+    .style('opacity', 0.9)
+    .transition('tm').duration(500)
+    .attr('r', 0).style('opacity', 0)
+    .remove();
+}
+
+function animateShrinkOut(group) {
+  for (const e of group) if (e.memory_id != null) shrinkOutNode(e.memory_id);
+}
+
+function arcTo(from, to) {
+  const mx = (from.x + to.x) / 2, my = (from.y + to.y) / 2 - 24;
+  fxNode('path')
+    .attr('d', `M${from.x},${from.y} Q${mx},${my} ${to.x},${to.y}`)
+    .style('fill', 'none')
+    .style('stroke', cssVar('--muted-foreground') || '#888')
+    .style('stroke-width', 1.5)
+    .style('opacity', 0.9)
+    .transition('tm').duration(600)
+    .style('opacity', 0)
+    .remove();
+}
+
+function animateMerge(group) {
+  for (const e of group) {
+    if (e.relation?.kind !== 'kept' || e.memory_id == null) continue;
+    const from = nodePos(e.memory_id), to = nodePos(e.relation.target_id);
+    if (from && to) arcTo(from, to);
+  }
+}
+
+function ringFx(id, { duration = 700, growTo = 2.2 } = {}) {
+  const p = nodePos(id);
+  if (!p) return;
+  const sel = timeNodeById.get('m-' + id);
+  const d = sel.datum();
+  const r0 = d?._r ?? 4;
+  const stroke = d?.kind === 'memory' ? (COLORS[d.mem.type] || cssVar('--muted-foreground')) : cssVar('--muted-foreground');
+  fxNode('circle')
+    .attr('cx', p.x).attr('cy', p.y).attr('r', r0)
+    .style('fill', 'none')
+    .style('stroke', stroke)
+    .style('stroke-width', 1.5)
+    .style('opacity', 1)
+    .transition('tm').duration(duration)
+    .attr('r', r0 * growTo)
+    .style('opacity', 0)
+    .remove();
+}
+
+// Supersede archives nothing — both nodes stay visible. relation direction
+// varies by which row of the pair we're looking at (old row: superseded_by=
+// new; new row: supersedes=old) — normalize both to {oldId, newId} once.
+function supersedeIds(group) {
+  let oldId = null, newId = null;
+  for (const e of group) {
+    if (e.relation?.kind === 'superseded_by') { oldId = e.memory_id; newId = e.relation.target_id; }
+    else if (e.relation?.kind === 'supersedes') { newId = e.memory_id; oldId = e.relation.target_id; }
+  }
+  return { oldId, newId };
+}
+
+// The old node's deprecated tint is real, ongoing state (not a flourish) — it
+// applies in both motion modes, called directly from animateCrossedEvents
+// ahead of the REDUCED_MOTION gate.
+function applySupersedeState(group) {
+  const { oldId } = supersedeIds(group);
+  if (oldId != null) timeNodeById.get('m-' + oldId)?.classed('tm-deprecated', true);
+}
+
+// Motion-gated flourish only — the tint itself is handled by applySupersedeState.
+function animateSupersede(group) {
+  const { newId } = supersedeIds(group);
+  if (newId != null) ringFx(newId, { duration: 500, growTo: 1.8 });
+}
+
+function animatePulse(group) {
+  for (const e of group) if (e.memory_id != null) ringFx(e.memory_id, { duration: 300, growTo: 1.6 });
+}
+
+function animateRing(group) {
+  for (const e of group) if (e.memory_id != null) ringFx(e.memory_id, { duration: 700, growTo: 2.2 });
+}
+
+function materializeFx(id) {
+  ringFx(id, { duration: 400, growTo: 1.5 });
+}
+
+// Branches on action exactly as the reducer does — archive rows (losers) shrink
+// out toward the survivor, the survivor's own rescope row gets a halo, and the
+// compensation row (unarchive) re-materializes instead of either.
+function animatePromote(group) {
+  for (const e of group) {
+    if (e.action === 'archive' && e.relation?.kind === 'promoted_to' && e.memory_id != null) {
+      const from = nodePos(e.memory_id), to = nodePos(e.relation.target_id);
+      if (from && to) arcTo(from, to);
+      shrinkOutNode(e.memory_id);
+    } else if (e.action === 'rescope' && e.memory_id != null) {
+      ringFx(e.memory_id, { duration: 600, growTo: 2 });
+    } else if (e.action === 'compensate_unarchive' && e.memory_id != null) {
+      materializeFx(e.memory_id);
+    }
+  }
+}
+
+// Branches on action exactly as the reducer does — restore_revision re-appears,
+// archive_creation shrinks out.
+function animateRollback(group) {
+  for (const e of group) {
+    if (e.memory_id == null) continue;
+    if (e.action === 'restore_revision') materializeFx(e.memory_id);
+    else if (e.action === 'archive_creation') shrinkOutNode(e.memory_id);
+  }
+}
+
+function tickFx(id) {
+  const p = nodePos(id);
+  if (!p) return;
+  fxNode('path')
+    .attr('d', `M${p.x - 4},${p.y} l3,4 l6,-9`)
+    .style('fill', 'none')
+    .style('stroke', cssVar('--type-discovery') || cssVar('--muted-foreground'))
+    .style('stroke-width', 1.6)
+    .style('opacity', 1)
+    .transition('tm').duration(400)
+    .style('opacity', 0)
+    .remove();
+}
+
+function animateConditional(group) {
+  for (const e of group) {
+    if (e.relation?.kind === 'encoded') ringFx(e.relation.target_id, { duration: 700, growTo: 2.2 });
+    else if (e.relation?.kind === 'encoded_in' && e.memory_id != null) tickFx(e.memory_id);
+  }
+}
+
+const EVENT_CLASS_NAMES = new Set(Object.keys(EVENT_ANIMATIONS));
+
+// Always-on: rendered in both motion modes, so it is reduced motion's primary
+// channel. One row per crossed group, newest entries pushed in with the same
+// prepend/cap convention as logRevertRow.
+function logEventGroup(group) {
+  const log = document.getElementById('time-log');
+  if (!log) return;
+  const rep = group[0];
+  const ids = [...new Set(group.filter(e => e.memory_id != null).map(e => e.memory_id))].join(',');
+  const actions = [...new Set(group.map(e => e.action).filter(Boolean))].join(',');
+  const row = document.createElement('div');
+  row.className = 'time-log-row';
+  const badge = document.createElement('span');
+  const cls = EVENT_CLASS_NAMES.has(rep.change_class) ? rep.change_class : 'other';
+  badge.className = 'time-log-badge time-log-badge-' + cls;
+  badge.textContent = rep.change_class;
+  row.append(badge, ` ${new Date(rep.t).toISOString().slice(0, 10)} · #${ids || '—'}${actions ? ' · ' + actions : ''}`);
+  row.addEventListener('click', () => { seekTo(rep.t); updateScrubFromT(); });
+  log.prepend(row);
+  while (log.childElementCount > EVENT_LOG_CAP) log.removeChild(log.lastElementChild);
+}
+
+// One pass over adjacency, computed once per seek: the set of entity ids that
+// currently have at least one visible memory neighbor (adjacency is id-keyed
+// for both kinds; only memory neighbors count — an entity has no
+// entity-to-entity edges in this model). Both updateLinkVisibility and
+// updateEntityGhosts read this instead of each re-scanning per entity.
+function computeVisibleEntities(next) {
+  const visible = new Set();
+  for (const [id, adj] of adjacency) {
+    if (!id.startsWith('e-')) continue;
+    for (const nid of adj) {
+      if (nid.startsWith('m-') && next.has(parseInt(nid.slice(2), 10))) { visible.add(id); break; }
+    }
+  }
+  return visible;
+}
+
+function updateLinkVisibility(next, visibleEntities) {
+  const hiddenNode = id => id.startsWith('m-')
+    ? !next.has(parseInt(id.slice(2), 10))
+    : !visibleEntities.has(id);
+  linkSel.classed('tm-absent', l => hiddenNode(endId(l.source)) || hiddenNode(endId(l.target)));
+}
+
+// Owns BOTH tm-absent and tm-ghost on entity nodes from this point forward —
+// entry sets tm-absent on anchor-absent entities as a one-time baseline, but
+// every seek after that must be the only thing mutating entity classes so the
+// three states below never go stale or double-own an entity.
+function updateEntityGhosts(next, visibleEntities) {
+  nodeSel.filter(d => d.kind === 'entity').each(function (d) {
+    const sel = d3.select(this);
+    if (visibleEntities.has(d.id)) {
+      sel.classed('tm-absent', false).classed('tm-ghost', false);
+    } else if (timeMode.anchor.has(d.id)) {
+      sel.classed('tm-ghost', true).classed('tm-absent', false);
+    } else {
+      sel.classed('tm-absent', true).classed('tm-ghost', false);
+    }
+  });
+}
+
+// ---------- T43 transport: scrub / step / play ----------
+let playRAF = null;
+let playLastTs = 0;
+
+function cancelPlayback() {
+  if (playRAF != null) { cancelAnimationFrame(playRAF); playRAF = null; }
+  const btn = document.getElementById('time-play');
+  if (btn) btn.textContent = '▶';
+}
+
+function updateScrubFromT() {
+  const scrubEl = document.getElementById('time-scrub');
+  if (!scrubEl) return;
+  const span = timeMode.tNow - timeMode.tMin;
+  const frac = span > 0 ? (timeMode.t - timeMode.tMin) / span : 1;
+  scrubEl.value = String(Math.round(Math.max(0, Math.min(1, frac)) * 1000));
+}
+
+function scrubTo(rawValue) {
+  const frac = Math.max(0, Math.min(1000, rawValue)) / 1000;
+  const t = timeMode.tMin + frac * (timeMode.tNow - timeMode.tMin);
+  seekTo(t); // jumps apply the final state instantly — no animation
+}
+
+function findNextEventIndex(t) {
+  const events = timeMode.timeline.globalEvents;
+  let lo = 0, hi = events.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (events[mid].t > t) hi = mid; else lo = mid + 1;
+  }
+  return lo < events.length ? lo : -1;
+}
+
+// Last index with e.t <= t — INCLUSIVE, so a Back step immediately after
+// landing exactly on an event's t undoes THAT event rather than skipping past it.
+function findPrevEventIndex(t) {
+  const events = timeMode.timeline.globalEvents;
+  let lo = 0, hi = events.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (events[mid].t <= t) lo = mid + 1; else hi = mid;
+  }
+  return lo - 1;
+}
+
+function stepForward() {
+  const idx = findNextEventIndex(timeMode.t);
+  if (idx < 0) return;
+  const prevT = timeMode.t;
+  seekTo(timeMode.timeline.globalEvents[idx].t, { animate: true, tPrev: prevT });
+  updateScrubFromT();
+}
+
+// Same-timestamp events undo as one bucket — visibleAt cannot stand between
+// equal timestamps, so neither can the stepper.
+function stepBack() {
+  const events = timeMode.timeline.globalEvents;
+  const idx = findPrevEventIndex(timeMode.t);
+  if (idx < 0) return; // nothing before the current position
+  const bucketT = events[idx].t;
+  let start = idx;
+  while (start > 0 && events[start - 1].t === bucketT) start--;
+  const bucket = events.slice(start, idx + 1);
+  seekTo(bucketT - 1); // no animate: reverse crossings are state-undo, not replay
+  updateScrubFromT();
+  logRevertRow(bucket);
+}
+
+function logRevertRow(bucket) {
+  const log = document.getElementById('time-log');
+  if (!log) return;
+  const classes = [...new Set(bucket.map(e => e.change_class))].join(',');
+  const ids = [...new Set(bucket.filter(e => e.memory_id != null).map(e => e.memory_id))].join(',');
+  const row = document.createElement('div');
+  row.className = 'time-log-row';
+  row.textContent = `⟲ reverted past ${classes} #${ids}`;
+  log.prepend(row);
+}
+
+function togglePlay() {
+  if (playRAF != null) { cancelPlayback(); return; }
+  if (!Number.isFinite(timeMode.tMin) || timeMode.tMin >= timeMode.tNow) return; // empty corpus guard
+  const btn = document.getElementById('time-play');
+  if (btn) btn.textContent = '⏸';
+  playLastTs = performance.now();
+  const frame = (ts) => {
+    const dt = ts - playLastTs;
+    playLastTs = ts;
+    const speed = Number(document.getElementById('time-speed').value);
+    const prevT = timeMode.t;
+    const t = Math.min(timeMode.t + speed * (dt / 1000), timeMode.tNow);
+    seekTo(t, { animate: true, tPrev: prevT });
+    updateScrubFromT();
+    if (t >= timeMode.tNow) { cancelPlayback(); return; } // auto-pause at now
+    playRAF = requestAnimationFrame(frame);
+  };
+  playRAF = requestAnimationFrame(frame);
+}
+
+// Bucket globalEvents into canvas.width bins, bar heights normalized to the
+// max bin. Drawn once at entry — the timeline's event set is fixed for the
+// life of this time-mode session.
+function drawDensityStrip() {
+  const canvas = document.getElementById('time-density');
+  if (!canvas) return;
+  const w = Math.max(1, Math.round(canvas.parentElement?.clientWidth || canvas.clientWidth || 200));
+  canvas.width = w;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const events = timeMode.timeline.globalEvents;
+  const span = timeMode.tNow - timeMode.tMin;
+  if (!events.length || !Number.isFinite(timeMode.tMin) || span <= 0) return;
+  const bins = new Array(w).fill(0);
+  for (const e of events) {
+    if (e.t < timeMode.tMin || e.t > timeMode.tNow) continue;
+    bins[Math.min(w - 1, Math.floor(((e.t - timeMode.tMin) / span) * w))]++;
+  }
+  const max = Math.max(1, ...bins);
+  ctx.fillStyle = cssVar('--muted-foreground') || '#888';
+  for (let i = 0; i < w; i++) {
+    if (!bins[i]) continue;
+    const h = (bins[i] / max) * canvas.height;
+    ctx.fillRect(i, canvas.height - h, 1, h);
+  }
+}
+
+// Called once at entry, after the union render and baseline visibility are
+// set: wires the scrubber's initial position, draws the density strip, marks
+// unknown-state nodes, and disables the transport entirely for an empty/degenerate
+// corpus (tMin === Infinity when there are no records to derive a minimum from).
+function renderTimeControls() {
+  const playBtn = document.getElementById('time-play');
+  const backBtn = document.getElementById('time-step-back');
+  const fwdBtn = document.getElementById('time-step-fwd');
+  const scrubEl = document.getElementById('time-scrub');
+  const speedEl = document.getElementById('time-speed');
+  const empty = !Number.isFinite(timeMode.tMin) || timeMode.tMin >= timeMode.tNow;
+  for (const b of [playBtn, backBtn, fwdBtn, scrubEl, speedEl]) if (b) b.disabled = empty;
+  if (scrubEl) scrubEl.value = '1000'; // entry state is t = tNow
+  for (const id of timeMode.timeline.unknownIds) timeNodeById.get('m-' + id)?.classed('tm-unknown', true);
+  const diag = document.getElementById('time-diagnostic');
+  if (diag) {
+    const n = timeMode.timeline.unknownIds.length;
+    diag.hidden = n === 0;
+    diag.textContent = n > 0 ? `${n} memories differ from recorded history — unaudited operator actions` : '';
+  }
+  // Measured AFTER the diagnostic's hidden/shown state is final: unhiding it
+  // shrinks .time-track, and drawing the density strip against the pre-shrink
+  // width would misalign every bar from the scrubber for any corpus with
+  // unknownIds.length > 0.
+  drawDensityStrip();
+  document.getElementById('time-label').textContent = new Date(timeMode.tNow).toISOString().slice(0, 10);
+}
+
+{
+  const timeBtn = document.getElementById('time-toggle');
+  if (timeBtn) {
+    timeBtn.addEventListener('click', () => {
+      if (timeMode.phase === 'active') { exitTimeMode(); requestRender(); }
+      else enterTimeMode();
+    });
+  }
+  const playBtn = document.getElementById('time-play');
+  const backBtn = document.getElementById('time-step-back');
+  const fwdBtn = document.getElementById('time-step-fwd');
+  const scrubEl = document.getElementById('time-scrub');
+  if (playBtn) playBtn.addEventListener('click', () => { if (timeMode.phase === 'active') togglePlay(); });
+  if (backBtn) backBtn.addEventListener('click', () => { if (timeMode.phase === 'active') { cancelPlayback(); stepBack(); } });
+  if (fwdBtn) fwdBtn.addEventListener('click', () => { if (timeMode.phase === 'active') { cancelPlayback(); stepForward(); } });
+  if (scrubEl) scrubEl.addEventListener('input', () => {
+    if (timeMode.phase !== 'active') return;
+    cancelPlayback();
+    scrubTo(Number(scrubEl.value));
+  });
 }
 
 // ---------- Highlight ----------
@@ -958,7 +1804,7 @@ window.addEventListener('resize', () => {
   // and moveTooltip would otherwise position against the pre-resize geometry.
   svgRect = els.svg.getBoundingClientRect();
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => { if (lastStats) renderGraph(); }, 200);
+  resizeTimer = setTimeout(() => { if (lastStats) requestRender(); }, 200);
 });
 
 // Theme toggle button — wired up here, after all let/const declarations are
@@ -1040,7 +1886,7 @@ window.addEventListener('resize', () => {
     }
     // Recompute graph layout after layout shifts.
     if (name === 'graph' && typeof lastStats !== 'undefined' && lastStats) {
-      setTimeout(() => renderGraph(), 50);
+      setTimeout(() => requestRender(), 50);
     }
   }
 
@@ -4230,7 +5076,7 @@ window.addEventListener('resize', () => {
       try { localStorage.setItem(STORAGE[side], next ? 'true' : 'false'); } catch {}
       applyCollapsed(side, next);
       // Reflow the force graph after the grid transition lands.
-      setTimeout(() => { if (lastStats) renderGraph(); }, 180);
+      setTimeout(() => { if (lastStats) requestRender(); }, 180);
     });
   }
 }
