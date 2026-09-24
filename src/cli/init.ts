@@ -90,7 +90,7 @@ export interface InitPaths {
   hintsDir: string;
   autostartRecordFile: string;
   ensureKnobFile: string;
-  /** `<appDir>/node_modules/kopeng` — the installed package root wire/doctor target. */
+  /** `<appDir>/node_modules/@djy89/kopeng` — the installed package root wire/doctor target. */
   installedRepoRoot: string;
   serverEntry: string;
   /** The ensure knob's `script` field — see scripts/hooks/memory-session-start.mjs. */
@@ -99,7 +99,7 @@ export interface InitPaths {
 
 export function derivedInitPaths(kopengHome: string): InitPaths {
   const appDir = path.join(kopengHome, 'app');
-  const installedRepoRoot = path.join(appDir, 'node_modules', 'kopeng');
+  const installedRepoRoot = path.join(appDir, 'node_modules', '@djy89', 'kopeng');
   return {
     kopengHome,
     appDir,
@@ -392,7 +392,7 @@ export interface InstallSpec {
 
 /** RULING-D: `--from` exists so CI/preview installs work before first publish. */
 export function decideInstallSpec(fromFlag: string | undefined, runningVersion: string): InstallSpec {
-  return fromFlag ? { spec: fromFlag, reason: 'from-flag' } : { spec: `kopeng@${runningVersion}`, reason: 'pinned-version' };
+  return fromFlag ? { spec: fromFlag, reason: 'from-flag' } : { spec: `@djy89/kopeng@${runningVersion}`, reason: 'pinned-version' };
 }
 
 export type InstallAction = 'skip' | 'install';
@@ -729,7 +729,7 @@ export function buildConsentScreen(report: PreflightReport, profile: WireProfile
   lines.push('');
   lines.push(`Learning profile: ${profile} — ${PROFILE_DESCRIPTIONS[profile]}`);
   lines.push('');
-  lines.push('Nothing phones home. Everything above is removed by: npx kopeng uninstall');
+  lines.push('Nothing phones home. Everything above is removed by: npx @djy89/kopeng uninstall');
   return lines.join('\n');
 }
 
@@ -1048,7 +1048,7 @@ function realNpmInstall(args: string[]): Promise<{ code: number; stdout: string;
 
 function realDownloadModels(opts: { appDir: string; modelsDir: string; kopengHome: string; envFile: string }): Promise<{ ok: boolean; detail: string }> {
   return new Promise((resolve) => {
-    const embedderEntry = path.join(opts.appDir, 'node_modules', 'kopeng', 'dist', 'embeddings', 'embedder.js');
+    const embedderEntry = path.join(opts.appDir, 'node_modules', '@djy89', 'kopeng', 'dist', 'embeddings', 'embedder.js');
     const entryUrl = pathToFileURL(embedderEntry).href;
     const script =
       'import(process.argv[1]).then(m => m.initEmbedder()).then(() => process.exit(0))' +

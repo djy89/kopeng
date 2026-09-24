@@ -111,7 +111,7 @@ beforeEach(async () => {
   repoRoot = path.join(scratch, 'repo');
   fs.mkdirSync(path.join(repoRoot, 'scripts', 'hooks'), { recursive: true });
   fs.mkdirSync(path.join(repoRoot, 'dist'), { recursive: true });
-  fs.writeFileSync(path.join(repoRoot, 'package.json'), `{"name":"kopeng","version":"${REPO_VERSION}"}\n`, 'utf8');
+  fs.writeFileSync(path.join(repoRoot, 'package.json'), `{"name":"@djy89/kopeng","version":"${REPO_VERSION}"}\n`, 'utf8');
   fs.writeFileSync(path.join(repoRoot, 'dist', 'index.js'), '// built test entry\n', 'utf8');
   // Copy the WHOLE hooks directory, never an enumerated subset. The hooks
   // import each other as sibling modules, and a spawned hook that cannot
@@ -381,7 +381,7 @@ describe('runDoctor', () => {
 
     it('names the PACKAGED command when this copy lives inside node_modules (Finding 3: `npm run migrate:anchors` is unrunnable there — no scripts/ops in `files`, no tsx)', async () => {
       corpusHealthData = { legacy_anchor_count: 2 };
-      const packagedRoot = path.join(scratch, 'app', 'node_modules', 'kopeng');
+      const packagedRoot = path.join(scratch, 'app', 'node_modules', '@djy89', 'kopeng');
 
       const report = await runDoctor({ homeDir, repoRoot: packagedRoot, env: doctorEnv, log: () => undefined });
 
@@ -475,7 +475,7 @@ describe('featurePosture default on a packaged install (Finding 2)', () => {
 
   beforeEach(() => {
     fakeKopengHome = fs.mkdtempSync(path.join(os.tmpdir(), 'kopeng-doctor-khome-'));
-    packagedRepoRoot = path.join(fakeKopengHome, 'app', 'node_modules', 'kopeng');
+    packagedRepoRoot = path.join(fakeKopengHome, 'app', 'node_modules', '@djy89', 'kopeng');
     fs.mkdirSync(packagedRepoRoot, { recursive: true });
     bareHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kopeng-doctor-bhome-'));
     fs.mkdirSync(path.join(bareHomeDir, '.claude'), { recursive: true });
@@ -540,8 +540,8 @@ describe('featurePosture default on a packaged install (Finding 2)', () => {
 
 describe('isPackagedInstall (Finding 3 — which fix line doctor may prescribe)', () => {
   it('is true only for a root with a node_modules path segment', () => {
-    expect(isPackagedInstall(path.join('C:', 'Users', 'x', '.kopeng', 'app', 'node_modules', 'kopeng'))).toBe(true);
-    expect(isPackagedInstall('/home/x/.kopeng/app/node_modules/kopeng')).toBe(true);
+    expect(isPackagedInstall(path.join('C:', 'Users', 'x', '.kopeng', 'app', 'node_modules', '@djy89', 'kopeng'))).toBe(true);
+    expect(isPackagedInstall('/home/x/.kopeng/app/node_modules/@djy89/kopeng')).toBe(true);
     expect(isPackagedInstall('/home/x/code/kopeng')).toBe(false);
     // A directory merely NAMED like the marker is not a segment match.
     expect(isPackagedInstall('/home/x/code/my-node_modules-notes')).toBe(false);

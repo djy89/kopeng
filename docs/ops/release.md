@@ -122,7 +122,7 @@ approval before it touches npm.
 10. **Post-publish sanity, on one real machine** (not CI, not a container —
    the point is to prove the thing a user will actually run):
    ```bash
-   npx kopeng@latest init
+   npx @djy89/kopeng@latest init
    ```
    Confirm it completes, `kopeng doctor` passes, and `kopeng viz` opens.
    **Manual spot-check (Windows, spaced profile path):** the install-smoke
@@ -131,7 +131,7 @@ approval before it touches npm.
    1) survives a real spaced path end to end — `tests/unit/npm-spawn.test.ts`
    proves the quoting algorithm and a real cmd.exe round-trip, but not the
    whole `kopeng init` flow. Before (or shortly after) a release that
-   touches `src/cli/npm-spawn.ts`, run `npx kopeng@latest init` once on a
+   touches `src/cli/npm-spawn.ts`, run `npx @djy89/kopeng@latest init` once on a
    Windows account whose profile path contains a space (e.g. a local account
    named with a space, or any `C:\Users\<First Last>\...` profile) and
    confirm it completes cleanly.
@@ -174,7 +174,7 @@ Useful before ever pushing a tag, or to reproduce a CI failure locally:
 ```bash
 npm run build
 npm pack
-node scripts/ci/install-smoke.mjs kopeng-*.tgz
+node scripts/ci/install-smoke.mjs djy89-kopeng-*.tgz
 ```
 
 It creates its own temp sandbox (a fake `HOME`/`USERPROFILE` and

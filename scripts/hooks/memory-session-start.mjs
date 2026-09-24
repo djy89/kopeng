@@ -104,7 +104,7 @@ function isInside(parent, child) {
 // not a privilege crossing (whatever wrote that file already runs as the
 // operator), but it is cheap to deny: the knob `kopeng init` writes always
 // names THIS node binary and a script under KOPENG_HOME (see init.ts's
-// `cliEntry`, <home>/app/node_modules/kopeng/dist/cli/index.js), so anything
+// `cliEntry`, <home>/app/node_modules/@djy89/kopeng/dist/cli/index.js), so anything
 // else is not our knob and we simply do not fire it.
 //
 // Fail-open to today's no-op on any mismatch or surprise — a session start

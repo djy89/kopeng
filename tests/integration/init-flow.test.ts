@@ -140,11 +140,11 @@ function createHarness(opts: HarnessOptions = {}): Harness {
     npmInstall: async (args) => {
       order.push('npmInstall');
       npmInstallCalls.push(args);
-      // Simulate what a real `npm install --prefix <appDir> kopeng@x` leaves
-      // behind — just enough for wireClient's validateRepoRoot to accept it.
+      // Simulate what a real `npm install --prefix <appDir> @djy89/kopeng@x`
+      // leaves behind — just enough for wireClient's validateRepoRoot to accept it.
       const repoRoot = paths.installedRepoRoot;
       fs.mkdirSync(path.join(repoRoot, 'scripts', 'hooks'), { recursive: true });
-      fs.writeFileSync(path.join(repoRoot, 'package.json'), JSON.stringify({ name: 'kopeng', version: '1.2.3' }), 'utf8');
+      fs.writeFileSync(path.join(repoRoot, 'package.json'), JSON.stringify({ name: '@djy89/kopeng', version: '1.2.3' }), 'utf8');
       return { code: 0, stdout: '', stderr: '' };
     },
     downloadModels: async () => { order.push('downloadModels'); return { ok: true, detail: 'model ready (fake)' }; },

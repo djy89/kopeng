@@ -104,7 +104,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: kopeng-tarball
-          path: kopeng-*.tgz
+          path: djy89-kopeng-*.tgz
           if-no-files-found: error
 
   # A REAL install of the packed tarball on every target platform: init ->
@@ -158,7 +158,7 @@ jobs:
       # OS, including Windows (whose GitHub-hosted runner ships Git Bash).
       - name: Real install smoke (init -> canary -> uninstall, sandboxed HOME)
         shell: bash
-        run: node scripts/ci/install-smoke.mjs kopeng-*.tgz
+        run: node scripts/ci/install-smoke.mjs djy89-kopeng-*.tgz
 
   # RULING-D: the operator does the first publish. This job is inert by
   # construction until BOTH the `npm-publish` environment (created lazily by
@@ -212,4 +212,4 @@ jobs:
         shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public kopeng-*.tgz
+        run: npm publish --provenance --access public djy89-kopeng-*.tgz

@@ -47,7 +47,7 @@ afterEach(() => {
 
 function createRepo(root: string): void {
   fs.mkdirSync(path.join(root, 'scripts', 'hooks'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'package.json'), '{"name":"kopeng"}\n', 'utf8');
+  fs.writeFileSync(path.join(root, 'package.json'), '{"name":"@djy89/kopeng"}\n', 'utf8');
 }
 
 describe('removeConfigs', () => {

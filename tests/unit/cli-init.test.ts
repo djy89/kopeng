@@ -288,7 +288,7 @@ describe('decideInstallSpec + decideInstallAction (spec selection)', () => {
 
   it('default pins the running CLI version', () => {
     const spec = decideInstallSpec(undefined, '1.2.0');
-    expect(spec).toEqual({ spec: 'kopeng@1.2.0', reason: 'pinned-version' });
+    expect(spec).toEqual({ spec: '@djy89/kopeng@1.2.0', reason: 'pinned-version' });
   });
 
   it('repair with the same pinned version already installed -> skip', () => {
@@ -482,7 +482,7 @@ describe('buildConsentScreen (consent-screen content)', () => {
   it('includes the preflight lines and the literal no-telemetry / uninstall line', () => {
     const screen = buildConsentScreen(report, 'minimal');
     for (const line of report.lines) expect(screen).toContain(line);
-    expect(screen).toContain('Nothing phones home. Everything above is removed by: npx kopeng uninstall');
+    expect(screen).toContain('Nothing phones home. Everything above is removed by: npx @djy89/kopeng uninstall');
   });
 
   it('names the chosen profile using the SAME description wire uses', () => {
@@ -495,7 +495,7 @@ describe('derivedInitPaths', () => {
   it('derives every path under the given kopengHome, pure function of its input', () => {
     const paths = derivedInitPaths('/home/x/.kopeng');
     expect(paths.appDir).toBe(path.join('/home/x/.kopeng', 'app'));
-    expect(paths.installedRepoRoot).toBe(path.join('/home/x/.kopeng', 'app', 'node_modules', 'kopeng'));
+    expect(paths.installedRepoRoot).toBe(path.join('/home/x/.kopeng', 'app', 'node_modules', '@djy89', 'kopeng'));
     expect(paths.serverEntry).toBe(path.join(paths.installedRepoRoot, 'dist', 'server.js'));
     expect(paths.cliEntry).toBe(path.join(paths.installedRepoRoot, 'dist', 'cli', 'index.js'));
     expect(paths.envFile).toBe(path.join('/home/x/.kopeng', '.env'));

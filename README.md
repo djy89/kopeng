@@ -11,14 +11,14 @@ KOPENG is persistent, self-curating, local-first memory for coding agents (Claud
 One prerequisite: **Node.js 20+**. That's it — no Docker, no database server, no cloud account, no API keys, no admin rights.
 
 ```bash
-npx kopeng@latest init
+npx @djy89/kopeng@latest init
 ```
 
 On **Windows**, also install the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) first — the local embedding runtime is a native module that will not load without it (KOPENG degrades to keyword-only search rather than failing, but you want the semantic half).
 
 The installer is dry-run-first: it shows you exactly what it will do, then waits for your yes. On your next Claude Code prompt, recall just fires.
 
-**What it puts on your machine** (and what `npx kopeng uninstall` removes):
+**What it puts on your machine** (and what `npx @djy89/kopeng uninstall` removes):
 
 | Item | Where |
 | --- | --- |
@@ -29,14 +29,14 @@ The installer is dry-run-first: it shows you exactly what it will do, then waits
 | MCP registration + 5 fail-open Claude Code hooks, merged minimally into your existing config (backed up first) | `~/.claude.json`, `~/.claude/settings.json` |
 | Learning-profile flags (observation ingestion, discovery detection, dreaming — all off until you opt in) | `~/.kopeng/.env` |
 
-`npx kopeng uninstall` reverses all of it and keeps your memory data unless you pass `--purge`. Nothing phones home — there is no telemetry to opt out of.
+`npx @djy89/kopeng uninstall` reverses all of it and keeps your memory data unless you pass `--purge`. Nothing phones home — there is no telemetry to opt out of.
 
 Prefer to run from source, wire configs by hand, or install as a real system service? The clone-and-`npm run wire` path lives in **[SETUP.md](SETUP.md)**, along with Codex CLI wiring and troubleshooting.
 
 ## Watch it think
 
 ```bash
-npx kopeng viz
+npx @djy89/kopeng viz
 ```
 
 <!-- SCREENSHOT/GIF HERE: live tab + graph tab while a Claude Code session runs -->

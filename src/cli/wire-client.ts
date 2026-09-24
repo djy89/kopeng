@@ -190,8 +190,8 @@ function validateRepoRoot(repoRoot: string): void {
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`Repo root must contain a readable package.json (${detail}). No files were changed.`);
   }
-  if (!isObject(packageJson) || packageJson.name !== 'kopeng') {
-    throw new Error(`Repo root package.json must have \"name\": \"kopeng\": ${posixPath(repoRoot)}. No files were changed.`);
+  if (!isObject(packageJson) || packageJson.name !== '@djy89/kopeng') {
+    throw new Error(`Repo root package.json must have \"name\": \"@djy89/kopeng\": ${posixPath(repoRoot)}. No files were changed.`);
   }
 
   const hooksDir = path.join(repoRoot, 'scripts', 'hooks');

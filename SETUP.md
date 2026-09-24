@@ -4,20 +4,20 @@ Get KOPENG running on a fresh device and wired to Claude Code. For full architec
 
 ---
 
-## The fast path: `npx kopeng init`
+## The fast path: `npx @djy89/kopeng init`
 
 ```bash
-npx kopeng init
+npx @djy89/kopeng init
 ```
 
 One command: it checks Node/port/disk/client prerequisites, shows exactly what it's about to
 put on your machine and asks you to confirm, installs the server into `~/.kopeng/app`,
 downloads the embedding model, registers a zero-admin-rights autostart entry, starts the
 server, wires Claude Code's hooks + MCP registration, and finishes with a `doctor`/`canary`
-health check. Non-interactive/CI installs: `npx kopeng init --non-interactive --profile
-minimal`. `npx kopeng uninstall` reverses everything it lists on the consent screen.
+health check. Non-interactive/CI installs: `npx @djy89/kopeng init --non-interactive --profile
+minimal`. `npx @djy89/kopeng uninstall` reverses everything it lists on the consent screen.
 
-**Uninstalling:** `npx kopeng uninstall` stops the server (`POST /api/admin/shutdown`), removes
+**Uninstalling:** `npx @djy89/kopeng uninstall` stops the server (`POST /api/admin/shutdown`), removes
 the autostart entry and ensure knob, reverses the Claude Code MCP/hook wiring, and deletes
 `~/.kopeng/app`. Your database, downloaded models, and `.env` are **kept** — pass `--purge` to
 remove `~/.kopeng` entirely too (gated behind `--yes` or typing `purge` at a prompt, since
@@ -26,7 +26,7 @@ without touching anything. Every step degrades to a printed reason and continues
 failing outright — an already-stopped server, a missing autostart entry, or a hand-edited config
 file are all handled, not treated as errors.
 
-**Updating:** `npx kopeng update` (optionally `--from <tarball|spec>`) installs a newer release
+**Updating:** `npx @djy89/kopeng update` (optionally `--from <tarball|spec>`) installs a newer release
 into `~/.kopeng/app` and, only if the version actually changed, stops the server, restarts it,
 and prints a `doctor` summary. Already up to date is a no-op — nothing restarts. A brief pass;
 the full command-reference update is tracked separately.
@@ -52,7 +52,7 @@ a foreign process already owns the port; `kopeng viz` launches the web dashboard
 
 **Offline / air-gapped install:** copy a populated `~/.kopeng/models` directory from another
 machine (same layout — the embedding model's `.onnx` files under `Xenova/all-MiniLM-L6-v2/`),
-then run `npx kopeng init --offline` on the target machine: it verifies the model files are
+then run `npx @djy89/kopeng init --offline` on the target machine: it verifies the model files are
 already there instead of downloading them, and fails plainly naming what's missing if they
 aren't.
 

@@ -20,8 +20,8 @@ import { fakeChildProcess } from '../fixtures/fake-child-process.js';
 // spawn) — never installs, stops, spawns, or polls anything real.
 
 describe('decideUpdateSpec (pure)', () => {
-  it('defaults to kopeng@latest with no --from', () => {
-    expect(decideUpdateSpec(undefined)).toEqual({ spec: 'kopeng@latest', reason: 'latest' });
+  it('defaults to @djy89/kopeng@latest with no --from', () => {
+    expect(decideUpdateSpec(undefined)).toEqual({ spec: '@djy89/kopeng@latest', reason: 'latest' });
   });
 
   it('an explicit --from always wins', () => {
@@ -70,8 +70,8 @@ describe('derivedUpdatePaths', () => {
   it('derives the installed-repo-root and server-entry paths from kopengHome', () => {
     const paths = derivedUpdatePaths('/home/op/.kopeng');
     expect(paths.appDir.replace(/\\/g, '/')).toBe('/home/op/.kopeng/app');
-    expect(paths.installedRepoRoot.replace(/\\/g, '/')).toBe('/home/op/.kopeng/app/node_modules/kopeng');
-    expect(paths.serverEntry.replace(/\\/g, '/')).toBe('/home/op/.kopeng/app/node_modules/kopeng/dist/server.js');
+    expect(paths.installedRepoRoot.replace(/\\/g, '/')).toBe('/home/op/.kopeng/app/node_modules/@djy89/kopeng');
+    expect(paths.serverEntry.replace(/\\/g, '/')).toBe('/home/op/.kopeng/app/node_modules/@djy89/kopeng/dist/server.js');
     expect(paths.envFile.replace(/\\/g, '/')).toBe('/home/op/.kopeng/.env');
   });
 });
@@ -137,8 +137,8 @@ function createHarness(opts: HarnessOptions): Harness {
       appDir: '/home/test/.kopeng/app',
       envFile: '/home/test/.kopeng/.env',
       hintsDir: '/home/test/.kopeng/hints',
-      installedRepoRoot: '/home/test/.kopeng/app/node_modules/kopeng',
-      serverEntry: '/home/test/.kopeng/app/node_modules/kopeng/dist/server.js',
+      installedRepoRoot: '/home/test/.kopeng/app/node_modules/@djy89/kopeng',
+      serverEntry: '/home/test/.kopeng/app/node_modules/@djy89/kopeng/dist/server.js',
     },
     nodePath: '/usr/bin/node',
     startHealthTimeoutMs: 30,
@@ -215,7 +215,7 @@ describe('runUpdate', () => {
 
     expect(code).toBe(0);
     expect(npmInstallCalls).toHaveLength(1);
-    expect(npmInstallCalls[0]).toEqual(['install', '--prefix', '/home/test/.kopeng/app', 'kopeng@latest']);
+    expect(npmInstallCalls[0]).toEqual(['install', '--prefix', '/home/test/.kopeng/app', '@djy89/kopeng@latest']);
     expect(order).toEqual(['npmInstall']); // no stopServer/runEnsure/runDoctor
     expect(logs.join('\n')).toMatch(/already up to date/i);
   });
@@ -430,7 +430,7 @@ describe('runUpdate — real npm-spawn wiring parity (Task 2.5 fix round 1, Find
     expect(code).toBe(0);
     expect(spawnImpl).toHaveBeenCalledWith(
       'npm.cmd',
-      ['install', '--prefix', '"C:\\Users\\John Smith\\.kopeng\\app"', 'kopeng@latest'],
+      ['install', '--prefix', '"C:\\Users\\John Smith\\.kopeng\\app"', '@djy89/kopeng@latest'],
       expect.objectContaining({ shell: true })
     );
   });
@@ -463,7 +463,7 @@ describe('runUpdate — real npm-spawn wiring parity (Task 2.5 fix round 1, Find
     expect(code).toBe(0);
     expect(spawnImpl).toHaveBeenCalledWith(
       'npm',
-      ['install', '--prefix', '/home/test/.kopeng/app', 'kopeng@latest'],
+      ['install', '--prefix', '/home/test/.kopeng/app', '@djy89/kopeng@latest'],
       expect.objectContaining({ shell: false })
     );
   });

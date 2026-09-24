@@ -22,8 +22,8 @@
  *      root.
  *   2. `npm install --prefix <sandbox>/prefix <tarball>` — a bootstrap
  *      install, just enough to have a runnable `kopeng` CLI (this mirrors
- *      what `npx kopeng@x` does for a real user before `init` runs its OWN
- *      install into ~/.kopeng/app).
+ *      what `npx @djy89/kopeng@x` does for a real user before `init` runs
+ *      its OWN install into ~/.kopeng/app).
  *   3. Run the INSTALLED CLI's `init --non-interactive --profile minimal
  *      --no-autostart --port 3299 --from <tarball>` with HOME/USERPROFILE/
  *      KOPENG_HOME redirected into the sandbox.
@@ -404,7 +404,7 @@ async function main() {
         shell: process.platform === 'win32',
       });
       if (code !== 0) throw new Error(`npm install exited with code ${code}`);
-      cliEntry = path.join(prefixDir, 'node_modules', 'kopeng', 'dist', 'cli', 'index.js');
+      cliEntry = path.join(prefixDir, 'node_modules', '@djy89', 'kopeng', 'dist', 'cli', 'index.js');
       if (!existsSync(cliEntry)) throw new Error(`installed CLI not found at ${cliEntry}`);
     });
 
@@ -469,12 +469,12 @@ async function main() {
         throw new Error(`port ${PORT} did not go quiet after stopping the init-started server`);
       }
 
-      const autostartModule = path.join(kopengHome, 'app', 'node_modules', 'kopeng', 'dist', 'cli', 'autostart.js');
+      const autostartModule = path.join(kopengHome, 'app', 'node_modules', '@djy89', 'kopeng', 'dist', 'cli', 'autostart.js');
       if (!existsSync(autostartModule)) throw new Error(`installed autostart module not found at ${autostartModule}`);
 
       const autostartOpts = {
         nodePath: process.execPath,
-        serverEntry: path.join(kopengHome, 'app', 'node_modules', 'kopeng', 'dist', 'server.js'),
+        serverEntry: path.join(kopengHome, 'app', 'node_modules', '@djy89', 'kopeng', 'dist', 'server.js'),
         kopengHome,
         envFile: path.join(kopengHome, '.env'),
         homeDir: home,

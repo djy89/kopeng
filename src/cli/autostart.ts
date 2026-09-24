@@ -36,7 +36,7 @@ export type AutostartMechanism =
 export interface AutostartOpts {
   /** process.execPath — the node executable to run the server with. */
   nodePath: string;
-  /** Installed server entry point: `<app>/node_modules/kopeng/dist/server.js`. */
+  /** Installed server entry point: `<app>/node_modules/@djy89/kopeng/dist/server.js`. */
   serverEntry: string;
   /** `~/.kopeng` (honors KOPENG_HOME) — where the win32 shim files live. */
   kopengHome: string;
@@ -536,7 +536,7 @@ export const realAutostartEffects: AutostartEffects = {
 export function currentAutostartOpts(): AutostartOpts {
   return {
     nodePath: process.execPath,
-    serverEntry: path.join(APP_DIR, 'node_modules', 'kopeng', 'dist', 'server.js'),
+    serverEntry: path.join(APP_DIR, 'node_modules', '@djy89', 'kopeng', 'dist', 'server.js'),
     kopengHome: KOPENG_HOME,
     envFile: ENV_FILE,
     homeDir: os.homedir(),

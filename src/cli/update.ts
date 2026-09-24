@@ -51,7 +51,7 @@ export interface UpdatePaths {
 
 export function derivedUpdatePaths(kopengHome: string): UpdatePaths {
   const appDir = path.join(kopengHome, 'app');
-  const installedRepoRoot = path.join(appDir, 'node_modules', 'kopeng');
+  const installedRepoRoot = path.join(appDir, 'node_modules', '@djy89', 'kopeng');
   return {
     kopengHome,
     appDir,
@@ -75,7 +75,7 @@ export interface UpdateSpec {
  *  (init's own default is the version currently RUNNING, since init just
  *  wants to reproduce itself — update's whole purpose is to move forward). */
 export function decideUpdateSpec(fromFlag: string | undefined): UpdateSpec {
-  return fromFlag ? { spec: fromFlag, reason: 'from-flag' } : { spec: 'kopeng@latest', reason: 'latest' };
+  return fromFlag ? { spec: fromFlag, reason: 'from-flag' } : { spec: '@djy89/kopeng@latest', reason: 'latest' };
 }
 
 export type UpdateOutcome = 'no-change' | 'updated';

@@ -32,7 +32,7 @@ function readJson(filePath: string): Record<string, unknown> {
 
 function createRepo(root: string): void {
   fs.mkdirSync(path.join(root, 'scripts', 'hooks'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'package.json'), '{"name":"kopeng"}\n', 'utf8');
+  fs.writeFileSync(path.join(root, 'package.json'), '{"name":"@djy89/kopeng"}\n', 'utf8');
 }
 
 function createLinkedWorktree(root: string, canonicalRoot: string): void {
@@ -573,7 +573,7 @@ describe('wireClient', () => {
     fs.writeFileSync(path.join(invalidRoot, 'package.json'), '{"name":"other"}\n', 'utf8');
 
     expect(() => wireClient({ homeDir, repoRoot: invalidRoot, apply: true, log: () => undefined }))
-      .toThrow(/package\.json must have "name": "kopeng".*No files were changed/i);
+      .toThrow(/package\.json must have "name": "@djy89\/kopeng".*No files were changed/i);
     expect(fs.existsSync(claudePath())).toBe(false);
     expect(fs.existsSync(settingsPath())).toBe(false);
   });

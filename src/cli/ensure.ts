@@ -295,7 +295,7 @@ export function currentEnsureDeps(): EnsureDeps {
   return {
     port: readPort(RESOLVED_ENV_FILE),
     nodePath: process.execPath,
-    serverEntry: path.join(APP_DIR, 'node_modules', 'kopeng', 'dist', 'server.js'),
+    serverEntry: path.join(APP_DIR, 'node_modules', '@djy89', 'kopeng', 'dist', 'server.js'),
     kopengHome: KOPENG_HOME,
     envFile: RESOLVED_ENV_FILE,
     hintsDir: process.env.KOPENG_HINTS_DIR || path.join(KOPENG_HOME, 'hints'),
